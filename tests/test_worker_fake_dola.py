@@ -88,7 +88,11 @@ def test_q2_q3_one_account_one_job_and_all_accounts_used(db, fake_dola, worker_r
 
 
 # ---------------------------------------------------------------- Q4
-def test_q4_captcha_pauses_job_and_does_not_reopen_chrome(db, fake_dola, worker_runner):
+def test_q4_captcha_pauses_job_and_does_not_reopen_chrome(db, fake_dola, worker_runner, monkeypatch):
+    """Captcha hiện sau khi gửi prompt và KHÔNG được giải: chờ tại chỗ CAPTCHA_SOLVE_TIMEOUT_SECONDS (đặt 5 s cho test)
+    rồi Tạm dừng + needs_manual='captcha', không mở lại Chrome (BH-04, BH-39)."""
+    import config
+    monkeypatch.setattr(config, "CAPTCHA_SOLVE_TIMEOUT_SECONDS", 5)
     db.set_setting("max_concurrent_jobs", 2)
     fake_dola.control(mode="captcha")
     acc_id = db.add_account("nick captcha")
@@ -100,6 +104,10 @@ def test_q4_captcha_pauses_job_and_does_not_reopen_chrome(db, fake_dola, worker_
     acc = db.account(acc_id)
     assert acc["needs_manual"] == NeedsManual.CAPTCHA, acc
     assert "captcha" in (job["status_message"] or "").lower() or "mảnh ghép" in (job["status_message"] or ""), job["status_message"]
+    assert "captcha_container" in (acc["last_error"] or ""), acc["last_error"]  # BH-38: dấu hiệu thật được ghi
+    messages = [r["message"] or "" for r in db.system_logs()]
+    assert any("Dola yêu cầu kéo mảnh ghép" in m and "5 giây" in m for m in messages), messages
+    assert any("captcha vẫn còn" in m for m in messages), messages
     # BH-26: nick được trả sau khi Chrome đóng, muộn hơn lúc job ghi Tạm dừng → chờ thay vì assert ngay
     wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
 
@@ -110,6 +118,112 @@ def test_q4_captcha_pauses_job_and_does_not_reopen_chrome(db, fake_dola, worker_
     assert st["chat_get_count"] == opens_before, "worker vẫn mở Chrome lại sau khi Tạm dừng vì captcha (BH-04)"
     assert db.job(job_id)["status"] == JobStatus.TAM_DUNG
     assert get_active_browser_count() in (0, None)
+
+
+# ---------------------------------------------------------------- BH-39: captcha được kéo tại chỗ, job chạy tiếp
+def test_captcha_solved_in_place_job_completes(db, fake_dola, worker_runner, monkeypatch):
+    """Captcha hiện sau khi gửi prompt, người dùng kéo xong sau 6 s (fake tự giải): job KHÔNG Tạm dừng, gửi lại prompt
+    một lần, Hoàn thành với mp4 > 50 KB; nick không bị needs_manual.
+
+    Test chạy config.HEADLESS (không có cửa sổ) nên show_window/hide_window thật là no-op trả False; thay bằng
+    hàm giả trả True để đi đúng nhánh "cửa sổ đã được đưa ra màn hình" (cửa sổ thật kiểm ở test_browser_hidden_xvfb).
+    """
+    import dola_service
+    calls = {"show": 0, "hide": 0}
+    show_kwargs = {}
+
+    def fake_show(context, page, **kwargs):
+        calls["show"] += 1
+        show_kwargs.update(kwargs)
+        return True
+
+    monkeypatch.setattr(dola_service, "show_window", fake_show)
+    monkeypatch.setattr(dola_service, "hide_window", lambda context, page: calls.__setitem__("hide", calls["hide"] + 1) or True)
+    fake_dola.control(mode="captcha", solve_captcha_after=6, render_seconds=2)
+    acc_id = db.add_account("nick kéo captcha")
+    job_id = db.add_job("Job captcha giải tại chỗ")
+
+    worker_runner.start()
+    jobs = _assert_completed(db, [job_id], timeout=150)
+    assert jobs[job_id]["account_id"] == acc_id
+
+    messages = [r["message"] or "" for r in db.system_logs() if r["job_id"] == job_id]
+    assert any("cửa sổ Chrome của nick 'nick kéo captcha' đã được đưa ra màn hình" in m for m in messages), messages
+    assert any("đã kéo xong mảnh ghép" in m for m in messages), messages
+    # BH-45 nhánh (b): fake giữ nguyên chữ trong ô nhập sau khi giải captcha → gửi lại bằng Enter, không gõ lại
+    assert any("ô nhập còn nguyên prompt" in m and "gửi lại prompt một lần bằng Enter" in m for m in messages), messages
+    assert not any("credit" in m and "KHÔNG gửi lại" in m for m in messages), messages
+    assert calls["show"] == 1 and calls["hide"] == 1, calls
+    # N-2: dola_service truyền account_id (xếp bậc thang) và tiêu đề có tên nick cho show_window
+    assert show_kwargs.get("account_id") == acc_id, show_kwargs
+    assert show_kwargs.get("title") == "Nick nick kéo captcha — kéo mảnh ghép", show_kwargs
+
+    wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
+    acc = db.account(acc_id)
+    assert acc["needs_manual"] is None, acc
+    assert acc["last_error"] is None, acc
+    st = fake_dola.get_state()
+    assert st["mode"] == "normal" and st["captcha_solved_at"] is not None
+    assert len(st["conversations"]) == 1, st["conversations"]
+    assert st["sent_prompts"] == [next(iter(st["conversations"].values()))["prompt"]]
+    assert "Job captcha giải tại chỗ" in st["sent_prompts"][0]
+    assert st["chat_get_count"] == 1, "job phải chạy tiếp trong cùng phiên Chrome, không mở lại"
+    assert db.job(job_id)["status"] == JobStatus.HOAN_THANH
+
+
+# ---------------------------------------------------------------- BH-45: Dola tự gửi prompt sau khi giải captcha → không gửi lại
+def test_captcha_solved_dola_auto_sends_no_resend(db, fake_dola, worker_runner, monkeypatch):
+    """Fake `auto_resend_after_solve`: ngay khi captcha được giải, server tự tạo conversation cho prompt đã gõ
+    (như Dola thật đôi khi làm). dola_service thấy conversation trong 15 s đầu nên KHÔNG gửi lại: đúng 1 conversation,
+    đúng 1 prompt, không tốn 2 credit."""
+    import dola_service
+    monkeypatch.setattr(dola_service, "show_window", lambda context, page, **kw: True)
+    monkeypatch.setattr(dola_service, "hide_window", lambda context, page: True)
+    fake_dola.control(mode="captcha", solve_captcha_after=6, auto_resend_after_solve=True, render_seconds=2, credits=4)
+    acc_id = db.add_account("nick dola tự gửi")
+    job_id = db.add_job("Job captcha Dola tự gửi")
+
+    worker_runner.start()
+    jobs = _assert_completed(db, [job_id], timeout=150)
+    assert jobs[job_id]["account_id"] == acc_id
+
+    messages = [r["message"] or "" for r in db.system_logs() if r["job_id"] == job_id]
+    assert any("đã kéo xong mảnh ghép" in m for m in messages), messages
+    assert not any("gửi lại prompt" in m for m in messages), f"BH-45: không được gửi lại khi Dola đã nhận prompt: {messages}"
+    st = fake_dola.get_state()
+    assert len(st["conversations"]) == 1, st["conversations"]
+    assert len(st["sent_prompts"]) == 1 and "Job captcha Dola tự gửi" in st["sent_prompts"][0], st["sent_prompts"]
+    sess = next(s for s in st["sessions"].values() if s.get("captcha_shown"))
+    assert sess["credits"] == 3, f"chỉ được trừ đúng 1 credit: {sess}"
+    wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
+    assert db.account(acc_id)["needs_manual"] is None
+
+
+# ---------------------------------------------------------------- N-4: không đưa được cửa sổ ra → chờ ngắn rồi Tạm dừng
+def test_captcha_window_cannot_be_shown_pauses_quickly(db, fake_dola, worker_runner, monkeypatch):
+    """show_window trả False (CDP lỗi / không có cửa sổ) với captcha vĩnh viễn: không chờ đủ 3 phút
+    (CAPTCHA_SOLVE_TIMEOUT_SECONDS giữ mặc định 180) mà chỉ CAPTCHA_NO_WINDOW_TIMEOUT_SECONDS (20 s) rồi Tạm dừng,
+    thông điệp nói rõ không đưa được cửa sổ ra và bảo bấm nút Chrome."""
+    import config
+    import dola_service
+    assert config.CAPTCHA_SOLVE_TIMEOUT_SECONDS == 180 and config.CAPTCHA_NO_WINDOW_TIMEOUT_SECONDS == 20
+    monkeypatch.setattr(dola_service, "show_window", lambda context, page, **kw: False)
+    fake_dola.control(mode="captcha")
+    acc_id = db.add_account("nick không cửa sổ")
+    job_id = db.add_job("Job captcha không cửa sổ")
+
+    worker_runner.start()
+    wait_until(lambda: "không đưa được cửa sổ" in (db.job(job_id)["status_message"] or ""), 60,
+               what="job báo không đưa được cửa sổ ra màn hình")
+    t0 = time.time()
+    wait_until(lambda: db.job(job_id)["status"] == JobStatus.TAM_DUNG, 60, what="job về Tạm dừng")
+    assert time.time() - t0 < 40, "N-4: không có cửa sổ thì chỉ chờ ~20 s rồi Tạm dừng, không chờ 3 phút"
+    assert db.account(acc_id)["needs_manual"] == NeedsManual.CAPTCHA
+    messages = [r["message"] or "" for r in db.system_logs() if r["job_id"] == job_id]
+    assert any("không đưa được cửa sổ Chrome của nick 'nick không cửa sổ' ra màn hình" in m
+               and "bấm nút Chrome để kéo tay" in m and "20 giây" in m for m in messages), messages
+    assert any("sau 20 giây captcha vẫn còn" in m for m in messages), messages
+    wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
 
 
 # ---------------------------------------------------------------- Q5

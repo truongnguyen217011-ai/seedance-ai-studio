@@ -15,6 +15,12 @@ CASES = [
     ("<div class='captcha_verify_container' style='width:300px;height:200px'>Drag the slider</div>", True, "khung captcha hiện"),
     ("<p>Verify to continue</p>", True, "câu chữ captcha"),
     ("<div class='captcha-box' style='display:none'>Verify</div>", False, "khung captcha ẩn"),
+    # BH-39: lớp phủ thật của Dola: div có id, KHÔNG có class, fixed phủ cả trang, iframe bên trong
+    ("<div id='captcha_container' style='display: block; z-index: 111111; position: fixed; width: 100%; height: 100%;"
+     " background-color: rgba(0,0,0,0.514); inset: 0px;'><iframe src='about:blank'></iframe></div>",
+     True, "#captcha_container display:block"),
+    ("<div id='captcha_container' style='display: none; position: fixed; width: 100%; height: 100%; inset: 0px;'>"
+     "<iframe src='about:blank'></iframe></div>", False, "#captcha_container display:none"),
 ]
 
 
@@ -51,4 +57,23 @@ def test_bh38_evidence_names_the_trigger():
         assert 'chữ "verify to continue"' == dola_service._captcha_evidence(page)
         page.set_content("<p>ok</p>")
         assert dola_service._captcha_evidence(page) == ""
+        browser.close()
+
+
+def test_bh39_captcha_container_evidence_and_gone():
+    with sync_playwright() as p:
+        kw = {"headless": True, "args": ["--no-sandbox"]}
+        if CHROME:
+            kw["executable_path"] = CHROME
+        browser = p.chromium.launch(**kw)
+        page = browser.new_page()
+        page.set_content("<div id='captcha_container' style='display:block;position:fixed;inset:0;width:100%;height:100%'>"
+                         "<iframe src='about:blank'></iframe></div>")
+        ev = dola_service._captcha_evidence(page)
+        assert "#captcha_container" in ev, ev
+        assert dola_service._captcha_gone(page) is False
+        page.evaluate("document.getElementById('captcha_container').remove()")
+        assert dola_service._captcha_gone(page) is True
+        page.close()
+        assert dola_service._captcha_gone(page) is False, "trang đã đóng không được coi là 'hết captcha'"
         browser.close()

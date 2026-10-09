@@ -67,6 +67,14 @@ Hệ thống tích hợp bộ phân tích thông minh chuẩn Notebook ChatGPT &
 
 ---
 
+## 4.1. Các cửa sổ Chrome ẩn khi tool đang chạy
+* Khi tool chạy job, bạn sẽ thấy **nhiều biểu tượng Chrome trên taskbar** nhưng không thấy cửa sổ nào: đó là Chrome của từng nick, tool đặt cửa sổ **nằm ngoài màn hình** (Dola chặn Chrome ẩn hoàn toàn nên phải dùng Chrome thật).
+* **KHÔNG đóng các cửa sổ đó** (không bấm X, không "Close window" trên taskbar): đóng là job của nick đó **thất bại** ngay.
+* Khi Dola bắt kéo mảnh ghép (captcha), tool tự đưa cửa sổ của nick đó ra màn hình với tiêu đề `Nick <tên> — kéo mảnh ghép`; kéo xong cửa sổ tự ẩn lại và job chạy tiếp. Nếu tool báo "không đưa được cửa sổ ra màn hình", bấm nút **Chrome** trên dòng nick để mở cửa sổ và kéo tay, rồi bấm **Tiếp tục** trên job.
+* Hàng đợi báo "Đang chờ chỗ mở Chrome (x/N đang dùng)" nghĩa là đã mở đủ số Chrome cho phép (Cài đặt → Số Chrome tối đa); job sẽ tự chạy khi có chỗ.
+
+---
+
 ## 5. Xem Trực Tiếp & Tải Video MP4
 * Bấm **`[Xem Video Siêu Mượt]`** để mở trình phát video chất lượng cao tích hợp.
 * Bấm **`[Tải MP4]`** (ngay trên hàng đợi hoặc trong trình phát) để lưu video về máy tính.

@@ -11,6 +11,15 @@ Thiết kế:
 - Conversation id là chuỗi số (dola_service tìm bằng regex ``/chat/(\\d+)``).
 - Trạng thái toàn cục (mode, render_seconds, credits mặc định...) đổi qua ``POST /__control``,
   đọc toàn bộ qua ``GET /__state``.
+- mode=captcha giống Dola thật (BH-39): trang tải lên bình thường; ``POST /__send`` đầu tiên trong phiên trả
+  ``{captcha: true}`` (KHÔNG tạo conversation) và trang chèn ``#captcha_container`` (div có id, không class,
+  fixed phủ cả trang, bên trong iframe ``/__captcha_frame``). ``{"solve_captcha_after": N}``: N giây sau lần hiện
+  đầu tiên server tự đổi mode về normal, trang poll ``/__captcha_state`` mỗi 1 s và gỡ lớp phủ; ``/__send`` kế
+  tiếp tạo conversation bình thường. Không đặt → captcha vĩnh viễn (test Q4).
+- ``{"auto_resend_after_solve": true}`` (chỉ có nghĩa cùng solve_captcha_after): mô phỏng Dola TỰ gửi prompt đã
+  gõ ngay khi captcha được giải (như Dola thật đôi khi làm): lúc chuyển mode về normal, server tạo conversation
+  cho mọi phiên đã bị captcha chặn với đúng prompt họ đã gửi và trừ 1 credit. Ô nhập trên trang vẫn còn chữ
+  (giống thật: trang không biết server đã gửi). Dùng để kiểm dola_service KHÔNG gửi lại (tốn thêm credit, BH-45).
 """
 from __future__ import annotations
 
@@ -30,6 +39,13 @@ MODES = ("normal", "captcha", "daily_limit", "slow", "crash")
 FAKE_MP4_SIZE = 120 * 1024  # > 50 000 byte theo điều kiện của dola_service
 DAILY_LIMIT_TEXT = "You have reached the daily limit for video generation"
 CAPTCHA_TEXT = "Verify to continue"
+# Lớp phủ captcha giống Dola thật (BH-39): div có id, không có class, position:fixed phủ cả trang, bên trong là
+# iframe captcha của ByteDance. Chỉ xuất hiện SAU khi gửi prompt lần đầu trong phiên; không nằm sẵn trong trang.
+CAPTCHA_CONTAINER_HTML = (
+    '<div id="captcha_container" style="display:block;position:fixed;inset:0;width:100%;height:100%;'
+    'z-index:111111;background:rgba(0,0,0,.5)">'
+    '<iframe src="/__captcha_frame?from=iframe&fp=verify_x" style="width:400px;height:300px"></iframe></div>'
+)
 SESSION_COOKIE = "sessionid"
 ANON_SESSION = "__anonymous__"
 
@@ -43,6 +59,11 @@ class FakeDolaState:
         self.render_seconds: float = 2.0
         self.credits: int = 4            # credit khởi điểm cho mỗi phiên mới
         self.slow_delay: float = 3.0     # mode=slow: trễ mỗi phản hồi (giây)
+        # mode=captcha: None = captcha vĩnh viễn (người dùng không giải); N = tự "giải" N giây sau lần hiện đầu tiên
+        self.solve_captcha_after: Optional[float] = None
+        self.auto_resend_after_solve: bool = False
+        self.captcha_shown_at: Optional[float] = None
+        self.captcha_solved_at: Optional[float] = None
         self.sent_prompts: List[str] = []
         self.conversations: Dict[str, Dict[str, Any]] = {}
         self.request_log: List[str] = []
@@ -57,6 +78,10 @@ class FakeDolaState:
             self.render_seconds = 2.0
             self.credits = 4
             self.slow_delay = 3.0
+            self.solve_captcha_after = None
+            self.auto_resend_after_solve = False
+            self.captcha_shown_at = None
+            self.captcha_solved_at = None
             self.sent_prompts = []
             self.conversations = {}
             self.request_log = []
@@ -91,6 +116,38 @@ class FakeDolaState:
         items.sort(key=lambda kv: kv[1]["created_at"], reverse=True)  # mới nhất trước
         return [cid for cid, _ in items]
 
+    def captcha_blocking(self) -> bool:
+        """mode=captcha còn hiệu lực không; tự chuyển về normal khi đã quá solve_captcha_after giây kể từ lần hiện đầu."""
+        with self.lock:
+            if self.mode != "captcha":
+                return False
+            if (self.solve_captcha_after is not None and self.captcha_shown_at is not None
+                    and time.time() - self.captcha_shown_at >= self.solve_captcha_after):
+                self.mode = "normal"
+                self.captcha_solved_at = time.time()
+                if self.auto_resend_after_solve:
+                    self._auto_resend_pending()
+                return False
+            return True
+
+    def mark_captcha_shown(self, sid: str, text: str = "") -> None:
+        with self.lock:
+            if self.captcha_shown_at is None:
+                self.captcha_shown_at = time.time()
+            sess = self.session(sid)
+            sess["captcha_shown"] = True
+            if text:
+                sess["pending_prompt"] = text  # prompt đã gõ lúc captcha chặn (auto_resend_after_solve)
+
+    def _auto_resend_pending(self) -> None:
+        """auto_resend_after_solve: tạo conversation cho prompt đã gửi lúc captcha chặn, trừ 1 credit (giữ lock)."""
+        for sid, sess in self.sessions.items():
+            text = sess.pop("pending_prompt", "")
+            if not text or sess["credits"] <= 0:
+                continue
+            sess["credits"] = max(0, sess["credits"] - 1)
+            self.new_conversation(sid, text)
+
     def daily_limited(self, sid: str) -> bool:
         with self.lock:
             if self.mode == "daily_limit":
@@ -122,6 +179,10 @@ class FakeDolaState:
                 "render_seconds": self.render_seconds,
                 "credits": self.credits,
                 "slow_delay": self.slow_delay,
+                "solve_captcha_after": self.solve_captcha_after,
+                "auto_resend_after_solve": self.auto_resend_after_solve,
+                "captcha_shown_at": self.captcha_shown_at,
+                "captcha_solved_at": self.captcha_solved_at,
                 "sent_prompts": list(self.sent_prompts),
                 "conversations": {k: dict(v) for k, v in self.conversations.items()},
                 "request_log": list(self.request_log),
@@ -197,9 +258,9 @@ __CAPTCHA__
     });
     const data = await resp.json();
     if (data.captcha) {
-      if (!document.querySelector('.captcha-box')) {
-        const c = document.createElement('div'); c.className = 'captcha-box'; c.textContent = '__CAPTCHA_TEXT__';
-        document.body.insertBefore(c, msgs);
+      if (!document.getElementById('captcha_container')) {
+        document.body.insertAdjacentHTML('beforeend', __CAPTCHA_CONTAINER_JSON__);
+        pollCaptcha();
       }
       return;
     }
@@ -213,6 +274,20 @@ __CAPTCHA__
       }
       history.pushState({conv: data.conversation_id}, '', '/chat/' + data.conversation_id);
     }
+  }
+  // Giống thật: lớp phủ tự biến mất khi "đã kéo xong" (server đổi mode qua solve_captcha_after)
+  function pollCaptcha() {
+    const timer = setInterval(async function () {
+      try {
+        const r = await fetch('/__captcha_state', {credentials: 'include'});
+        const st = await r.json();
+        if (!st.captcha) {
+          const c = document.getElementById('captcha_container');
+          if (c) c.remove();
+          clearInterval(timer);
+        }
+      } catch (e) { /* server tắt: thôi poll */ clearInterval(timer); }
+    }, 1000);
   }
   box.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); sendPrompt(); }
@@ -228,7 +303,7 @@ def render_page(sid: str, conv_id: Optional[str]) -> str:
     limited = STATE.daily_limited(sid)
     credits = 0 if limited else sess["credits"]
     daily_block = f'<div class="limit-banner">{DAILY_LIMIT_TEXT}</div>' if limited else ""
-    captcha_block = f'<div class="captcha-box">{CAPTCHA_TEXT}</div>' if STATE.mode == "captcha" else ""
+    captcha_block = ""  # captcha chỉ hiện sau khi gửi prompt (xem /__send), giống Dola thật
     history = ""
     if conv_id:
         conv = STATE.conversations.get(conv_id)
@@ -239,7 +314,7 @@ def render_page(sid: str, conv_id: Optional[str]) -> str:
             .replace("__DAILY_LIMIT__", daily_block)
             .replace("__CAPTCHA__", captcha_block)
             .replace("__HISTORY__", history)
-            .replace("__CAPTCHA_TEXT__", CAPTCHA_TEXT)
+            .replace("__CAPTCHA_CONTAINER_JSON__", json.dumps(CAPTCHA_CONTAINER_HTML))
             .replace("__DAILY_LIMIT_TEXT__", DAILY_LIMIT_TEXT))
 
 
@@ -279,8 +354,9 @@ async def send_prompt(request: Request):
     sid = _log(request)
     body = await request.json()
     text = str(body.get("text") or "")
-    if STATE.mode == "captcha":
-        return {"captcha": True}
+    if STATE.captcha_blocking():
+        STATE.mark_captcha_shown(sid, text)
+        return {"captcha": True}  # không tạo conversation khi captcha đang hiện
     if STATE.daily_limited(sid):
         return {"daily_limit": True, "credits_left": 0}
     sess = STATE.session(sid)
@@ -289,6 +365,19 @@ async def send_prompt(request: Request):
         credits_left = sess["credits"]
     cid = STATE.new_conversation(sid, text)
     return {"conversation_id": cid, "credits_left": credits_left}
+
+
+@app.get("/__captcha_state")
+async def captcha_state(request: Request):
+    return {"captcha": STATE.captcha_blocking(), "mode": STATE.mode, "captcha_shown_at": STATE.captcha_shown_at,
+            "captcha_solved_at": STATE.captcha_solved_at}
+
+
+@app.get("/__captcha_frame", response_class=HTMLResponse)
+async def captcha_frame(request: Request):
+    """Nội dung iframe captcha (giả lập bdcaptcha.html của ByteDance)."""
+    return HTMLResponse(f"<!doctype html><html><body><p>{CAPTCHA_TEXT}</p><p>Drag the puzzle piece into place</p>"
+                        "<div class='slider' style='width:300px;height:40px;background:#ddd'></div></body></html>")
 
 
 @app.post("/im/chain/recent_conv")
@@ -343,6 +432,13 @@ async def control(request: Request):
             STATE.render_seconds = float(body["render_seconds"])
         if "slow_delay" in body:
             STATE.slow_delay = float(body["slow_delay"])
+        if "solve_captcha_after" in body:
+            v = body["solve_captcha_after"]
+            STATE.solve_captcha_after = None if v is None else float(v)
+            STATE.captcha_shown_at = None
+            STATE.captcha_solved_at = None
+        if "auto_resend_after_solve" in body:
+            STATE.auto_resend_after_solve = bool(body["auto_resend_after_solve"])
         if "credits" in body:
             STATE.credits = int(body["credits"])
             for s in STATE.sessions.values():

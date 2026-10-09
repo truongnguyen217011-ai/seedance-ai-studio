@@ -154,3 +154,70 @@ def test_g2_browser_session_reports_slot_wait(monkeypatch):
     src = open(ROOT / "dola_service.py", encoding="utf-8").read()
     assert "slot_timeout=JOB_SLOT_TIMEOUT_SECONDS" in src and "on_wait=_on_wait_slot" in src
     assert "JOB_SLOT_TIMEOUT_SECONDS = 120" in src
+
+
+# ---------------------------------------------------------------- N-2: cửa sổ xếp bậc thang + tiêu đề theo nick
+@pytest.mark.parametrize("account_id,left", [(None, 80), (0, 80), (1, 120), (3, 200), (7, 360), (8, 80), (9, 120), ("2", 160)])
+def test_n2_show_window_bounds_staggered_by_account(account_id, left):
+    b = browser.show_window_bounds(account_id)
+    assert (b["left"], b["top"]) == (left, left), b
+    assert b["width"] == 1280 and b["height"] == 960 and b["windowState"] == "normal"
+
+
+class _FakeSession:
+    def __init__(self, log):
+        self.log = log
+
+    def send(self, method, params=None):
+        self.log.append(("cdp", method, params))
+        if method == "Browser.getWindowForTarget":
+            return {"windowId": 1, "bounds": {"windowState": "normal"}}
+        return {}
+
+    def detach(self):
+        pass
+
+
+class _FakeContext:
+    def __init__(self, log):
+        self.log = log
+
+    def new_cdp_session(self, page):
+        return _FakeSession(self.log)
+
+
+class _FakePage:
+    def __init__(self, log):
+        self.log = log
+
+    def evaluate(self, script, arg=None):
+        self.log.append(("evaluate", script, arg))
+
+    def bring_to_front(self):
+        self.log.append(("bring_to_front",))
+
+
+def test_n2_show_window_sets_title_before_bring_to_front(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "HEADLESS", False)
+    log = []
+    assert browser.show_window(_FakeContext(log), _FakePage(log), account_id=3, title="Nick A — kéo mảnh ghép") is True
+    kinds = [e[0] for e in log]
+    assert kinds == ["cdp", "cdp", "evaluate", "bring_to_front"], kinds
+    bounds_call = log[1]
+    assert bounds_call[1] == "Browser.setWindowBounds" and bounds_call[2]["bounds"]["left"] == 200, bounds_call
+    assert "document.title" in log[2][1] and log[2][2] == "Nick A — kéo mảnh ghép"
+    # Không có title → không evaluate; hide_window không đặt lại title
+    log.clear()
+    assert browser.show_window(_FakeContext(log), _FakePage(log)) is True
+    assert [e[0] for e in log] == ["cdp", "cdp", "bring_to_front"]
+    log.clear()
+    assert browser.hide_window(_FakeContext(log), _FakePage(log)) is True
+    assert "evaluate" not in [e[0] for e in log]
+    assert log[1][2]["bounds"]["left"] == -32000
+
+
+def test_n2_hidden_args_disable_native_window_occlusion():
+    """Windows: cửa sổ ngoài màn hình bị coi là che khuất → Chrome ngừng vẽ tab; cờ này tắt phép tính đó."""
+    assert "--disable-features=CalculateNativeWinOcclusion" in browser._build_args(True, False)
+    assert "--disable-features=CalculateNativeWinOcclusion" not in browser._build_args(False, False)

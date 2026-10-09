@@ -163,6 +163,8 @@ def init_db():
         ("attempts", "INTEGER DEFAULT 0"),
         ("started_at", "TIMESTAMP"),
         ("finished_at", "TIMESTAMP"),
+        # Giai đoạn 4: mã trường phái Đạo diễn AI đã dùng khi ghép prompt_final (docs/KIEN_TRUC.md mục 8)
+        ("archetype_code", "TEXT"),
     ]
     for col, decl in job_columns:
         _add_column_if_missing(cursor, "jobs", col, decl)
@@ -186,6 +188,9 @@ def init_db():
         "auto_download": "true",
         "delay_between_jobs": "5",
     }
+    # Đạo diễn AI (director.SETTING_DEFAULTS): bật/tắt từng lớp mẫu ghép vào prompt, trường phái mặc định
+    from director import SETTING_DEFAULTS as _DIRECTOR_DEFAULTS
+    defaults.update(_DIRECTOR_DEFAULTS)
     for k, v in defaults.items():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 

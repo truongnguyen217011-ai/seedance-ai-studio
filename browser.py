@@ -4,6 +4,13 @@
 - BrowserSlots: giới hạn số Chrome đang mở (semaphore đổi được kích thước theo setting max_concurrent_jobs).
 - browser_session(...): context manager giữ slot, mở persistent context, đóng và trả slot.
 - kill_orphan_chrome(profile_dir): CHỈ gọi lúc khởi động hoặc từ diagnostics khi chắc chắn nick không bận.
+- show_window(context, page, account_id=None, title=None) / hide_window(context, page): đưa cửa sổ Chrome ẩn ra
+  màn hình (người dùng kéo captcha; xếp bậc thang theo account_id, đặt document.title để nhận ra trên taskbar)
+  rồi đặt lại ngoài màn hình, qua CDP Browser.setWindowBounds. No-op khi config.HEADLESS.
+
+Chế độ "ẩn" (BH-39): Dola chặn Chrome headless bằng captcha ngay sau khi gửi prompt, nên thao tác tự động
+mặc định dùng Chrome THẬT (headless=False) với cửa sổ đặt ngoài màn hình (--window-position=-32000,-32000).
+Chỉ khi config.HEADLESS (SEEDANCE_HEADLESS=1, máy test không có màn hình) mới dùng Playwright headless=True.
 """
 import asyncio
 import os
@@ -341,7 +348,8 @@ def cleanup_profiles_on_startup() -> int:
     return total
 
 
-def _build_args(headless: bool, has_proxy: bool) -> list:
+def _build_args(hidden: bool, has_proxy: bool) -> list:
+    """hidden=True: cửa sổ đặt ngoài màn hình + cờ chống backgrounding; hidden=False: cửa sổ người dùng thấy."""
     args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-gpu-watchdog",
@@ -354,12 +362,15 @@ def _build_args(headless: bool, has_proxy: bool) -> list:
         "--disable-infobars",
         "--disable-popup-blocking",
     ]
-    if headless:
+    if hidden:
         args.extend([
-            "--window-position=-32000,-32000",
+            f"--window-position={config.HIDDEN_WINDOW_POSITION}",
             "--window-size=1280,960",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
+            # Windows: Chrome coi cửa sổ nằm ngoài màn hình là "bị che khuất" (native window occlusion) và
+            # ngừng vẽ/giảm ưu tiên tab → trang Dola không chạy JS, captcha/render không tiến. Tắt phép tính đó.
+            "--disable-features=CalculateNativeWinOcclusion",
             "--mute-audio",
         ])
     else:
@@ -371,8 +382,20 @@ def _build_args(headless: bool, has_proxy: bool) -> list:
     return args
 
 
+def playwright_headless(hidden: bool) -> bool:
+    """Chrome có chạy headless thật không: chỉ khi muốn ẩn VÀ config.HEADLESS (máy không có màn hình)."""
+    return bool(hidden) and bool(config.HEADLESS)
+
+
 def launch_context(pw, profile_dir: str, proxy: Optional[dict] = None, headless: bool = True):
-    """Mở persistent context (KHÔNG giữ slot). Chỉ browser_session() được gọi hàm này."""
+    """Mở persistent context (KHÔNG giữ slot). Chỉ browser_session() được gọi hàm này.
+
+    Tham số `headless` giữ tên cũ nhưng nghĩa là **hidden** (ẩn khỏi người dùng), BH-39:
+    - headless=True  → config.HEADLESS ? Playwright headless=True : Chrome thật, cửa sổ ngoài màn hình
+                       (`--window-position=-32000,-32000 --window-size=1280,960`, đưa ra bằng show_window);
+    - headless=False → Chrome thật, `--start-maximized` (người dùng bấm nút Chrome để đăng nhập/kéo captcha).
+    """
+    hidden = bool(headless)
     chrome = find_chrome()
     if not chrome:
         raise ChromeNotFoundError(
@@ -383,13 +406,84 @@ def launch_context(pw, profile_dir: str, proxy: Optional[dict] = None, headless:
     clean_profile_locks(profile_dir)
     opts = {
         "user_data_dir": profile_dir,
-        "headless": headless,
+        "headless": playwright_headless(hidden),
         "executable_path": chrome,
-        "args": _build_args(headless, bool(proxy)),
+        "args": _build_args(hidden, bool(proxy)),
     }
     if proxy:
         opts["proxy"] = proxy
     return pw.chromium.launch_persistent_context(**opts)
+
+
+def _set_window_bounds(context, page, bounds: dict, what: str) -> bool:
+    """Đặt vị trí/trạng thái cửa sổ Chrome chứa `page` qua CDP. Trả True nếu đặt được; lỗi chỉ ghi WARNING."""
+    if config.HEADLESS:
+        log.debug("config.HEADLESS: không có cửa sổ để %s", what)
+        return False
+    session = None
+    try:
+        session = context.new_cdp_session(page)
+        win = session.send("Browser.getWindowForTarget")
+        window_id = win["windowId"]
+        state = (win.get("bounds") or {}).get("windowState")
+        # CDP không cho đặt left/top khi cửa sổ đang maximized/minimized: đưa về normal trước
+        if state and state != "normal":
+            session.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
+        session.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": bounds})
+        return True
+    except Exception as e:  # noqa: BLE001 - cửa sổ có thể đã đóng; không được làm hỏng job
+        log.warning("Không %s được cửa sổ Chrome qua CDP: %s", what, str(e).splitlines()[0][:160])
+        return False
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except Exception as e:  # noqa: BLE001
+                log.debug("Detach CDP session lỗi: %s", str(e)[:80])
+
+
+SHOW_WINDOW_BASE = 80       # góc trên-trái của cửa sổ nick đầu tiên
+SHOW_WINDOW_STEP = 40       # mỗi nick lệch thêm chừng này px (xếp bậc thang, tối đa 8 bậc)
+SHOW_WINDOW_STEPS = 8
+
+
+def show_window_bounds(account_id=None) -> dict:
+    """Vị trí cửa sổ khi đưa ra màn hình: xếp bậc thang theo account_id để nhiều nick cùng đòi captcha
+    không đè lên nhau (nick 1 → 120,120; nick 2 → 160,160; ...; None → 80,80)."""
+    try:
+        step = int(account_id) % SHOW_WINDOW_STEPS if account_id is not None else 0
+    except (TypeError, ValueError):
+        step = 0
+    offset = SHOW_WINDOW_BASE + SHOW_WINDOW_STEP * step
+    return {"left": offset, "top": offset, "width": 1280, "height": 960, "windowState": "normal"}
+
+
+def show_window(context, page, account_id=None, title: Optional[str] = None) -> bool:
+    """Đưa cửa sổ Chrome ẩn (ngoài màn hình) ra màn hình và lên trước để người dùng thao tác (kéo captcha).
+
+    account_id: xếp bậc thang (show_window_bounds) để các cửa sổ của nhiều nick không chồng lên nhau.
+    title: đặt `document.title` (ví dụ "Nick A — kéo mảnh ghép") TRƯỚC bring_to_front để người dùng nhận ra
+    cửa sổ đúng nick trên taskbar; hide_window không cần đặt lại (trang Dola tự đổi title khi điều hướng).
+    Trả về True nếu cửa sổ đã được đưa ra; False khi config.HEADLESS (không có cửa sổ) hoặc CDP lỗi (đã ghi log).
+    """
+    ok = _set_window_bounds(context, page, show_window_bounds(account_id), "đưa ra màn hình")
+    if ok:
+        if title:
+            try:
+                page.evaluate("t => { document.title = t; }", str(title))
+            except Exception as e:  # noqa: BLE001 - chỉ là tiêu đề, không được làm hỏng bước kéo captcha
+                log.warning("Không đặt được tiêu đề cửa sổ '%s': %s", title, str(e).splitlines()[0][:120])
+        try:
+            page.bring_to_front()
+        except Exception as e:  # noqa: BLE001
+            log.warning("bring_to_front lỗi: %s", str(e).splitlines()[0][:120])
+    return ok
+
+
+def hide_window(context, page) -> bool:
+    """Đặt lại cửa sổ Chrome ra ngoài màn hình (config.HIDDEN_WINDOW_POSITION). No-op khi config.HEADLESS."""
+    left, top = (int(v) for v in config.HIDDEN_WINDOW_POSITION.split(","))
+    return _set_window_bounds(context, page, {"left": left, "top": top, "windowState": "normal"}, "ẩn")
 
 
 def slot_wait_message() -> str:
@@ -403,6 +497,8 @@ def browser_session(pw, profile_dir: str, proxy: Optional[dict] = None, headless
                     on_wait: Optional[Callable[[str], None]] = None):
     """Giữ một slot, mở Chrome trên profile_dir, yield context; luôn đóng và trả slot.
 
+    headless=True nghĩa là "ẩn khỏi người dùng" (xem launch_context, BH-39): Chrome thật ngoài màn hình,
+    hoặc headless thật khi config.HEADLESS.
     slot_timeout=None: chờ đến khi có slot (không bao giờ vượt quá giới hạn Chrome).
     on_wait(message): được gọi MỘT lần nếu không có slot ngay (job ghi status_message "Đang chờ chỗ mở Chrome (x/N)").
     """
@@ -420,8 +516,9 @@ def browser_session(pw, profile_dir: str, proxy: Optional[dict] = None, headless
         )
     context = None
     try:
-        log.debug("Mở Chrome (headless=%s, proxy=%s) cho profile %s", headless,
-                  bool(proxy), os.path.basename(profile_dir), extra={"account_id": account_id})
+        log.debug("Mở Chrome (ẩn=%s, headless thật=%s, proxy=%s) cho profile %s", headless,
+                  playwright_headless(headless), bool(proxy), os.path.basename(profile_dir),
+                  extra={"account_id": account_id})
         context = launch_context(pw, profile_dir, proxy=proxy, headless=headless)
         yield context
     finally:

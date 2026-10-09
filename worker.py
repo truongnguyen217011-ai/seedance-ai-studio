@@ -190,6 +190,25 @@ def _mark_no_chrome(conn) -> None:
         _set_message_if_changed(conn, job_row, NO_CHROME_MESSAGE)
 
 
+WAITING_SLOT_MESSAGE_LIMIT = 20  # chỉ ghi lý do "chờ chỗ mở Chrome" lên chừng này job Chờ đầu hàng (N-5)
+
+
+def _mark_waiting_for_slot(conn) -> None:
+    """Hết chỗ mở Chrome (N-5): các job Chờ đầu hàng nhận lý do "Đang chờ chỗ mở Chrome (x/N đang dùng)" để người
+    dùng biết vì sao hàng đợi đứng yên. Chỉ ghi khi nội dung đổi; khi có chỗ lại worker tự nhặt nên không cần xóa."""
+    pending = conn.execute(
+        "SELECT id, status_message FROM jobs WHERE status = ? ORDER BY batch_id, seq, id LIMIT ?",
+        (JobStatus.CHO, WAITING_SLOT_MESSAGE_LIMIT),
+    ).fetchall()
+    if not pending:
+        return
+    message = browser.slot_wait_message()
+    for job_row in pending:
+        if job_row["id"] in _running_jobs:
+            continue
+        _set_message_if_changed(conn, job_row, message)
+
+
 def _tick() -> list:
     """Một vòng quét (chạy trong thread). Trả về danh sách (job_id, account_id) cần khởi chạy.
 
@@ -208,7 +227,9 @@ def _tick() -> list:
                 # Slot trống = min(chỗ Chrome còn trống, giới hạn trừ số job đang chạy).
                 # Vế thứ hai chặn trường hợp job vừa khởi chạy chưa kịp giữ slot (tránh mở quá giới hạn).
                 free = min(browser.available(), browser.capacity() - len(_running_jobs))
-                if free > 0:
+                if free <= 0:
+                    _mark_waiting_for_slot(conn)
+                else:
                     pending = conn.execute(
                         "SELECT * FROM jobs WHERE status = ? ORDER BY batch_id, seq, id LIMIT 500",
                         (JobStatus.CHO,),

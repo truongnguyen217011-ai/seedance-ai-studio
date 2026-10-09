@@ -11,7 +11,8 @@ Cách ly giữa các test không làm bằng đổi env + importlib.reload (dễ
 trước mỗi test (fixture `env_tmp`/`db`). Cổng fake Dola cũng được chọn trước ở đây để
 SEEDANCE_DOLA_URL khớp với server khởi động sau.
 
-Có thể ghi đè: SEEDANCE_CHROME_PATH (đường dẫn Chromium), SEEDANCE_TEST_KEEP=1 (giữ lại thư mục tạm).
+Có thể ghi đè: SEEDANCE_CHROME_PATH (đường dẫn Chromium), SEEDANCE_TEST_KEEP=1 (giữ lại thư mục tạm),
+SEEDANCE_HEADLESS=0 (chạy Chrome cửa sổ ẩn thật, cần DISPLAY, ví dụ `xvfb-run -a python -m pytest tests`).
 """
 from __future__ import annotations
 
@@ -55,6 +56,10 @@ os.environ["SEEDANCE_DATA_DIR"] = SESSION_DATA_DIR
 os.environ["SEEDANCE_DB_PATH"] = os.path.join(SESSION_DATA_DIR, "studio.db")
 os.environ.setdefault("SEEDANCE_CHROME_PATH", DEFAULT_CHROME)
 os.environ["SEEDANCE_DOLA_URL"] = f"http://127.0.0.1:{FAKE_DOLA_PORT}"
+# BH-39: app mặc định mở Chrome THẬT với cửa sổ ngoài màn hình (headless bị Dola chặn), nhưng máy test Linux
+# không có DISPLAY nên launch headless=False thất bại ("Target page, context or browser has been closed").
+# Test chạy headless thật; chế độ cửa sổ ẩn thật được kiểm riêng qua xvfb (tests/test_browser_hidden_xvfb.py).
+os.environ.setdefault("SEEDANCE_HEADLESS", "1")
 
 
 def _cleanup_session_dir() -> None:

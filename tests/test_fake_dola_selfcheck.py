@@ -117,18 +117,87 @@ def test_full_job_flow_with_real_chromium(fake_dola, page):
 
 
 def test_captcha_mode(fake_dola, page):
+    """BH-39: giống Dola thật, captcha KHÔNG nằm sẵn trong trang; chỉ chèn #captcha_container sau khi gửi prompt,
+    và lần gửi đó không tạo conversation. Không đặt solve_captcha_after → lớp phủ còn mãi."""
     fake_dola.control(mode="captcha")
     page.goto(fake_dola.base_url + "/chat/", wait_until="domcontentloaded")
-    assert page.locator("div[class*='captcha']").first.is_visible()
-    assert "verify to continue" in page.inner_text("body").lower()
+    assert page.locator("#captcha_container").count() == 0, "captcha không được hiện trước khi gửi prompt"
     box = page.locator("div.ProseMirror").first
     box.click()
     box.fill("prompt bị chặn")
     page.keyboard.press("Enter")
     time.sleep(1)
+    cont = page.locator("#captcha_container")
+    assert cont.count() == 1 and cont.is_visible()
+    assert cont.get_attribute("class") in (None, ""), "div thật không có class"
+    assert "bdcaptcha" in page.locator("#captcha_container iframe").get_attribute("src") or \
+        "captcha_frame" in page.locator("#captcha_container iframe").get_attribute("src")
     assert re.search(r"/chat/\d+", page.url) is None
     st = fake_dola.get_state()
     assert st["conversations"] == {} and st["sent_prompts"] == []
+    assert st["captcha_shown_at"] is not None and st["solve_captcha_after"] is None
+    # gửi lần nữa khi captcha đang hiện: vẫn không tạo conversation
+    page.keyboard.press("Enter")
+    time.sleep(1)
+    assert fake_dola.get_state()["conversations"] == {}
+    time.sleep(3)
+    assert page.locator("#captcha_container").is_visible(), "không đặt solve_captcha_after thì captcha phải còn mãi"
+
+
+def test_captcha_mode_solved_after_delay(fake_dola, page):
+    """solve_captcha_after=3: lớp phủ tự biến mất ~3 s sau lần hiện đầu; /__send kế tiếp tạo conversation."""
+    fake_dola.control(mode="captcha", solve_captcha_after=3, render_seconds=1)
+    page.goto(fake_dola.base_url + "/chat/", wait_until="domcontentloaded")
+    box = page.locator("div.ProseMirror").first
+    box.click()
+    box.fill("prompt sau captcha")
+    page.keyboard.press("Enter")
+    time.sleep(1)
+    assert page.locator("#captcha_container").is_visible()
+    deadline = time.time() + 10
+    while time.time() < deadline and page.locator("#captcha_container").count() > 0:
+        time.sleep(0.5)
+    assert page.locator("#captcha_container").count() == 0, "lớp phủ phải tự gỡ sau solve_captcha_after"
+    st = fake_dola.get_state()
+    assert st["mode"] == "normal" and st["captcha_solved_at"] is not None
+    assert st["conversations"] == {}, "prompt gửi lúc captcha đang hiện không được tạo conversation"
+    box.click()
+    page.keyboard.press("Enter")
+    # BH-41: Sync API chỉ cập nhật page.url khi có lệnh Playwright đang chạy; không đọc page.url sau time.sleep
+    page.wait_for_url(re.compile(r"/chat/\d+"), timeout=10000)
+    st = fake_dola.get_state()
+    assert len(st["conversations"]) == 1 and st["sent_prompts"] == ["prompt sau captcha"]
+
+
+def test_captcha_mode_auto_resend_after_solve(fake_dola, page):
+    """auto_resend_after_solve: khi captcha được giải, server TỰ tạo conversation cho prompt đã gõ và trừ 1 credit;
+    ô nhập trên trang vẫn còn chữ (trang không biết). Enter lần nữa sẽ tạo conversation THỨ HAI (tốn thêm credit) →
+    đó là thứ dola_service phải tránh (BH-45)."""
+    fake_dola.control(mode="captcha", solve_captcha_after=2, auto_resend_after_solve=True, render_seconds=1, credits=4)
+    page.goto(fake_dola.base_url + "/chat/", wait_until="domcontentloaded")
+    box = page.locator("div.ProseMirror").first
+    box.click()
+    box.fill("prompt dola tự gửi")
+    page.keyboard.press("Enter")
+    time.sleep(1)
+    assert page.locator("#captcha_container").is_visible()
+    deadline = time.time() + 10
+    while time.time() < deadline and page.locator("#captcha_container").count() > 0:
+        time.sleep(0.5)
+    assert page.locator("#captcha_container").count() == 0
+    st = fake_dola.get_state()
+    assert st["auto_resend_after_solve"] is True and st["mode"] == "normal"
+    assert len(st["conversations"]) == 1 and st["sent_prompts"] == ["prompt dola tự gửi"]
+    sess = next(s for s in st["sessions"].values() if s.get("captcha_shown"))
+    assert sess["credits"] == 3 and "pending_prompt" not in sess
+    assert box.inner_text().strip() == "prompt dola tự gửi", "ô nhập vẫn còn chữ như Dola thật"
+    # Gửi lại mù quáng → conversation thứ hai, mất thêm credit
+    box.click()
+    page.keyboard.press("Enter")
+    page.wait_for_url(re.compile(r"/chat/\d+"), timeout=10000)
+    st = fake_dola.get_state()
+    assert len(st["conversations"]) == 2 and len(st["sent_prompts"]) == 2
+    assert next(s for s in st["sessions"].values() if s.get("captcha_shown"))["credits"] == 2
 
 
 def test_daily_limit_mode(fake_dola, page):

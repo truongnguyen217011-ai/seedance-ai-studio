@@ -242,6 +242,9 @@ async function fetchJobs() {
       return;
     }
 
+    _jobsById = {};
+    jobs.forEach(j => { _jobsById[j.id] = j; });
+
     tbody.innerHTML = jobs.map(j => {
       const isRunning = j.status === JOB_STATUS.DANG_CHAY;
       const isCompleted = j.status === JOB_STATUS.HOAN_THANH;
@@ -312,6 +315,10 @@ async function fetchJobs() {
           <td class="p-2.5">${proxyBadge}</td>
           <td class="p-2.5">
             <div class="font-medium text-gray-200 line-clamp-1" title="${escapeHtml(promptFull)}">${escapeHtml(titleText)}</div>
+            <div class="mt-0.5 flex items-center space-x-1.5">
+              ${j.archetype_code ? `<span class="px-1 py-0.5 rounded bg-[#0f2126] text-cyan-300 border border-cyan-900/60 text-[9px] font-mono" title="Trường phái Đạo diễn AI đã ghép vào prompt">${escapeHtml(j.archetype_code)}</span>` : `<span class="text-[9px] text-gray-600" title="Job này không qua Đạo diễn AI">không đạo diễn</span>`}
+              <button type="button" onclick="openJobPromptModal(${j.id})" class="px-1.5 py-0.5 rounded bg-[#101722] text-gray-300 hover:text-cyan-300 border border-[#1b2636] text-[9px] font-semibold" title="Xem prompt gốc và prompt đã đạo diễn (sửa được khi job chưa chạy)">Prompt</button>
+            </div>
             ${videoButtons}
           </td>
           <td class="p-2.5 text-center">${jobActionButtons(j)}</td>
@@ -909,32 +916,152 @@ async function fetchAccounts() {
   }
 }
 
-// Action: Submit Batch Prompts
-async function submitBatchPrompts() {
+// ==================== ĐẠO DIỄN AI (backend director.py; giao diện chỉ gọi preview, không tự ghép bằng JS — BH-41) ====================
+function _batchPromptLines() {
   const text = document.getElementById('batchPromptsInput').value;
-  const model = document.getElementById('batchModelSelect').value;
-  const duration = document.getElementById('batchDurationSelect').value;
+  return text.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+}
 
-  const prompts = text.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+function _directorRequestBody(prompts) {
+  const styleEl = document.getElementById('batchStyleSelect');
+  const dirEl = document.getElementById('batchDirectorEnabled');
+  return {
+    prompts,
+    model: document.getElementById('batchModelSelect').value,
+    duration: document.getElementById('batchDurationSelect').value,
+    style_code: styleEl ? styleEl.value : '',
+    director: dirEl ? !!dirEl.checked : null
+  };
+}
+
+function renderDirectorPreview(items) {
+  const box = document.getElementById('directorPreviewBox');
+  if (!box) return;
+  if (!items || items.length === 0) {
+    box.innerHTML = '<div class="p-2 text-[11px] text-gray-500">Không có dòng prompt nào để xem trước.</div>';
+    box.classList.remove('hidden');
+    return;
+  }
+  box.innerHTML = `
+    <table class="w-full text-[10px]">
+      <thead class="sticky top-0 bg-[#0b1017] text-gray-400 uppercase">
+        <tr><th class="p-1.5 text-left w-6">#</th><th class="p-1.5 text-left w-1/3">Prompt gốc</th><th class="p-1.5 text-left">Đã đạo diễn (gửi Dola)</th></tr>
+      </thead>
+      <tbody class="divide-y divide-[#101722]">
+        ${items.map((it, i) => `
+          <tr class="align-top">
+            <td class="p-1.5 text-gray-500 font-mono">${i + 1}</td>
+            <td class="p-1.5 text-gray-300">${escapeHtml(it.prompt)}</td>
+            <td class="p-1.5 text-gray-200">
+              <div class="mb-0.5 flex items-center space-x-1">
+                <span class="px-1 py-0.5 rounded bg-[#0f2126] text-cyan-300 border border-cyan-900/60 font-mono" title="${escapeHtml(it.archetype_name || '')}">${escapeHtml(it.archetype_code || 'tắt')}</span>
+                ${(it.characters && it.characters.length) ? `<span class="text-purple-300" title="Nhân vật khớp Kho nhân vật">Nhân vật: ${escapeHtml(it.characters.join(', '))}</span>` : ''}
+                ${(it.existing_layers && it.existing_layers.length) ? `<span class="text-gray-500" title="Lớp prompt đã tự mô tả, không chèn lại">đã có: ${escapeHtml(it.existing_layers.join(', '))}</span>` : ''}
+              </div>
+              <div class="font-mono whitespace-pre-wrap break-words">${escapeHtml(it.prompt_final)}</div>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+  box.classList.remove('hidden');
+}
+
+async function previewDirectorPrompts() {
+  const prompts = _batchPromptLines();
+  if (prompts.length === 0) {
+    showToast('Nhập ít nhất 1 dòng prompt rồi mới xem trước được', 'warning');
+    return;
+  }
+  try {
+    const data = await apiJson('/api/director/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_directorRequestBody(prompts))
+    });
+    if (data.success === false) {
+      showToast('Không xem trước được: ' + (data.message || 'máy chủ từ chối'), 'error', 8000);
+      return;
+    }
+    renderDirectorPreview(data.items || []);
+    if (data.director_enabled === false) showToast('Đạo diễn AI đang tắt: prompt chỉ được thêm câu mở đầu, không ghép mẫu', 'warning', 6000);
+  } catch (err) {
+    reportFetchError('Không xem trước được prompt đã đạo diễn', err);
+  }
+}
+
+// Action: Submit Batch Prompts (backend ghép prompt_final lúc tạo job; trả về mã trường phái từng job)
+async function submitBatchPrompts() {
+  const prompts = _batchPromptLines();
   if (prompts.length === 0) {
     alert('Vui lòng nhập ít nhất 1 dòng prompt!');
     return;
   }
 
   try {
-    const res = await fetch('/api/jobs/batch', {
+    const data = await apiJson('/api/jobs/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompts, model, duration })
+      body: JSON.stringify(_directorRequestBody(prompts))
     });
-    const data = await res.json();
-    if (data.success) {
-      closeModal('modalBatchPrompts');
-      document.getElementById('batchPromptsInput').value = '';
-      refreshData();
+    if (data.success === false) {
+      showToast('Không tạo được job: ' + (data.message || 'máy chủ từ chối'), 'error', 8000);
+      return;
     }
+    closeModal('modalBatchPrompts');
+    document.getElementById('batchPromptsInput').value = '';
+    const box = document.getElementById('directorPreviewBox');
+    if (box) { box.innerHTML = ''; box.classList.add('hidden'); }
+    const codes = Array.from(new Set((data.jobs || []).map(j => j.archetype).filter(Boolean)));
+    showToast(`Đã nạp ${data.created} job vào hàng đợi` + (codes.length ? ` · trường phái: ${codes.join(', ')}` : ' · không qua Đạo diễn AI'), 'success', 7000);
+    refreshData();
   } catch (err) {
-    showToast('Lỗi gửi jobs: ' + err.message, 'error');
+    reportFetchError('Không gửi được lô prompt', err);
+  }
+}
+
+// Modal xem/sửa prompt đã đạo diễn của một job
+let _jobsById = {};
+let _jobPromptEditingId = null;
+const JOB_PROMPT_EDITABLE = [JOB_STATUS.CHO, JOB_STATUS.THAT_BAI, JOB_STATUS.TAM_DUNG];
+
+function openJobPromptModal(id) {
+  const j = _jobsById[id];
+  if (!j) { showToast(`Không tìm thấy job #${id} trong bảng, bấm làm mới`, 'warning'); return; }
+  _jobPromptEditingId = id;
+  document.getElementById('jobPromptTitle').textContent = `Prompt của job #${id}`;
+  document.getElementById('jobPromptArchetype').textContent = j.archetype_code ? `Trường phái ${j.archetype_code}` : 'Không qua Đạo diễn AI';
+  document.getElementById('jobPromptOriginal').value = j.prompt || '';
+  document.getElementById('jobPromptFinal').value = j.prompt_final || '';
+  const editable = JOB_PROMPT_EDITABLE.includes(j.status);
+  const ta = document.getElementById('jobPromptFinal');
+  const btn = document.getElementById('jobPromptSaveBtn');
+  ta.readOnly = !editable;
+  btn.disabled = !editable;
+  document.getElementById('jobPromptHint').textContent = editable
+    ? `Job đang '${j.status}': sửa xong bấm Lưu, worker sẽ gửi đúng nội dung này sang Dola.`
+    : `Job đang '${j.status}': không sửa được prompt lúc này (chỉ sửa khi ${JOB_PROMPT_EDITABLE.join(', ')}).`;
+  openModal('modalJobPrompt');
+}
+
+async function saveJobPromptFinal() {
+  const id = _jobPromptEditingId;
+  if (!id) return;
+  const prompt_final = document.getElementById('jobPromptFinal').value;
+  try {
+    const data = await apiJson(`/api/jobs/${id}/prompt_final`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt_final })
+    });
+    if (data.success === false) {
+      showToast(`Không lưu được prompt job #${id}: ${data.message || 'máy chủ từ chối'}`, 'error', 8000);
+      return;
+    }
+    showToast(`Đã lưu prompt đã đạo diễn của job #${id}`, 'success');
+    closeModal('modalJobPrompt');
+    fetchJobs();
+  } catch (err) {
+    reportFetchError(`Không lưu được prompt job #${id}`, err);
   }
 }
 
@@ -1032,9 +1159,38 @@ async function loadSettings() {
     set('settingDuration', s.default_duration);
     const cp = document.getElementById('settingChromePath');
     if (cp) cp.value = s.chrome_path || '';
+    applyDirectorSettings(s);
   } catch (err) {
     reportFetchError('Không tải được cài đặt', err);
   }
+}
+
+// Setting director_* (director.SETTING_DEFAULTS): "1"/"0"; thiếu key → coi như bật (giống backend)
+const DIRECTOR_SETTING_CHECKBOXES = Object.freeze({
+  director_enabled: 'settingDirectorEnabled',
+  director_layer_camera: 'settingDirectorCamera',
+  director_layer_lighting: 'settingDirectorLighting',
+  director_layer_palette: 'settingDirectorPalette',
+  director_layer_character: 'settingDirectorCharacter'
+});
+
+function _settingOn(v) {
+  if (v === null || v === undefined || v === '') return true;
+  return ['1', 'true', 'on', 'yes'].includes(String(v).toLowerCase());
+}
+
+function applyDirectorSettings(s) {
+  Object.entries(DIRECTOR_SETTING_CHECKBOXES).forEach(([key, id]) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = _settingOn(s[key]);
+  });
+  const styleEl = document.getElementById('settingDirectorStyle');
+  if (styleEl) styleEl.value = s.director_default_style || '';
+  // Modal lô prompt lấy mặc định theo setting
+  const batchDir = document.getElementById('batchDirectorEnabled');
+  if (batchDir) batchDir.checked = _settingOn(s.director_enabled);
+  const batchStyle = document.getElementById('batchStyleSelect');
+  if (batchStyle && !batchStyle.value) batchStyle.value = s.director_default_style || '';
 }
 
 async function saveSettings() {
@@ -1051,12 +1207,21 @@ async function saveSettings() {
     return;
   }
 
+  const body = { max_concurrent_jobs, default_model, default_duration, delay_between_jobs, chrome_path };
+  Object.entries(DIRECTOR_SETTING_CHECKBOXES).forEach(([key, id]) => {
+    const el = document.getElementById(id);
+    if (el) body[key] = el.checked ? '1' : '0';
+  });
+  const styleEl = document.getElementById('settingDirectorStyle');
+  if (styleEl) body.director_default_style = styleEl.value || '';
+
   try {
     await apiJson('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ max_concurrent_jobs, default_model, default_duration, delay_between_jobs, chrome_path })
+      body: JSON.stringify(body)
     });
+    applyDirectorSettings(body);
     showToast('Đã lưu cài đặt hệ thống', 'success');
     fetchHealth();
   } catch (err) {
@@ -1363,34 +1528,11 @@ function analyzePromptWithChatGPTAndBructa(rawPrompt) {
   };
 }
 
-// ==================== ĐẠO DIỄN AI TỰ ĐỘNG PHÂN TÍCH PROMPT VIDEO HÀNG LOẠT ====================
+// ==================== ĐẠO DIỄN AI PHÂN TÍCH PROMPT VIDEO HÀNG LOẠT ====================
+// Trước đây hàm này ghép mẫu bằng JS rồi ghi đè ô nhập (backend không biết). Nay logic ghép nằm ở director.py
+// (một bản duy nhất) và chạy lúc tạo job; nút trên giao diện chỉ gọi /api/director/preview để xem trước (BH-41).
 function autoDetectAndEnhanceBructa() {
-  const textarea = document.getElementById('batchPromptsInput');
-  if (!textarea) return;
-
-  const rawText = textarea.value.trim();
-  if (!rawText) {
-    alert("Vui lòng nhập hoặc dán ít nhất 1 dòng prompt (bằng tiếng Việt hoặc tiếng Anh) để Đạo Diễn AI phân tích!");
-    return;
-  }
-
-  const lines = rawText.split('\n');
-  const detectedArchetypes = new Set();
-  let processedCount = 0;
-
-  const enhanced = lines.map((line) => {
-    line = line.trim();
-    if (!line) return "";
-    processedCount++;
-    const res = analyzePromptWithChatGPTAndBructa(line);
-    detectedArchetypes.add(`• [${res.code}] ${res.name}`);
-    return `${res.enhancedPrompt}, --ar 16:9`;
-  });
-
-  textarea.value = enhanced.filter(l => l.length > 0).join('\n\n');
-  
-  const archSummary = Array.from(detectedArchetypes).join('\n');
-  alert(`✅ ĐẠO DIỄN AI ĐÃ TỰ ĐỘNG PHÂN TÍCH & KẾT HỢP XONG ${processedCount} PROMPT!\n\n🎯 CÁC TRƯỜNG PHÁI THỊ GIÁC ĐÃ TỰ ĐỘNG NHẬN DIỆN:\n${archSummary}\n\n🎬 Đã kết hợp tự động:\n1. Bố cục, Cỡ cảnh & Góc máy chuẩn Bructa\n2. Ống kính & Ánh sáng Chiaroscuro/Rim Light\n3. Bảng màu kinh điển tương thích 100%\n4. Công thức 6 thành tố nghệ thuật bóc tách từ 186 họa sĩ ChatGPT!`);
+  return previewDirectorPrompts();
 }
 
 // ==================== ĐẠO DIỄN AI TỰ ĐỘNG PHÂN TÍCH PROMPT TẠO ẢNH ====================

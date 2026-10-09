@@ -24,7 +24,7 @@ from playwright.sync_api import sync_playwright
 
 import config
 from account_pool import AccountPool
-from browser import ChromeNotFoundError, browser_session
+from browser import ChromeNotFoundError, browser_session, hide_window, show_window
 from constants import AccountStatus, JobStatus, NeedsManual, Reason
 from database import get_connection
 from diagnostics import mask_proxy
@@ -82,7 +82,10 @@ SELECTORS = {
     ]
 }
 
-CAPTCHA_SELECTOR = "iframe[src*='captcha'], iframe[src*='secsdk'], iframe[id*='captcha'], div[class*='captcha'], div[class*='secsdk']"
+# `#captcha_container`: lớp phủ thật của Dola (div có id, KHÔNG có class, position:fixed phủ cả trang, bên trong là
+# iframe bdcaptcha.html của ByteDance) xuất hiện ngay sau khi gửi prompt (BH-39). Các mẫu còn lại là dự phòng.
+CAPTCHA_SELECTOR = ("#captcha_container, iframe[src*='captcha'], iframe[src*='secsdk'], iframe[id*='captcha'], "
+                    "div[class*='captcha'], div[class*='secsdk']")
 CAPTCHA_KEYWORDS = [
     "verify to continue", "drag the puzzle piece into place",
     "kéo mảnh ghép", "xác minh để tiếp tục", "vui lòng hoàn tất xác minh",
@@ -539,6 +542,20 @@ def _captcha_evidence(page) -> str:
 def _detect_captcha(page) -> bool:
     """Có khung/chữ yêu cầu kéo mảnh ghép (slide captcha) đang HIỂN THỊ trên trang không."""
     return bool(_captcha_evidence(page))
+
+
+def _captcha_gone(page) -> bool:
+    """True khi trang còn mở và KHÔNG còn phần tử captcha nào hiển thị (người dùng đã kéo xong).
+
+    Trang đã đóng/crash không được coi là "hết captcha" (sẽ lộ ra ở bước sau như lỗi kỹ thuật, không phải "đã giải").
+    """
+    try:
+        if page.is_closed():
+            return False
+        return _captcha_evidence(page) == ""
+    except Exception as e:  # noqa: BLE001
+        log.debug("Kiểm tra captcha đã biến mất lỗi: %s", str(e)[:80])
+        return False
 
 
 def _busy_message(acc_name: str, account_id: int) -> str:
@@ -1012,19 +1029,30 @@ def _fetch_single_chain(page, conv_id: str, job_id=None):
 
 
 def build_full_prompt(job: dict) -> str:
-    """Prompt cuối cùng gửi Dola (giữ nguyên công thức cũ)."""
-    dur = job.get("duration") or 30
-    raw_p = (job.get("prompt") or "").strip()
-    raw_p = re.sub(r'^(Làm video|Tạo video|Video đã tạo)[:\s\-]*', '', raw_p, flags=re.I).strip()
-    has_cine = any(k in raw_p.lower() for k in [
-        'shot', 'lens', 'lighting', 'cinematic', '8k', '4k', 'camera', 'fpv', 'góc quay', 'ánh sáng', 'điện ảnh'
-    ])
-    if not has_cine:
-        action_motion = ("Góc quay camera FPV chuyển động linh hoạt bám sát nhân vật, các pha nhào lộn và chuyển động "
-                         "hành động dồn dập kịch tính, ánh sáng điện ảnh Hollywood bom tấn, dynamic high-speed acrobatic action, "
-                         "Hollywood blockbuster action masterpiece, 4k ultra realistic.")
-        return f"Tạo video Seedance 2.5 dài {dur} giây: {raw_p}. {action_motion}"
-    return f"Tạo video Seedance 2.5 dài {dur} giây: {raw_p}"
+    """Prompt cuối cùng gửi Dola = prompt đã đạo diễn (jobs.prompt_final, BH-42).
+
+    Job tạo trước khi có Đạo diễn AI chưa có prompt_final → ghép bằng director.compose với
+    cài đặt và kho nhân vật hiện tại. Không còn câu "FPV bom tấn" cố định.
+    """
+    ready = (job.get("prompt_final") or "").strip()
+    if ready:
+        return ready
+    import director  # import muộn: director là hàm thuần, không phụ thuộc module này
+    conn = get_connection()
+    try:
+        settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
+        assets = [dict(r) for r in conn.execute(
+            "SELECT id, name, character_code, image_url, description FROM assets").fetchall()]
+    finally:
+        conn.close()
+    res = director.compose(
+        job.get("prompt") or "",
+        duration_label=job.get("duration") or settings.get("default_duration") or "30 giây",
+        model=job.get("model") or settings.get("default_model") or "Seedance 2.5",
+        options=director.options_from_settings(settings),
+        assets=assets,
+    )
+    return res["prompt_final"]
 
 
 def update_job_status(job_id, status, status_message, progress, local_video_path=None, **fields):
@@ -1107,6 +1135,185 @@ def _handle_captcha(job_id: int, acc: dict, page) -> None:
               page, "captcha", module="Captcha")
 
 
+def _captcha_timeout_text(seconds: int) -> str:
+    return f"{seconds // 60} phút" if seconds >= 60 and seconds % 60 == 0 else f"{seconds} giây"
+
+
+def _wait_user_solve_captcha(job_id: int, acc: dict, context, page) -> bool:
+    """Captcha giữa chừng job: đưa cửa sổ Chrome của nick ra màn hình, chờ người dùng kéo mảnh ghép tại chỗ
+    (tối đa config.CAPTCHA_SOLVE_TIMEOUT_SECONDS) rồi ẩn cửa sổ lại. Trả True nếu captcha đã biến mất.
+
+    Không đổi trạng thái job (vẫn Đang chạy) và không đặt needs_manual trong lúc chờ: nick vẫn do job này giữ,
+    người dùng thao tác trực tiếp trên cửa sổ đang mở. Hết giờ → False, người gọi _handle_captcha (Tạm dừng).
+    """
+    account_id = acc["id"]
+    timeout = int(config.CAPTCHA_SOLVE_TIMEOUT_SECONDS)
+    evidence = _captcha_evidence(page) or "không rõ"
+    job = _load_job(job_id) or {}
+    progress = int(job.get("progress") or 30)
+    shown = show_window(context, page, account_id=account_id, title=f"Nick {acc['name']} — kéo mảnh ghép")
+    if shown:
+        msg = (f"Dola yêu cầu kéo mảnh ghép: cửa sổ Chrome của nick '{acc['name']}' đã được đưa ra màn hình, "
+               f"hãy kéo mảnh ghép trong {_captcha_timeout_text(timeout)}")
+    else:
+        # N-4: người dùng không thấy cửa sổ nào để kéo → không chờ đủ 3 phút vô ích, chỉ chờ ngắn rồi Tạm dừng
+        timeout = min(timeout, int(config.CAPTCHA_NO_WINDOW_TIMEOUT_SECONDS))
+        msg = (f"Dola yêu cầu kéo mảnh ghép nhưng không đưa được cửa sổ Chrome của nick '{acc['name']}' ra màn hình, "
+               f"hãy bấm nút Chrome để kéo tay; job chờ thêm {_captcha_timeout_text(timeout)} rồi Tạm dừng")
+    update_job_status(job_id, JobStatus.DANG_CHAY, msg, progress)
+    arts = save_failure_artifacts(page, "captcha_shown", job_id=job_id, account_id=account_id)
+    log_event(f"Job #{job_id}: {msg} (dấu hiệu: {evidence}){artifact_suffix(arts)}", "WARNING", "Captcha",
+              job_id=job_id, account_id=account_id)
+
+    started = time.time()
+    solved = False
+    while time.time() - started < timeout:
+        time.sleep(2)
+        if _captcha_gone(page):
+            solved = True
+            break
+    elapsed = int(time.time() - started)
+    hide_window(context, page)
+    if not solved:
+        log_event(f"Job #{job_id}: sau {_captcha_timeout_text(timeout)} captcha vẫn còn trên nick '{acc['name']}', "
+                  f"tạm dừng job để kéo tay", "WARNING", "Captcha", job_id=job_id, account_id=account_id)
+        return False
+    _set_account_fields(account_id, needs_manual=None, last_error=None)
+    update_job_status(job_id, JobStatus.DANG_CHAY, f"Đã kéo xong mảnh ghép trên nick '{acc['name']}', tiếp tục job", progress)
+    log_event(f"Job #{job_id}: người dùng đã kéo xong mảnh ghép trên nick '{acc['name']}' sau {elapsed}s, "
+              f"cửa sổ đã ẩn lại, tiếp tục job", "SUCCESS", "Captcha", job_id=job_id, account_id=account_id)
+    return True
+
+
+def _send_prompt(page, full_prompt: str) -> bool:
+    """Gõ prompt vào ô nhập và Enter. False nếu không thấy ô nhập."""
+    input_box = page.locator("div.ProseMirror, textarea, [contenteditable='true']").first
+    if not input_box.is_visible():
+        return False
+    input_box.click()
+    input_box.fill(full_prompt)
+    time.sleep(1)
+    page.keyboard.press("Enter")
+    return True
+
+
+def _wait_new_conversation(page, initial_conv_ids: set, seconds: float, job_id: int) -> Optional[str]:
+    """Chờ tối đa `seconds` cho tới khi URL hoặc recent_conv có conversation KHÔNG nằm trong initial_conv_ids."""
+    started = time.time()
+    while True:
+        m_url = re.search(r'/chat/(\d+)', page.url)
+        if m_url and m_url.group(1) not in initial_conv_ids:
+            return m_url.group(1)
+        for cand_id in _fetch_recent_conv_ids(page, 3, 3, job_id):
+            if cand_id and cand_id not in initial_conv_ids:
+                return cand_id
+        if time.time() - started >= seconds:
+            return None
+        time.sleep(3)
+
+
+# Sau khi người dùng kéo xong captcha: chờ chừng này giây xem prompt đã gửi có tạo conversation không, rồi gửi lại 1 lần
+CONV_WAIT_AFTER_CAPTCHA_SECONDS = 15
+CONV_WAIT_SECONDS = 30
+# BH-45: credit đã bị trừ sau captcha = Dola đã nhận prompt → KHÔNG gửi lại, chỉ chờ thêm conversation chừng này giây
+CONV_WAIT_CREDIT_SPENT_SECONDS = 45
+# Ô nhập trống mà không đọc được credit: chưa có bằng chứng gì → chờ thêm chừng này giây rồi mới gửi lại
+CONV_WAIT_NO_EVIDENCE_SECONDS = 15
+PROMPT_PREFIX_CHECK_CHARS = 40
+
+_INPUT_BOX_SELECTOR = "div.ProseMirror, textarea, [contenteditable='true']"
+
+
+def _input_box_text(page) -> Optional[str]:
+    """Nội dung hiện có trong ô nhập prompt ("" nếu trống); None nếu không đọc được / không thấy ô."""
+    try:
+        box = page.locator(_INPUT_BOX_SELECTOR).first
+        if not box.is_visible():
+            return None
+        tag = (box.evaluate("e => e.tagName") or "").lower()
+        text = box.input_value() if tag == "textarea" else box.inner_text()
+        return (text or "").strip()
+    except Exception as e:  # noqa: BLE001
+        log.debug("Không đọc được ô nhập prompt: %s", str(e)[:80])
+        return None
+
+
+def _resend_with_enter(page) -> bool:
+    """Ô nhập còn nguyên prompt: chỉ bấm Enter (không gõ lại, tránh nhân đôi nội dung). False nếu không thấy ô."""
+    box = page.locator(_INPUT_BOX_SELECTOR).first
+    if not box.is_visible():
+        return False
+    box.click()
+    time.sleep(0.5)
+    page.keyboard.press("Enter")
+    return True
+
+
+def _conv_after_captcha_solved(job: dict, acc: dict, page, initial_conv_ids: set, full_prompt: str,
+                               credits_pre: Optional[int] = None):
+    """Captcha vừa được giải: chờ 15 s cho conversation mới; chưa có thì KIỂM BẰNG CHỨNG rồi mới gửi lại (BH-45).
+
+    Gửi lại prompt tốn credit, nên trước khi lặp lại phải chắc lần gửi trước KHÔNG thành công:
+    (a) credit đọc được và đã giảm so với trước captcha → Dola đã nhận prompt: không gửi lại, chỉ chờ thêm
+        conversation tối đa CONV_WAIT_CREDIT_SPENT_SECONDS;
+    (b) ô nhập còn nguyên prompt (chứa 40 ký tự đầu) → chưa gửi: gửi lại bằng Enter (không gõ lại);
+    (c) ô nhập trống: credit đọc được (không giảm) → coi như chưa gửi, gõ lại + Enter; credit không đọc được →
+        chờ thêm CONV_WAIT_NO_EVIDENCE_SECONDS rồi mới gõ lại + Enter.
+    Nhánh được chọn ghi rõ trong nhật ký. Trả về (conv_id | None, finalized): finalized=True nghĩa là trạng thái
+    cuối của job đã được ghi (captcha lại, không thấy ô nhập) và người gọi phải return ngay.
+    """
+    job_id, account_id = job["id"], acc["id"]
+    conv_id = _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_AFTER_CAPTCHA_SECONDS, job_id)
+    if conv_id:
+        return conv_id, False
+
+    credits_now = extract_dola_credits(page)
+    if credits_now is not None and credits_pre is not None and credits_now < credits_pre:
+        # (a) đã mất credit → prompt đã được Dola nhận, gửi lại sẽ tốn thêm 1 credit cho video thứ hai
+        msg = (f"credit của nick '{acc['name']}' đã giảm {credits_pre} → {credits_now} sau khi kéo captcha, "
+               f"Dola đã nhận prompt nên KHÔNG gửi lại; chờ thêm conversation tối đa {CONV_WAIT_CREDIT_SPENT_SECONDS}s")
+        log_event(f"Job #{job_id}: {msg}", "INFO", "Engine", job_id=job_id, account_id=account_id)
+        update_job_status(job_id, JobStatus.DANG_CHAY, "Đã kéo xong mảnh ghép, Dola đã nhận prompt, chờ cuộc trò chuyện mới", 30)
+        return _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_CREDIT_SPENT_SECONDS, job_id), False
+
+    box_text = _input_box_text(page)
+    prefix = full_prompt[:PROMPT_PREFIX_CHECK_CHARS]
+    if box_text and prefix in box_text:
+        # (b) prompt vẫn nằm trong ô nhập → lần gửi lúc captcha hiện không đi, chỉ cần Enter
+        log_event(f"Job #{job_id}: {CONV_WAIT_AFTER_CAPTCHA_SECONDS}s sau khi kéo xong captcha vẫn chưa có conversation "
+                  f"mới, ô nhập còn nguyên prompt (credit {credits_pre} → {credits_now}), gửi lại prompt một lần bằng Enter",
+                  "INFO", "Engine", job_id=job_id, account_id=account_id)
+        update_job_status(job_id, JobStatus.DANG_CHAY, "Đã kéo xong mảnh ghép, gửi lại prompt sang Dola (Enter)", 30)
+        sent = _resend_with_enter(page)
+    else:
+        if credits_now is None:
+            # (c2) không có bằng chứng nào: chờ thêm rồi mới gõ lại
+            log_event(f"Job #{job_id}: sau khi kéo xong captcha ô nhập trống và không đọc được credit, chưa rõ prompt "
+                      f"đã gửi chưa; chờ thêm {CONV_WAIT_NO_EVIDENCE_SECONDS}s trước khi gửi lại",
+                      "INFO", "Engine", job_id=job_id, account_id=account_id)
+            conv_id = _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_NO_EVIDENCE_SECONDS, job_id)
+            if conv_id:
+                return conv_id, False
+            branch = "ô nhập trống, credit không đọc được, đã chờ thêm vẫn chưa có conversation"
+        else:
+            # (c1) credit không giảm, ô trống (trang xóa ô dù không gửi) → chưa gửi
+            branch = f"ô nhập trống nhưng credit không giảm ({credits_pre} → {credits_now})"
+        log_event(f"Job #{job_id}: {branch}, gửi lại prompt một lần", "INFO", "Engine",
+                  job_id=job_id, account_id=account_id)
+        update_job_status(job_id, JobStatus.DANG_CHAY, "Đã kéo xong mảnh ghép, gửi lại prompt sang Dola", 30)
+        sent = _send_prompt(page, full_prompt)
+    if not sent:
+        _fail_job(job_id, account_id, JobStatus.THAT_BAI, "Không thấy ô nhập prompt trên trang Dola sau khi kéo captcha",
+                  page, "no_input")
+        return None, True
+    time.sleep(4)
+    if _detect_captcha(page):
+        # Dola đòi captcha lần thứ hai ngay sau khi vừa giải: không chờ tại chỗ nữa, Tạm dừng để người dùng xem
+        _handle_captcha(job_id, acc, page)
+        return None, True
+    return _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_SECONDS, job_id), False
+
+
 def _download_video(url: str, dest_file: str, job_id: int) -> bool:
     req_dl = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -1150,7 +1357,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         log_event(f"Job #{job_id}: {msg}", "WARNING", "Auth", job_id=job_id, account_id=account_id)
         return
 
-    if _detect_captcha(page):
+    if _detect_captcha(page) and not _wait_user_solve_captcha(job_id, acc, context, page):
         _handle_captcha(job_id, acc, page)
         return
 
@@ -1173,22 +1380,22 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
 
     # 2. Gửi prompt
     full_prompt = build_full_prompt(job)
-    _set_job_fields(job_id, prompt_final=full_prompt)
+    if (job.get("prompt_final") or "").strip() != full_prompt:
+        _set_job_fields(job_id, prompt_final=full_prompt)
     update_job_status(job_id, JobStatus.DANG_CHAY, "Đang gửi prompt sang Dola", 30)
-    input_box = page.locator("div.ProseMirror, textarea, [contenteditable='true']").first
-    if input_box.is_visible():
-        input_box.click()
-        input_box.fill(full_prompt)
-        time.sleep(1)
-        page.keyboard.press("Enter")
-    else:
+    if not _send_prompt(page, full_prompt):
         _fail_job(job_id, account_id, JobStatus.THAT_BAI, "Không thấy ô nhập prompt trên trang Dola", page, "no_input")
         return
     time.sleep(4)
 
+    # Dola (chống bot) thường chèn captcha NGAY SAU khi gửi prompt (BH-39): chờ người dùng kéo tại chỗ,
+    # hết giờ mới Tạm dừng. Prompt gửi lúc captcha hiện không tạo conversation → sau khi giải phải gửi lại.
+    captcha_solved = False
     if _detect_captcha(page):
-        _handle_captcha(job_id, acc, page)
-        return
+        if not _wait_user_solve_captcha(job_id, acc, context, page):
+            _handle_captcha(job_id, acc, page)
+            return
+        captcha_solved = True
 
     body_text = _safe_body_text(page)
     if RE_DAILY_LIMIT.search(body_text) or "only have 0 left today" in body_text or "chỉ còn 0" in body_text:
@@ -1196,26 +1403,23 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         return
 
     # 3. Lấy conversation_id MỚI
-    conv_id = None
-    wait_conv_start = time.time()
-    while time.time() - wait_conv_start < 30:
-        m_url = re.search(r'/chat/(\d+)', page.url)
-        if m_url and m_url.group(1) not in initial_conv_ids:
-            conv_id = m_url.group(1)
-            break
-        for cand_id in _fetch_recent_conv_ids(page, 3, 3, job_id):
-            if cand_id and cand_id not in initial_conv_ids:
-                conv_id = cand_id
-                break
-        if conv_id:
-            break
-        time.sleep(3)
+    if captcha_solved:
+        conv_id, finalized = _conv_after_captcha_solved(job, acc, page, initial_conv_ids, full_prompt, credits_pre)
+        if finalized:
+            return
+    else:
+        conv_id = _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_SECONDS, job_id)
+        if not conv_id and _detect_captcha(page):
+            # captcha xuất hiện muộn (sau khi đã chờ conversation)
+            if not _wait_user_solve_captcha(job_id, acc, context, page):
+                _handle_captcha(job_id, acc, page)
+                return
+            conv_id, finalized = _conv_after_captcha_solved(job, acc, page, initial_conv_ids, full_prompt, credits_pre)
+            if finalized:
+                return
 
     if not conv_id:
-        if _detect_captcha(page):
-            _handle_captcha(job_id, acc, page)
-        else:
-            _fail_job(job_id, account_id, JobStatus.THAT_BAI, Reason.NO_NEW_CONV, page, "no_new_conv", module="Engine")
+        _fail_job(job_id, account_id, JobStatus.THAT_BAI, Reason.NO_NEW_CONV, page, "no_new_conv", module="Engine")
         return
 
     # 4. Chờ render & tải video
@@ -1301,7 +1505,8 @@ def execute_video_job(job_id: int, account_id: int) -> None:
     """Chạy một job trên nick đã được worker chọn và khóa. Hàm sync, worker gọi trong thread.
 
     Không tự chọn/đổi nick: hết credit, mất phiên → job về Chờ để worker chọn nick khác;
-    captcha → Tạm dừng + needs_manual; lỗi kỹ thuật → Thất bại kèm ảnh chụp.
+    captcha → đưa cửa sổ Chrome ra màn hình chờ người dùng kéo (CAPTCHA_SOLVE_TIMEOUT_SECONDS), hết giờ mới
+    Tạm dừng + needs_manual; lỗi kỹ thuật → Thất bại kèm ảnh chụp.
     """
     job = _load_job(job_id)
     if not job:

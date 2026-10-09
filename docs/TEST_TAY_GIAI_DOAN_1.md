@@ -22,7 +22,8 @@ Trả lời theo mã: **đạt / không đạt / chưa thử**. Xong thì bấm 
 | Q5 | Đang có job Đang chạy → Ctrl+C → mở lại | Job đó về Chờ với lý do "App khởi động lại" rồi tự chạy lại |
 | Q6 | Chờ 1 job thất bại (hoặc đặt proxy sai cho nick) | Hiện đỏ "Thất bại" + lý do + link "Xem ảnh lỗi" mở được + nút Chạy lại |
 | Q7 | Xóa/cho nghỉ hết nick rồi thêm 1 prompt | Job Chờ, lý do dạng "Chưa có nick phù hợp: ...", không mở Chrome |
-| Q4 | Nếu Dola bắt kéo captcha | Job Tạm dừng, nick có nhãn "Cần kéo captcha", Chrome KHÔNG mở lại liên tục; bấm Chrome kéo xong → bấm Tiếp tục |
+| Q4 | Nếu Dola bắt kéo captcha (thường ngay sau khi gửi prompt) | Cửa sổ Chrome của nick **tự hiện ra màn hình**, job vẫn Đang chạy với lý do "Dola yêu cầu kéo mảnh ghép: cửa sổ Chrome của nick 'X' đã được đưa ra màn hình, hãy kéo mảnh ghép trong 3 phút". Kéo xong trong 3 phút → cửa sổ tự ẩn, job chạy tiếp và Hoàn thành (nhật ký có dòng "đã kéo xong mảnh ghép"; nếu phải gửi lại thì có dòng nói rõ bằng chứng: "ô nhập còn nguyên prompt ... gửi lại bằng Enter" hoặc "credit ... đã giảm ... KHÔNG gửi lại"; credit của nick chỉ giảm đúng 1). Không kéo → sau 3 phút cửa sổ ẩn, job Tạm dừng, nick có nhãn "Cần kéo captcha", Chrome KHÔNG mở lại liên tục; bấm Chrome kéo xong → bấm Tiếp tục |
+| Q4b | Nhìn Task Manager khi job chạy bình thường | Có chrome.exe của tool nhưng không thấy cửa sổ nào (cửa sổ đặt ngoài màn hình, không phải headless); trang Dola không đòi captcha mỗi lần gửi prompt |
 
 ## D: chẩn đoán
 | Mã | Làm | Đạt khi |

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 import browser
 import config
+import director
 from account_pool import AccountPool
 from batch_dispatcher import get_batch_progress, import_b3_batch
 from constants import JobStatus, Reason
@@ -96,6 +97,20 @@ class BatchJobsRequest(BaseModel):
     prompts: List[str]
     model: Optional[str] = "Seedance 2.5"
     duration: Optional[str] = "30 giây"
+    style_code: Optional[str] = ""      # "" = tự nhận diện; mã trong director.ARCHETYPE_BY_CODE để ép trường phái
+    director: Optional[bool] = None     # None = theo setting director_enabled
+
+
+class DirectorPreviewRequest(BaseModel):
+    prompts: List[str]
+    style_code: Optional[str] = ""
+    duration: Optional[str] = None
+    model: Optional[str] = None
+    director: Optional[bool] = None
+
+
+class PromptFinalRequest(BaseModel):
+    prompt_final: str
 
 
 class CreateImageRequest(BaseModel):
@@ -511,44 +526,153 @@ async def get_jobs(limit: int = 500):
     return {"jobs": [dict(r) for r in rows]}
 
 
+# --- Đạo diễn AI (director.py, docs/KIEN_TRUC.md mục 8): prompt_final được ghép LÚC TẠO JOB, không phải lúc gửi Dola ---
+def _load_settings_dict() -> dict:
+    conn = get_connection()
+    try:
+        return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
+    finally:
+        conn.close()
+
+
+def _load_assets() -> list:
+    conn = get_connection()
+    try:
+        return [dict(r) for r in conn.execute("SELECT id, name, character_code, image_url, description FROM assets").fetchall()]
+    finally:
+        conn.close()
+
+
+def _director_context(director_flag: Optional[bool], model: Optional[str], duration: Optional[str]) -> dict:
+    """Đọc settings + assets một lần cho cả lô; director_flag (True/False) ghi đè setting director_enabled."""
+    settings = _load_settings_dict()
+    options = director.options_from_settings(settings)
+    if director_flag is not None:
+        options["director_enabled"] = "1" if director_flag else "0"
+    return {
+        "options": options,
+        "assets": _load_assets(),
+        "model": model or settings.get("default_model") or "Seedance 2.5",
+        "duration": duration or settings.get("default_duration") or "30 giây",
+    }
+
+
+def _compose_for_job(prompt: str, ctx: dict, style_code: Optional[str]) -> dict:
+    return director.compose(prompt, duration_label=ctx["duration"], model=ctx["model"], options=ctx["options"],
+                            assets=ctx["assets"], style_override=style_code)
+
+
+@app.post("/api/director/preview")
+async def director_preview(req: DirectorPreviewRequest):
+    """Xem trước prompt đã đạo diễn, KHÔNG tạo job. Trả về một mục cho mỗi dòng prompt không rỗng."""
+    ctx = _director_context(req.director, req.model, req.duration)
+    items = []
+    try:
+        for p in req.prompts:
+            p = (p or "").strip()
+            if not p:
+                continue
+            r = _compose_for_job(p, ctx, req.style_code)
+            items.append({
+                "prompt": p,
+                "prompt_final": r["prompt_final"],
+                "archetype_code": r["archetype_code"],
+                "archetype_name": r["archetype_name"],
+                "layers_added": r["layers_added"],
+                "existing_layers": r["existing_layers"],
+                "characters": r["characters"],
+                "reference_image": r["reference_image"],
+            })
+    except ValueError as e:  # mã trường phái lạ
+        return {"success": False, "message": str(e), "items": []}
+    return {"success": True, "items": items, "director_enabled": director.is_enabled(ctx["options"])}
+
+
 @app.post("/api/jobs")
 async def create_job(req: CreateJobRequest):
     title = req.title if req.title else req.prompt[:40] + "..."
+    ctx = _director_context(None, req.model, req.duration)
+    try:
+        composed = _compose_for_job(req.prompt, ctx, None)
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
+    reference_image = req.reference_image or composed["reference_image"] or ""
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO jobs (account_id, title, prompt, model, duration, status, status_message, progress, reference_image, attempts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
-        """, (req.account_id, title, req.prompt, req.model, req.duration, JobStatus.CHO, "Chờ worker nhặt", req.reference_image))
+            INSERT INTO jobs (account_id, title, prompt, prompt_final, archetype_code, model, duration, status, status_message,
+                              progress, reference_image, attempts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
+        """, (req.account_id, title, req.prompt, composed["prompt_final"], composed["archetype_code"], req.model, req.duration,
+              JobStatus.CHO, "Chờ worker nhặt", reference_image))
         new_id = cursor.lastrowid
         conn.commit()
     finally:
         conn.close()
-    log_event(f"Tạo job video #{new_id} ({title})", "INFO", "Queue", job_id=new_id)
-    return {"success": True, "id": new_id}
+    log_event(f"Tạo job video #{new_id} ({title}) · trường phái {composed['archetype_code'] or 'tắt đạo diễn'}",
+              "INFO", "Queue", job_id=new_id)
+    return {"success": True, "id": new_id, "prompt": req.prompt, "prompt_final": composed["prompt_final"],
+            "archetype": composed["archetype_code"]}
 
 
 @app.post("/api/jobs/batch")
 async def create_batch_jobs(req: BatchJobsRequest):
-    count = 0
+    ctx = _director_context(req.director, req.model, req.duration)
+    try:
+        prepared = []
+        for seq, p in enumerate(req.prompts, 1):
+            p = (p or "").strip()
+            if not p:
+                continue
+            prepared.append((seq, p, _compose_for_job(p, ctx, req.style_code)))
+    except ValueError as e:
+        return {"success": False, "message": str(e), "created": 0, "jobs": []}
+
+    created = []
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        for seq, p in enumerate(req.prompts, 1):
-            p = p.strip()
-            if not p:
-                continue
+        for seq, p, composed in prepared:
             cursor.execute("""
-                INSERT INTO jobs (title, prompt, model, duration, status, status_message, progress, seq, attempts)
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0)
-            """, (p[:40] + "...", p, req.model, req.duration, JobStatus.CHO, "Chờ worker nhặt", seq))
-            count += 1
+                INSERT INTO jobs (title, prompt, prompt_final, archetype_code, model, duration, status, status_message,
+                                  progress, seq, reference_image, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+            """, (p[:40] + "...", p, composed["prompt_final"], composed["archetype_code"], ctx["model"], ctx["duration"],
+                  JobStatus.CHO, "Chờ worker nhặt", seq, composed["reference_image"] or ""))
+            created.append({"id": cursor.lastrowid, "prompt": p, "prompt_final": composed["prompt_final"],
+                            "archetype": composed["archetype_code"], "characters": composed["characters"]})
         conn.commit()
     finally:
         conn.close()
-    log_event(f"Nạp {count} prompt vào hàng đợi video", "SUCCESS", "Queue")
-    return {"success": True, "created": count}
+    codes = sorted({c["archetype"] for c in created if c["archetype"]})
+    log_event(f"Nạp {len(created)} prompt vào hàng đợi video · Đạo diễn AI: "
+              + (", ".join(codes) if codes else "tắt"), "SUCCESS", "Queue")
+    return {"success": True, "created": len(created), "jobs": created}
+
+
+@app.put("/api/jobs/{job_id}/prompt_final")
+async def update_job_prompt_final(job_id: int, req: PromptFinalRequest):
+    """Người dùng sửa tay prompt đã đạo diễn; chỉ khi job chưa chạy (Chờ, Thất bại, Tạm dừng)."""
+    job = _load_job_row(job_id)
+    if not job:
+        return {"success": False, "message": f"Không tìm thấy job #{job_id}"}
+    editable = (JobStatus.CHO, JobStatus.THAT_BAI, JobStatus.TAM_DUNG)
+    if job["status"] not in editable or job_id in running_job_ids():
+        return {"success": False, "status": job["status"],
+                "message": f"Job #{job_id} đang ở trạng thái '{job['status']}', không sửa được prompt. "
+                           f"Chỉ sửa được khi job {', '.join(editable)}"}
+    text = (req.prompt_final or "").strip()
+    if not text:
+        return {"success": False, "message": "Prompt đã đạo diễn không được để trống"}
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE jobs SET prompt_final = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (text, job_id))
+        conn.commit()
+    finally:
+        conn.close()
+    log_event(f"Job #{job_id}: người dùng sửa tay prompt đã đạo diễn ({len(text)} ký tự)", "INFO", "Queue", job_id=job_id)
+    return {"success": True, "prompt_final": text}
 
 
 def _load_job_row(job_id: int):

@@ -141,6 +141,43 @@ def test_n3_no_chrome_blocks_dispatch_with_reason(db, fake_dola, env_tmp, clean_
     assert db.job(job_id)["updated_at"] == first
 
 
+# ---------------------------------------------------------------- N-5
+def test_n5_jobs_waiting_for_chrome_slot_get_reason(db, clean_worker):
+    """Hết chỗ mở Chrome: các job Chờ đầu hàng (tối đa 20) nhận "Đang chờ chỗ mở Chrome (x/N đang dùng)";
+    không điều phối, không chạm nick; có chỗ lại thì vòng quét sau nhặt bình thường (ghi đè lý do)."""
+    import browser
+    from account_pool import AccountPool
+    acc_id = db.add_account("nick rảnh")
+    job_ids = [db.add_job(f"job chờ slot {i}", batch_id="b", seq=i) for i in range(25)]
+    db.set_setting("max_concurrent_jobs", 1)
+    original = browser.SLOTS.capacity()
+    assert browser.SLOTS.acquire(timeout=0)  # chiếm chỗ duy nhất (một Chrome tay/thao tác khác đang mở)
+    try:
+        assert worker._tick() == []
+        assert not AccountPool.get().is_busy(acc_id)
+        expected = "Đang chờ chỗ mở Chrome (1/1 đang dùng)"
+        assert browser.slot_wait_message() == expected
+        for jid in job_ids[:20]:
+            assert db.job(jid)["status_message"] == expected and db.job(jid)["status"] == JobStatus.CHO
+        for jid in job_ids[20:]:
+            assert db.job(jid)["status_message"] == "", "chỉ 20 job đầu hàng được ghi lý do"
+        # Nội dung không đổi → không ghi lại (updated_at giữ nguyên)
+        before = {jid: db.job(jid)["updated_at"] for jid in job_ids[:20]}
+        time.sleep(1.1)
+        assert worker._tick() == []
+        assert {jid: db.job(jid)["updated_at"] for jid in job_ids[:20]} == before
+    finally:
+        browser.SLOTS.release()
+    try:
+        # Có chỗ lại: job đầu được nhặt, lý do chờ slot bị ghi đè
+        to_start = worker._tick()
+        assert to_start == [(job_ids[0], acc_id)], to_start
+        assert "chờ chỗ mở Chrome" not in (db.job(job_ids[0])["status_message"] or "")
+    finally:
+        worker._rollback_dispatched(list(to_start))
+        browser.SLOTS.resize(original)
+
+
 # ---------------------------------------------------------------- N-6
 def test_n6_select_account_called_once_per_tick_when_no_account(db, clean_worker, monkeypatch):
     db.add_account("nick chưa login", with_session=False)
