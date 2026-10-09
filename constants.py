@@ -41,20 +41,30 @@ def duration_label(seconds: int) -> str:
     return f"{int(seconds)} giây"
 
 
+_RE_RATIO_VERTICAL_WORD = re.compile(r"(?<!\w)(dọc|doc|vertical|portrait)(?!\w)", re.IGNORECASE)
+_RE_RATIO_HORIZONTAL_WORD = re.compile(r"(?<!\w)(ngang|horizontal|landscape)(?!\w)", re.IGNORECASE)
+
+
 def normalize_ratio(value) -> Tuple[str, Optional[str]]:
-    """Tỷ lệ khung hình → (một trong RATIO_CHOICES, cảnh báo hoặc None). Chấp nhận "Dọc"/"Ngang" của giao diện cũ."""
+    """Tỷ lệ khung hình → (một trong RATIO_CHOICES, cảnh báo hoặc None).
+
+    Chấp nhận: "16:9"/"9:16" (kể cả nằm trong chuỗi dài như "tỷ lệ khung hình 16:9 (ngang)" của câu mở đầu),
+    dạng viết khác "16/9", "16x9", "16×9", và từ chỉ hướng "Dọc"/"Ngang"/"portrait"/"landscape"/"vertical"/"horizontal"
+    (so từ nguyên, không khớp "document"). Rỗng → mặc định không cảnh báo; giá trị lạ ("2.39:1", "4:3") → mặc định + cảnh báo.
+    """
     raw = str(value if value is not None else "").strip()
     if not raw:
         return DEFAULT_RATIO, None
     low = raw.lower()
-    if low in ("dọc", "doc", "vertical", "portrait"):
-        return "9:16", None
-    if low in ("ngang", "horizontal", "landscape"):
-        return "16:9", None
-    compact = low.replace(" ", "")
+    # "16 / 9", "16x9", "16×9" → "16:9" rồi tìm tỷ lệ hợp lệ trong chuỗi
+    compact = re.sub(r"\s*([/x×:])\s*", ":", low)
     for r in RATIO_CHOICES:
-        if compact == r:
+        if re.search(r"(?<![\d.])" + re.escape(r) + r"(?![\d.])", compact):
             return r, None
+    if _RE_RATIO_VERTICAL_WORD.search(low):
+        return "9:16", None
+    if _RE_RATIO_HORIZONTAL_WORD.search(low):
+        return "16:9", None
     return DEFAULT_RATIO, f"Tỷ lệ khung hình '{raw}' không hợp lệ, dùng mặc định {DEFAULT_RATIO}"
 
 

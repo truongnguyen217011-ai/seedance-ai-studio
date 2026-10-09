@@ -205,14 +205,37 @@ def test_duration_and_model_header():
 
 def test_bh46_fix_header_rewrites_old_header_only():
     """Job cũ trong hàng đợi có prompt_final "dài 30 giây." (không tỷ lệ) → header mới, phần sau nguyên văn;
+    header đã có giây 4-15 VÀ tỷ lệ hợp lệ → giữ nguyên dù tham số truyền vào khác (BH-49, người dùng đã sửa tay);
     prompt_final người dùng tự viết (không có header nhận ra được) → giữ nguyên."""
     old = "Tạo video Seedance 2.5 dài 30 giây. Cô gái cười. Hình ảnh: abc; def."
     assert director.fix_header(old, "30 giây", "16:9") == f"{H15} Cô gái cười. Hình ảnh: abc; def."
     new = f"{director.build_header('Seedance 2.0', '10 giây', '9:16')} Cô gái cười."
     assert director.fix_header(new, "10 giây", "9:16") == new
-    assert director.fix_header(new, "15 giây", "16:9") == f"{director.build_header('Seedance 2.0', '15 giây', '16:9')} Cô gái cười."
+    assert director.fix_header(new, "15 giây", "16:9") == new, "header hợp lệ không bị ghi đè bởi cột job/setting"
+    # thiếu tỷ lệ hoặc giây ngoài khoảng → viết lại
+    assert director.fix_header("Tạo video Seedance 2.5 dài 10 giây. Cô gái cười.", "10 giây", "9:16") == \
+        f"{director.build_header('Seedance 2.5', '10 giây', '9:16')} Cô gái cười."
+    assert director.fix_header("Tạo video Seedance 2.5 dài 30 giây, tỷ lệ khung hình 16:9 (ngang). Cô gái cười.", "15 giây", "16:9") == \
+        f"{H15} Cô gái cười."
     assert director.fix_header("Prompt tay không có câu mở đầu, 30 giây.", "30 giây", "16:9") == "Prompt tay không có câu mở đầu, 30 giây."
     assert director.fix_header("", "15 giây", "16:9") == ""
+
+
+def test_bh49_parse_header_reads_back_user_edited_values():
+    """BH-49: người dùng sửa header thành 8 giây 9:16 → đọc ngược đúng, valid=True; thiếu tỷ lệ/giây lạ → valid=False."""
+    edited = f"{director.build_header('Seedance 2.5', '8 giây', '9:16')} Cô gái cười."
+    info = director.parse_header(edited)
+    assert (info["model"], info["seconds"], info["ratio"], info["valid"]) == ("Seedance 2.5", 8, "9:16", True)
+    assert edited[info["end"]:].strip() == "Cô gái cười."
+    assert director.fix_header(edited, "15 giây", "16:9") == edited
+    info = director.parse_header("Tạo video Seedance 2.5 dài 30 giây. Cô gái cười.")
+    assert (info["seconds"], info["ratio"], info["valid"]) == (30, None, False)
+    info = director.parse_header("Tạo video Seedance 2.5 dài 10 giây. Cô gái cười.")
+    assert (info["seconds"], info["ratio"], info["valid"]) == (10, None, False)
+    info = director.parse_header("Tạo video Seedance 2.5 dài 20 giây, tỷ lệ khung hình 16:9 (ngang). Cô gái cười.")
+    assert (info["seconds"], info["ratio"], info["valid"]) == (20, "16:9", False)
+    assert director.parse_header("Prompt tay không có câu mở đầu.") is None
+    assert director.parse_header("") is None
 
 
 def test_visual_section_order_and_layers_added():

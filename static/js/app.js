@@ -1172,9 +1172,10 @@ async function loadSettings() {
     set('settingMaxJobs', s.max_concurrent_jobs);
     set('settingDelay', s.delay_between_jobs);
     set('settingModel', s.default_model);
-    set('settingDuration', s.default_duration);
-    set('settingRatio', s.default_ratio);
-    applyVideoDefaults(s.default_duration, s.default_ratio, s.default_model);
+    const { duration, ratio } = normalizeVideoDefaults(s.default_duration, s.default_ratio);
+    set('settingDuration', duration);
+    set('settingRatio', ratio);
+    applyVideoDefaults(duration, ratio, s.default_model);
     const cp = document.getElementById('settingChromePath');
     if (cp) cp.value = s.chrome_path || '';
     applyDirectorSettings(s);
@@ -1623,6 +1624,30 @@ function setVideoRatio(val, btn) {
     'ratio-btn px-2.5 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition');
   const sel = document.getElementById('batchRatioSelect');
   if (sel) sel.value = val;
+}
+
+// Cài đặt cũ ngoài danh sách Dola hỗ trợ (default_duration của bản trước dài hơn 15 giây, default_ratio "Dọc"/lạ)
+// → đổi về giá trị hợp lệ và báo MỘT lần vì sao (N-5); backend cũng ép (constants.normalize_duration) nên hai bên khớp.
+let _videoDefaultsWarned = false;
+function normalizeVideoDefaults(duration, ratio) {
+  const notes = [];
+  let dur = duration;
+  if (dur !== null && dur !== undefined && dur !== '' && !VIDEO_DURATION_CHOICES.includes(dur)) {
+    notes.push(`Cài đặt thời lượng cũ (${dur}) đã được đổi về 15 giây vì Dola chỉ hỗ trợ 4-15 giây`);
+    dur = '15 giây';
+  }
+  let rat = ratio;
+  if (rat === 'Dọc') rat = '9:16';
+  if (rat === 'Ngang') rat = '16:9';
+  if (rat !== null && rat !== undefined && rat !== '' && !VIDEO_RATIO_CHOICES.includes(rat)) {
+    notes.push(`Cài đặt tỷ lệ cũ (${rat}) đã được đổi về 16:9 vì Dola chỉ nhận 16:9 hoặc 9:16`);
+    rat = '16:9';
+  }
+  if (notes.length && !_videoDefaultsWarned) {
+    _videoDefaultsWarned = true;
+    showToast(notes.join('. '), 'warning', 9000);
+  }
+  return { duration: dur, ratio: rat };
 }
 
 // Cài đặt (default_duration / default_ratio / default_model) → giá trị chọn sẵn ở thanh điều khiển và modal lô prompt

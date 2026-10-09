@@ -25,7 +25,9 @@ Thiết kế:
   (ASK_RATIO_TEXT, không có URL video), không trừ credit. Tin nhắn KẾ TIẾP trong CÙNG conversation (trang gửi
   ``conversation_id`` lấy từ URL /chat/{id}) có chứa "9:16" hoặc "16:9" → bắt đầu render như normal (trừ 1 credit).
   Cấu trúc chain: ``content`` là CHUỖI JSON ``{"text": ...}`` lồng trong JSON (dạng tin nhắn Doubao/Dola) để kiểm
-  dola_service._assistant_texts parse được JSON trong chuỗi.
+  dola_service._assistant_texts parse được JSON trong chuỗi. Như Dola thật, chain trả CẢ LỊCH SỬ conversation
+  (BH-48): tin người dùng (prompt, rồi câu trả lời tỷ lệ của tool) ``role: user`` + tin trợ lý; trong lúc render có
+  thêm ``{"role": "assistant", "text": "Generating video..."}`` và ``status: generating``.
 - mode=reply_text: mọi conversation chỉ trả văn bản REPLY_TEXT ("I cannot create that video"), không bao giờ có video.
 """
 from __future__ import annotations
@@ -441,17 +443,25 @@ async def single_chain(request: Request):
     conv = STATE.conversations.get(conv_id)
     if not conv:
         return JSONResponse({"data": {"status": "error", "message": "conversation not found"}}, status_code=404)
-    user_msg = {"content_type": "text", "role": "user", "content": json.dumps({"text": conv["prompt"]}, ensure_ascii=False)}
+    # Giống Dola thật (BH-48): chain trả CẢ lịch sử — mọi tin người dùng đã gửi (prompt, câu trả lời tỷ lệ) lẫn tin
+    # trợ lý — chứ không chỉ tin mới nhất; dola_service phải tự loại tin của chính mình.
+    def _text_msg(role: str, text: str) -> Dict[str, Any]:
+        return {"content_type": "text", "role": role, "content": json.dumps({"text": text}, ensure_ascii=False)}
+
+    history: List[Dict[str, Any]] = [_text_msg("user", conv["prompt"])]
     if conv.get("reply_text"):
-        return {"data": {"messages": [user_msg, {"content_type": "text", "role": "assistant",
-                                                 "content": json.dumps({"text": REPLY_TEXT}, ensure_ascii=False)}]}}
-    if conv.get("asked") and not conv.get("answered_at"):
-        return {"data": {"messages": [user_msg, {"content_type": "text", "role": "assistant",
-                                                 "content": json.dumps({"text": ASK_RATIO_TEXT}, ensure_ascii=False)}]}}
+        return {"data": {"messages": history + [_text_msg("assistant", REPLY_TEXT)]}}
+    if conv.get("asked"):
+        history.append(_text_msg("assistant", ASK_RATIO_TEXT))
+        for extra in conv["messages"][1:]:   # câu trả lời tỷ lệ/thời lượng của người dùng (tool) trong cùng conversation
+            history.append(_text_msg("user", extra))
+        if not conv.get("answered_at"):
+            return {"data": {"messages": history}}
     if time.time() - conv["created_at"] < STATE.render_seconds:
-        return {"data": {"status": "generating", "text": "Generating video..."}}
+        return {"data": {"status": "generating",
+                         "messages": history + [{"content_type": "text", "role": "assistant", "text": "Generating video..."}]}}
     base = str(request.base_url).rstrip("/")  # http://127.0.0.1:PORT (server không có TLS)
-    return {"data": {"messages": [{"content_type": "video", "content": f"{base}/video/tos/{conv_id}.mp4"}]}}
+    return {"data": {"messages": history + [{"content_type": "video", "content": f"{base}/video/tos/{conv_id}.mp4"}]}}
 
 
 @app.get("/video/tos/{name}")

@@ -23,6 +23,7 @@ if sys.platform == "win32":
 from playwright.sync_api import sync_playwright
 
 import config
+import director  # hàm thuần (HEADER_RE, parse_header, fix_header), không import ngược module này
 from account_pool import AccountPool
 from browser import ChromeNotFoundError, browser_session, hide_window, show_window
 from constants import (DEFAULT_DURATION, DEFAULT_RATIO, AccountStatus, JobStatus, NeedsManual, Reason,
@@ -1055,10 +1056,17 @@ def build_full_prompt(job: dict) -> str:
     cài đặt và kho nhân vật hiện tại. Không còn câu "FPV bom tấn" cố định.
     BH-46: thời lượng ngoài 4-15 giây (job cũ "30 giây") bị ép về 15 và câu mở đầu được viết lại
     (director.fix_header) để luôn nêu số giây hợp lệ + tỷ lệ khung hình; jobs.duration/ratio được ghi lại.
+    BH-49: câu mở đầu đã hợp lệ (giây 4-15 + tỷ lệ) thì giữ nguyên văn và ghi ngược jobs.duration/ratio theo nó.
     """
-    import director  # import muộn: director là hàm thuần, không phụ thuộc module này
     settings = _load_settings_dict()
-    seconds, ratio, warning = job_video_params(job, settings)
+    ready = (job.get("prompt_final") or "").strip()
+    header = director.parse_header(ready) if ready else None
+    if header and header["valid"]:
+        # BH-49: câu mở đầu đã có số giây 4-15 và tỷ lệ hợp lệ (người dùng có thể đã sửa tay "8 giây"/"9:16")
+        # → header thắng, không ghi đè; đọc ngược để jobs.duration/ratio khớp với thứ thật sự gửi Dola
+        seconds, ratio, warning = header["seconds"], header["ratio"], None
+    else:
+        seconds, ratio, warning = job_video_params(job, settings)
     label = duration_label(seconds)
     fields = {}
     if (job.get("duration") or "") != label:
@@ -1071,7 +1079,6 @@ def build_full_prompt(job: dict) -> str:
         _set_job_fields(job["id"], **fields)
         job.update(fields)
 
-    ready = (job.get("prompt_final") or "").strip()
     if ready:
         return director.fix_header(ready, label, ratio)
     conn = get_connection()
@@ -1099,8 +1106,18 @@ _QUESTION_PHRASES = ("which option", "would you like", "aspect ratio", "duration
 # Chữ Dola/fake hiện trong lúc đang render: không phải "trả lời bằng chữ"
 _GENERATING_MARKERS = ("generating", "đang tạo")
 REPLY_MIN_CHARS = 20
-# Có văn bản trả lời (không phải câu hỏi) mà sau chừng này giây vẫn không có video/không "generating" → Thất bại
+# Văn bản trả lời giống lời TỪ CHỐI/GIẢI THÍCH (không phải câu hỏi) mà sau chừng này giây vẫn không có video/không
+# "generating" → Thất bại sớm (N-1). Văn bản khác (Dola nói gì đó nhưng không rõ là từ chối) chờ lâu hơn.
 REPLY_NO_VIDEO_SECONDS = 60
+# Văn bản trả lời bất kỳ (không câu hỏi, không từ chối) mà quá chừng này giây vẫn không video/không "generating" → Thất bại
+REPLY_NO_VIDEO_HARD_SECONDS = 120
+_RE_REFUSAL = re.compile(r"cannot|can't|unable|sorry|not able|not support|không thể|không hỗ trợ|xin lỗi|không được phép",
+                         re.IGNORECASE)
+# Dola hỏi lại mà không thấy ô nhập để trả lời: thử lại ở vòng poll sau, tối đa chừng này lần (N-3)
+AUTO_ANSWER_MAX_TRIES = 3
+# Giá trị của role/user_type/sender/from đánh dấu tin nhắn do NGƯỜI DÙNG (tức tool) gửi trong chain (BH-48)
+_USER_ROLE_KEYS = ("role", "user_type", "sender", "from")
+_USER_ROLE_VALUES = ("user", "human", "1", "me", "self")
 # Sau khi tự trả lời câu hỏi của Dola, mốc chờ render được đặt lại nhưng tổng không quá RENDER_TIMEOUT + chừng này
 REPLY_EXTRA_RENDER_SECONDS = 120
 
@@ -1116,27 +1133,58 @@ def _maybe_json(value: str):
         return None
 
 
-def _assistant_texts(chain_json, sent_prompt: str = "") -> list:
-    """Trích các đoạn văn bản trợ lý trả lời từ JSON chain/single của Dola.
+def _own_text_head(text: str) -> str:
+    """40 ký tự đầu của một tin tool đã gửi, tính SAU câu mở đầu cố định (director.HEADER_RE) nếu có (N-2).
+
+    Câu mở đầu "Tạo video ... dài N giây, tỷ lệ ..." giống nhau ở mọi job và Dola hay trích lại nó khi từ chối
+    ("You asked: 'Tạo video ...' but I cannot ..."); lấy 40 ký tự đầu của prompt làm dấu hiệu "tin của mình" sẽ
+    bỏ nhầm câu từ chối đó. Phần sau header mới là nội dung riêng của job.
+    """
+    norm = " ".join((text or "").split())
+    m = director.HEADER_RE.match(norm)
+    body = norm[m.end():].lstrip() if m else norm
+    return body[:PROMPT_PREFIX_CHECK_CHARS]
+
+
+def _is_user_node(node: dict) -> bool:
+    """Tin nhắn trong chain có role/user_type/sender/from là người dùng (tức do tool gửi) → bỏ cả nhánh (BH-48)."""
+    for key in _USER_ROLE_KEYS:
+        if key in node:
+            v = node[key]
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and int(v) == 1:
+                return True
+            if isinstance(v, str) and v.strip().lower() in _USER_ROLE_VALUES:
+                return True
+            if isinstance(v, dict) and _is_user_node(v):   # sender: {role: "user"}
+                return True
+    return False
+
+
+def _assistant_texts(chain_json, sent_prompt: str = "", own_texts=()) -> list:
+    """Trích các đoạn văn bản TRỢ LÝ trả lời từ JSON chain/single của Dola.
 
     Duyệt đệ quy mọi dict/list; chuỗi JSON lồng trong chuỗi (Dola để `content` là một chuỗi JSON chứa `text`)
     được parse và duyệt tiếp. Lấy chuỗi > REPLY_MIN_CHARS ký tự ở các khóa content/text/message; bỏ chuỗi chứa URL
-    (đó là video/ảnh) và bỏ chính prompt đã gửi (tin nhắn của người dùng nằm cùng chain). Thứ tự xuất hiện, không trùng.
+    (đó là video/ảnh). Thứ tự xuất hiện, không trùng.
+    BH-48: chain của Dola (thật lẫn fake) chứa CẢ tin nhắn tool đã gửi (prompt, câu tự trả lời, bản gửi lại sau
+    captcha), nên (a) mọi tin trong `sent_prompt` + `own_texts` bị loại: so nguyên văn, bản bị cắt ngắn (chuỗi con
+    của tin đã gửi) và 40 ký tự đầu SAU câu mở đầu cố định (`_own_text_head`, N-2); (b) node có role/user_type/
+    sender/from = user bị bỏ cả nhánh, không cần so chữ.
     """
     out: list = []
     seen: set = set()
-    prompt_norm = " ".join((sent_prompt or "").split())
-    prompt_head = prompt_norm[:PROMPT_PREFIX_CHECK_CHARS]
+    own_norm = [" ".join(t.split()) for t in [sent_prompt or "", *(own_texts or ())] if t and t.strip()]
+    own_heads = [h for h in (_own_text_head(t) for t in own_norm) if len(h) >= 20]
 
-    def is_own_prompt(text: str) -> bool:
-        if not prompt_norm:
-            return False
+    def is_own_text(text: str) -> bool:
         t = " ".join(text.split())
-        return t == prompt_norm or t in prompt_norm or (len(prompt_head) >= 20 and prompt_head in t)
+        return any(t == o or t in o for o in own_norm) or any(h in t for h in own_heads)
 
     def add(text: str) -> None:
         t = text.strip()
-        if len(t) <= REPLY_MIN_CHARS or _RE_URL.search(t) or is_own_prompt(t) or t in seen:
+        if len(t) <= REPLY_MIN_CHARS or _RE_URL.search(t) or is_own_text(t) or t in seen:
             return
         seen.add(t)
         out.append(t)
@@ -1145,6 +1193,8 @@ def _assistant_texts(chain_json, sent_prompt: str = "") -> list:
         if depth > 12:
             return
         if isinstance(node, dict):
+            if _is_user_node(node):
+                return
             for k, v in node.items():
                 walk(v, str(k), depth + 1)
         elif isinstance(node, (list, tuple)):
@@ -1170,6 +1220,35 @@ def _looks_like_question(text: str) -> bool:
 def _is_generating_text(text: str) -> bool:
     t = (text or "").lower()
     return any(m in t for m in _GENERATING_MARKERS)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    """Dola từ chối/giải thích ("I cannot...", "Sorry...", "không thể...") thay vì tạo video (N-1)."""
+    return bool(_RE_REFUSAL.search(text or ""))
+
+
+def _reply_should_fail(reply: str, waited_seconds: float, generating: bool) -> bool:
+    """Văn bản trả lời (không phải câu hỏi) đã treo `waited_seconds` giây: dừng sớm hay chờ tiếp? (N-1)
+
+    Đang "generating" → chờ. Giống lời từ chối → dừng sau REPLY_NO_VIDEO_SECONDS (60 s). Văn bản khác → chỉ dừng
+    sau REPLY_NO_VIDEO_HARD_SECONDS (120 s) không video; còn lại chờ tới RENDER_TIMEOUT (lý do kèm nguyên văn).
+    """
+    if generating:
+        return False
+    if _looks_like_refusal(reply) and waited_seconds >= REPLY_NO_VIDEO_SECONDS:
+        return True
+    return waited_seconds >= REPLY_NO_VIDEO_HARD_SECONDS
+
+
+def _auto_answer_step(send_fn, answer: str, tries_so_far: int) -> tuple:
+    """Một lần thử gửi câu tự trả lời cho Dola (N-3). Trả về (sent, tries, answered).
+
+    `answered` = coi như đã trả lời: gửi được, HOẶC đã thử đủ AUTO_ANSWER_MAX_TRIES lần mà không thấy ô nhập
+    (không thử nữa). Gửi hỏng mà chưa đủ số lần → answered False, vòng poll sau thử lại.
+    """
+    tries = tries_so_far + 1
+    sent = bool(send_fn(answer))
+    return sent, tries, sent or tries >= AUTO_ANSWER_MAX_TRIES
 
 
 def _auto_answer_text(seconds: int, ratio: str) -> str:
@@ -1562,6 +1641,8 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
     pending_reply: Optional[str] = None   # câu trả lời mới nhất chưa được xử lý
     pending_since = 0.0
     auto_answered = False
+    answer_tries = 0
+    own_texts: list = [full_prompt]  # BH-48: mọi tin tool đã gửi trong conversation này, để không đọc nhầm thành Dola nói
     log_event(f"Job #{job_id}: theo dõi Dola render (conv_id={conv_id}, {duration_seconds} giây, tỷ lệ {ratio})",
               "INFO", "Render", job_id=job_id, account_id=account_id)
 
@@ -1586,7 +1667,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
             return
 
         # Câu trả lời bằng chữ mới của trợ lý (bỏ "Generating video..." và prompt của chính mình)
-        new_replies = [t for t in _assistant_texts(chain_res, full_prompt)
+        new_replies = [t for t in _assistant_texts(chain_res, full_prompt, own_texts)
                        if t not in seen_replies and not _is_generating_text(t)]
         if new_replies:
             seen_replies.extend(new_replies)
@@ -1632,18 +1713,31 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
                               page, "dola_replied_text", module="Render")
                     return
                 answer = _auto_answer_text(duration_seconds, ratio)
-                sent = _send_prompt(page, answer)
-                auto_answered = True
-                msg = (f"Dola hỏi lại: '{_short(pending_reply, 80)}' → đã tự trả lời \"{answer}\""
-                       if sent else f"Dola hỏi lại: '{_short(pending_reply, 80)}' nhưng không thấy ô nhập để trả lời")
-                log_event(f"Job #{job_id}: {msg}", "WARNING", "Render", job_id=job_id, account_id=account_id)
-                update_job_status(job_id, JobStatus.DANG_CHAY, msg, est_progress)
-                pending_reply = None
-                # Dola bắt đầu render từ lúc này: đặt lại mốc chờ, tổng không quá RENDER_TIMEOUT + 120 s
-                start_poll = time.time()
-                render_deadline = min(start_poll + max_wait_seconds, hard_deadline)
-            elif time.time() - pending_since >= REPLY_NO_VIDEO_SECONDS and "generating" not in chain_lower \
-                    and "đang tạo" not in chain_lower:
+                # N-3: chỉ coi là đã trả lời khi gửi được; không thấy ô nhập thì thử lại ở vòng poll sau, tối đa 3 lần
+                sent, answer_tries, auto_answered = _auto_answer_step(lambda a: _send_prompt(page, a), answer, answer_tries)
+                if sent:
+                    own_texts.append(answer)  # BH-48: câu này sẽ xuất hiện trong chain, không phải Dola nói
+                    msg = f"Dola hỏi lại: '{_short(pending_reply, 80)}' → đã tự trả lời \"{answer}\""
+                    log_event(f"Job #{job_id}: {msg}", "WARNING", "Render", job_id=job_id, account_id=account_id)
+                    update_job_status(job_id, JobStatus.DANG_CHAY, msg, est_progress)
+                    pending_reply = None
+                    # Dola bắt đầu render từ lúc này: đặt lại mốc chờ, tổng không quá RENDER_TIMEOUT + 120 s
+                    start_poll = time.time()
+                    render_deadline = min(start_poll + max_wait_seconds, hard_deadline)
+                elif auto_answered:
+                    _fail_job(job_id, account_id, JobStatus.THAT_BAI,
+                              Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200))
+                              + f" (không thấy ô nhập để tự trả lời sau {answer_tries} lần)",
+                              page, "dola_replied_text", module="Render")
+                    return
+                else:
+                    msg = (f"Dola hỏi lại: '{_short(pending_reply, 80)}' nhưng không thấy ô nhập để trả lời "
+                           f"(lần {answer_tries}/{AUTO_ANSWER_MAX_TRIES}, sẽ thử lại)")
+                    log_event(f"Job #{job_id}: {msg}", "WARNING", "Render", job_id=job_id, account_id=account_id)
+                    update_job_status(job_id, JobStatus.DANG_CHAY, msg, est_progress)
+            elif _reply_should_fail(pending_reply, time.time() - pending_since,
+                                    "generating" in chain_lower or "đang tạo" in chain_lower):
+                # N-1: từ chối/giải thích → dừng sau 60 s; văn bản khác → 120 s; đang generating → chờ tiếp
                 _fail_job(job_id, account_id, JobStatus.THAT_BAI,
                           Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)), page, "dola_replied_text",
                           module="Render")

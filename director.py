@@ -14,7 +14,8 @@ import re
 import unicodedata
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set
 
-from constants import DEFAULT_DURATION, DEFAULT_RATIO, RATIO_ORIENTATION, normalize_duration, normalize_ratio
+from constants import (DEFAULT_DURATION, DEFAULT_RATIO, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS,
+                       RATIO_ORIENTATION, normalize_duration, normalize_ratio)
 
 # ---------------------------------------------------------------- bộ mẫu trường phái
 # Thứ tự trong danh sách = thứ tự ưu tiên nhận diện (nhánh đầu tiên khớp từ khóa thắng), giống if/else trong JS;
@@ -444,18 +445,39 @@ def build_header(model=DEFAULT_MODEL, duration_label=DEFAULT_DURATION, ratio=DEF
             f"Không hỏi lại, tạo video ngay.")
 
 
-def fix_header(prompt_final: str, duration_label, ratio, model=None) -> str:
-    """Thay câu mở đầu của prompt_final đã lưu bằng câu mở đầu hiện tại (thời lượng đã ép, có tỷ lệ).
+def parse_header(prompt_final: str) -> Optional[Dict]:
+    """Đọc ngược câu mở đầu của prompt_final: {model, seconds, ratio, valid} hoặc None nếu không có header nhận ra được.
 
-    Job tạo trước bản này có header "Tạo video Seedance 2.5 dài 30 giây." → "... dài 15 giây, tỷ lệ ... ".
-    Không có header nhận ra được (người dùng đã sửa tay toàn bộ) → giữ nguyên văn, không chèn gì.
+    `seconds` là số nguyên văn trong header (có thể ngoài 4-15 với job cũ "30 giây"); `ratio` là tỷ lệ đã chuẩn hóa
+    ("16:9"/"9:16") hoặc None khi header không nêu tỷ lệ/tỷ lệ lạ. `valid` = seconds trong khoảng Dola hỗ trợ
+    VÀ có tỷ lệ hợp lệ: khi đó header là tham số người dùng đã chốt (có thể đã sửa tay), không được ghi đè (BH-49).
     """
     text = (prompt_final or "").strip()
     m = HEADER_RE.match(text)
     if not m:
+        return None
+    seconds = int(m.group("seconds"))
+    ratio_text = (m.group("ratio") or "").replace(", tỷ lệ khung hình", "", 1).strip()
+    ratio_value, ratio_warning = normalize_ratio(ratio_text) if ratio_text else (None, "thiếu tỷ lệ")
+    ratio = ratio_value if ratio_text and not ratio_warning else None
+    valid = DURATION_MIN_SECONDS <= seconds <= DURATION_MAX_SECONDS and ratio is not None
+    return {"model": m.group("model"), "seconds": seconds, "ratio": ratio, "valid": valid, "end": m.end()}
+
+
+def fix_header(prompt_final: str, duration_label, ratio, model=None) -> str:
+    """Thay câu mở đầu của prompt_final đã lưu bằng câu mở đầu hiện tại CHỈ KHI header hiện có thiếu/sai tham số.
+
+    Job tạo trước bản này có header "Tạo video Seedance 2.5 dài 30 giây." (giây ngoài 4-15, không tỷ lệ) → viết lại
+    "... dài 15 giây, tỷ lệ ... ". Header đã có số giây hợp lệ (4-15) VÀ tỷ lệ hợp lệ → giữ nguyên văn (người dùng có
+    thể đã sửa tay "8 giây", "9:16"; `parse_header` cho dola_service đọc ngược để ghi lại jobs.duration/ratio, BH-49).
+    Không có header nhận ra được (người dùng đã sửa tay toàn bộ) → giữ nguyên văn, không chèn gì.
+    """
+    text = (prompt_final or "").strip()
+    info = parse_header(text)
+    if info is None or info["valid"]:
         return text
-    header = build_header(model or m.group("model"), duration_label, ratio)
-    rest = text[m.end():].lstrip()
+    header = build_header(model or info["model"], duration_label, ratio)
+    rest = text[info["end"]:].lstrip()
     return f"{header} {rest}".strip()
 
 

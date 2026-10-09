@@ -378,8 +378,11 @@ def test_technical_error_auto_retries_then_fails_with_max_attempts(db, fake_dola
 # ---------------------------------------------------------------- BH-46/BH-47: Dola hỏi lại tỷ lệ → tool tự trả lời một lần
 def test_dola_asks_ratio_tool_answers_once_and_completes(db, fake_dola, worker_runner):
     """mode=ask_ratio: tin nhắn đầu không tạo video, chain trả nguyên văn câu hỏi của Dola (tỷ lệ/thời lượng).
-    dola_service đọc câu trả lời, tự gửi "15 giây, tỷ lệ 16:9 ..." đúng MỘT lần, rồi Dola render → Hoàn thành."""
-    fake_dola.control(mode="ask_ratio", render_seconds=2, credits=4)
+    dola_service đọc câu trả lời, tự gửi "15 giây, tỷ lệ 16:9 ..." đúng MỘT lần, rồi Dola render → Hoàn thành.
+    BH-48: như Dola thật, chain sau đó chứa CẢ câu tool vừa trả lời; tool không được đọc nhầm nó thành "Dola trả lời
+    bằng chữ" (jobs.dola_reply phải vẫn là câu hỏi của Dola, không có log/lý do chứa câu của chính tool)."""
+    from fake_dola import ASK_RATIO_TEXT
+    fake_dola.control(mode="ask_ratio", render_seconds=8, credits=4)
     acc_id = db.add_account("nick bị hỏi tỷ lệ")
     job_id = db.add_job("Người nhện đánh nhau với robot")
 
@@ -387,7 +390,8 @@ def test_dola_asks_ratio_tool_answers_once_and_completes(db, fake_dola, worker_r
     jobs = _assert_completed(db, [job_id], timeout=150)
     assert jobs[job_id]["account_id"] == acc_id
     assert jobs[job_id]["duration"] == "15 giây" and jobs[job_id]["ratio"] == "16:9"
-    assert "Which option would you like?" in (jobs[job_id]["dola_reply"] or ""), jobs[job_id]["dola_reply"]
+    assert jobs[job_id]["dola_reply"] == ASK_RATIO_TEXT, \
+        "dola_reply phải là câu Dola hỏi, không phải câu tool tự trả lời (BH-48): %r" % (jobs[job_id]["dola_reply"],)
 
     st = fake_dola.get_state()
     assert len(st["conversations"]) == 1, st["conversations"]
@@ -397,6 +401,8 @@ def test_dola_asks_ratio_tool_answers_once_and_completes(db, fake_dola, worker_r
     assert st["sent_prompts"][1] == "15 giây, tỷ lệ 16:9. Hãy tạo video ngay, không cần hỏi thêm."
     messages = [r["message"] or "" for r in db.system_logs() if r["job_id"] == job_id]
     assert any("Dola hỏi lại" in m and "đã tự trả lời" in m for m in messages), messages
+    assert sum("Dola hỏi lại" in m for m in messages) == 1, messages
+    assert not any("Hãy tạo video ngay, không cần hỏi thêm" in m and "Dola trả lời bằng chữ" in m for m in messages), messages
     sess = next(v for k, v in st["sessions"].items() if k != "__anonymous__")
     assert sess["credits"] == 3, "hỏi lại không trừ credit, trả lời xong mới trừ đúng 1: %r" % (sess,)
     wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
@@ -406,8 +412,9 @@ def test_dola_asks_ratio_tool_answers_once_and_completes(db, fake_dola, worker_r
 # ---------------------------------------------------------------- BH-47: Dola trả lời bằng chữ, không tạo video → Thất bại sớm
 def test_dola_replies_text_job_fails_fast_with_reply_in_reason(db, fake_dola, worker_runner):
     """mode=reply_text: chain chỉ có văn bản "I cannot create that video" (không phải câu hỏi, không video).
-    Sau REPLY_NO_VIDEO_SECONDS (60 s) không có video/không "generating" → Thất bại ngay (không chờ 8 phút), lý do
-    chứa nguyên văn câu Dola nói; không tính lỗi kỹ thuật: attempts == 1, không tự chạy lại, nick vẫn ready."""
+    N-1: văn bản giống lời TỪ CHỐI ("cannot") → sau REPLY_NO_VIDEO_SECONDS (60 s) không có video/không "generating"
+    → Thất bại ngay (không chờ 8 phút, và < 120 s vì không phải chờ mốc REPLY_NO_VIDEO_HARD_SECONDS), lý do chứa
+    nguyên văn câu Dola nói; không tính lỗi kỹ thuật: attempts == 1, không tự chạy lại, nick vẫn ready."""
     fake_dola.control(mode="reply_text", credits=4)
     acc_id = db.add_account("nick bị từ chối")
     job_id = db.add_job("Job bị Dola trả lời bằng chữ")
