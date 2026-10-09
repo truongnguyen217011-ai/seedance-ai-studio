@@ -155,6 +155,52 @@ def check_chrome() -> bool:
     return False
 
 
+def port_in_use(host: str = "127.0.0.1", port: int = 8000) -> bool:
+    """True nếu cổng đã có tiến trình khác chiếm (bản tool cũ chưa tắt). BH-35."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+            return False
+        except OSError:
+            return True
+
+
+def find_pid_on_port(port: int = 8000):
+    """Tìm PID đang giữ cổng (Windows: netstat; nơi khác: ss). Không tìm được thì trả None."""
+    import subprocess
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3].upper() == "LISTENING":
+                    return parts[4]
+        else:
+            out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if f":{port} " in line and "pid=" in line:
+                    return line.split("pid=")[1].split(",")[0]
+    except Exception as e:  # BH-08: không nuốt lỗi
+        _print(f"(không tìm được PID giữ cổng {port}: {e})")
+    return None
+
+
+def check_port(port: int = 8000) -> bool:
+    if not port_in_use(port=port):
+        _print(f"[OK ] Cổng {port} đang rảnh")
+        return True
+    pid = find_pid_on_port(port)
+    _print(f"[LỖI] Cổng {port} đang bị chiếm" + (f" bởi tiến trình PID {pid}" if pid else "") + ".")
+    _print("      Thường là bản tool cũ vẫn đang chạy ở một cửa sổ đen khác.")
+    _print("      Cách xử lý: tìm cửa sổ đen 'Seedance AI Studio' cũ và bấm Ctrl+C (hoặc đóng cửa sổ),")
+    if pid:
+        _print(f"      hoặc mở cmd và chạy:  taskkill /PID {pid} /F")
+    _print("      rồi chạy lại KHOI_DONG.bat.")
+    return False
+
+
 def main() -> int:
     _print("=== Kiểm tra môi trường Seedance AI Studio ===")
     _print(f"Thư mục: {BASE_DIR}")
@@ -164,11 +210,15 @@ def main() -> int:
     if not check_libraries():
         return 1
     chrome_ok = check_chrome()
+    port_ok = check_port(8000)
 
     _print("")
-    _print("Tóm tắt: Python OK · Thư viện OK · Chrome " + ("OK" if chrome_ok else "THIẾU"))
+    _print("Tóm tắt: Python OK · Thư viện OK · Chrome " + ("OK" if chrome_ok else "THIẾU")
+           + " · Cổng 8000 " + ("rảnh" if port_ok else "BỊ CHIẾM"))
     if not chrome_ok:
         return 2
+    if not port_ok:
+        return 3
     _print("Môi trường sẵn sàng, đang khởi động server...")
     return 0
 

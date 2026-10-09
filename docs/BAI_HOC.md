@@ -253,3 +253,10 @@ Mẫu một mục:
 - Nguyên nhân gốc: `dola_service` ghi job về `Chờ` với "Nick X hết credit hôm nay, chưa có nick khác, chờ hồi phục lúc 00:05"; sau khi Chrome đóng và nick được trả, vòng quét 2 giây kế tiếp **đúng thiết kế Q7** ghi đè `status_message` thành tóm tắt "Chưa có nick phù hợp: 1 nick đang nghỉ". Test assert chuỗi tạm ngay sau khi thấy `status = Chờ` nên rơi vào cửa sổ đua giữa hai lần ghi (cùng họ với BH-26).
 - Quy tắc: thông điệp mà job mang lúc rời `Đang chạy` là **tạm**; test chỉ được assert nó dưới dạng "một trong các thông điệp hợp lệ", còn lý do gốc (hết credit, captcha, lỗi kỹ thuật) phải kiểm qua kênh bền: `system_logs` (log_event ghi cùng lúc), cột nick (`rest_until`, `needs_manual`), hoặc `attempts`. Không bao giờ assert bằng `==` trên `status_message` của job `Chờ` khi worker đang chạy.
 - Kiểm: `tests/test_worker_fake_dola.py::test_k4_partial_daily_limit_rests_account_and_requeues_job` (chấp nhận "hết credit" hoặc "nick đang nghỉ", kiểm "hết credit hôm nay" trong `system_logs`); `grep -n 'assert .*status_message.*== ' tests/test_worker_fake_dola.py` chỉ được ra trong Q5 (gọi `reset_orphans_on_startup()` đồng bộ, không có worker) và Q7 (so hai lần đọc với nhau, không so với chuỗi cứng).
+
+## BH-35 · Cổng 8000 bị bản tool cũ chiếm, server mới tắt im lặng
+- Ngày: 2026-10-09 · Giai đoạn: 1 · Mã: C2
+- Triệu chứng: người dùng chạy KHOI_DONG.bat, mọi bước kiểm tra OK, rồi một dòng đỏ tiếng Anh "Errno 10048 only one usage of each socket address", server tắt; người dùng tưởng đã xong.
+- Nguyên nhân gốc: check_env.py kiểm Python, thư viện, Chrome nhưng không kiểm cổng; lỗi của uvicorn bằng tiếng Anh, không nói cách xử lý.
+- Quy tắc: mọi tài nguyên server cần (cổng, thư mục dữ liệu, Chrome) đều phải kiểm trước khi khởi động và báo bằng tiếng Việt kèm cách xử lý (PID, lệnh taskkill).
+- Kiểm: `tests/test_check_env_port.py`; thử tay: mở KHOI_DONG.bat hai lần, cửa sổ thứ hai phải báo "Cổng 8000 đang bị chiếm bởi PID ..." và không khởi động server.

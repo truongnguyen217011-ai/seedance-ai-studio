@@ -22,7 +22,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [2/4] Kiem tra moi truong (thu vien, Chrome)...
+echo [2/4] Kiem tra moi truong: thu vien, Chrome, cong 8000 ...
 python check_env.py
 if %errorlevel% neq 0 (
     echo.
