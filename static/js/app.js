@@ -309,7 +309,7 @@ async function fetchJobs() {
             </div>
           </td>
           <td class="p-2.5 text-center font-mono ${attempts > 1 ? 'text-amber-300' : 'text-gray-400'}" title="Số lần đã thử chạy job này">${escapeHtml(attempts)}</td>
-          <td class="p-2.5 text-gray-300 font-medium">${escapeHtml(j.duration || '')}</td>
+          <td class="p-2.5 text-gray-300 font-medium" title="Thời lượng · tỷ lệ khung hình gửi Dola">${escapeHtml([j.duration, j.ratio].filter(Boolean).join(' · '))}</td>
           <td class="p-2.5 text-gray-300 font-semibold">${escapeHtml(j.model || '')}</td>
           <td class="p-2.5">${accBadge}</td>
           <td class="p-2.5">${proxyBadge}</td>
@@ -929,6 +929,7 @@ function _directorRequestBody(prompts) {
     prompts,
     model: document.getElementById('batchModelSelect').value,
     duration: document.getElementById('batchDurationSelect').value,
+    ratio: document.getElementById('batchRatioSelect').value,
     style_code: styleEl ? styleEl.value : '',
     director: dirEl ? !!dirEl.checked : null
   };
@@ -983,6 +984,7 @@ async function previewDirectorPrompts() {
       return;
     }
     renderDirectorPreview(data.items || []);
+    showParamWarnings(data.warnings);
     if (data.director_enabled === false) showToast('Đạo diễn AI đang tắt: prompt chỉ được thêm câu mở đầu, không ghép mẫu', 'warning', 6000);
   } catch (err) {
     reportFetchError('Không xem trước được prompt đã đạo diễn', err);
@@ -1012,11 +1014,18 @@ async function submitBatchPrompts() {
     const box = document.getElementById('directorPreviewBox');
     if (box) { box.innerHTML = ''; box.classList.add('hidden'); }
     const codes = Array.from(new Set((data.jobs || []).map(j => j.archetype).filter(Boolean)));
-    showToast(`Đã nạp ${data.created} job vào hàng đợi` + (codes.length ? ` · trường phái: ${codes.join(', ')}` : ' · không qua Đạo diễn AI'), 'success', 7000);
+    const params = [data.duration, data.ratio].filter(Boolean).join(' · ');
+    showToast(`Đã nạp ${data.created} job vào hàng đợi` + (params ? ` (${params})` : '') + (codes.length ? ` · trường phái: ${codes.join(', ')}` : ' · không qua Đạo diễn AI'), 'success', 7000);
+    showParamWarnings(data.warnings);
     refreshData();
   } catch (err) {
     reportFetchError('Không gửi được lô prompt', err);
   }
+}
+
+// BH-46: backend ép thời lượng ngoài 4-15 giây / tỷ lệ lạ về giá trị Dola hỗ trợ và trả `warnings` → báo cho người dùng
+function showParamWarnings(warnings) {
+  (Array.isArray(warnings) ? warnings : []).forEach(w => showToast(w, 'warning', 9000));
 }
 
 // Modal xem/sửa prompt đã đạo diễn của một job
@@ -1032,6 +1041,13 @@ function openJobPromptModal(id) {
   document.getElementById('jobPromptArchetype').textContent = j.archetype_code ? `Trường phái ${j.archetype_code}` : 'Không qua Đạo diễn AI';
   document.getElementById('jobPromptOriginal').value = j.prompt || '';
   document.getElementById('jobPromptFinal').value = j.prompt_final || '';
+  // BH-47: câu trả lời bằng chữ cuối cùng của Dola (nếu có) để người dùng biết Dola nói gì
+  const replyBox = document.getElementById('jobPromptDolaReplyBox');
+  const replyEl = document.getElementById('jobPromptDolaReply');
+  if (replyBox && replyEl) {
+    if (j.dola_reply) { replyEl.textContent = j.dola_reply; replyBox.classList.remove('hidden'); }
+    else { replyEl.textContent = ''; replyBox.classList.add('hidden'); }
+  }
   const editable = JOB_PROMPT_EDITABLE.includes(j.status);
   const ta = document.getElementById('jobPromptFinal');
   const btn = document.getElementById('jobPromptSaveBtn');
@@ -1157,6 +1173,8 @@ async function loadSettings() {
     set('settingDelay', s.delay_between_jobs);
     set('settingModel', s.default_model);
     set('settingDuration', s.default_duration);
+    set('settingRatio', s.default_ratio);
+    applyVideoDefaults(s.default_duration, s.default_ratio, s.default_model);
     const cp = document.getElementById('settingChromePath');
     if (cp) cp.value = s.chrome_path || '';
     applyDirectorSettings(s);
@@ -1197,6 +1215,8 @@ async function saveSettings() {
   const max_concurrent_jobs = document.getElementById('settingMaxJobs').value;
   const default_model = document.getElementById('settingModel').value;
   const default_duration = document.getElementById('settingDuration').value;
+  const ratioEl = document.getElementById('settingRatio');
+  const default_ratio = ratioEl ? ratioEl.value : '';
   const delay_between_jobs = document.getElementById('settingDelay').value;
   const chromeEl = document.getElementById('settingChromePath');
   const chrome_path = chromeEl ? chromeEl.value.trim() : '';
@@ -1207,7 +1227,7 @@ async function saveSettings() {
     return;
   }
 
-  const body = { max_concurrent_jobs, default_model, default_duration, delay_between_jobs, chrome_path };
+  const body = { max_concurrent_jobs, default_model, default_duration, default_ratio, delay_between_jobs, chrome_path };
   Object.entries(DIRECTOR_SETTING_CHECKBOXES).forEach(([key, id]) => {
     const el = document.getElementById(id);
     if (el) body[key] = el.checked ? '1' : '0';
@@ -1222,6 +1242,7 @@ async function saveSettings() {
       body: JSON.stringify(body)
     });
     applyDirectorSettings(body);
+    applyVideoDefaults(default_duration, default_ratio, default_model);
     showToast('Đã lưu cài đặt hệ thống', 'success');
     fetchHealth();
   } catch (err) {
@@ -1553,9 +1574,13 @@ function autoEnhanceImagePrompt() {
 }
 
 // ==================== STUDIO CONTROL BAR (TẠO VIDEO) ====================
-let currentSelectedDuration = "30 giây";
+// Thời lượng và tỷ lệ là tham số thật gửi Dola (BH-46): Dola chỉ hỗ trợ 4-15 giây; tỷ lệ 16:9 (ngang) / 9:16 (dọc).
+// Thanh điều khiển, modal "Thêm hàng loạt prompt" và Cài đặt dùng CÙNG một cặp biến mặc định này.
+const VIDEO_DURATION_CHOICES = Object.freeze(['5 giây', '10 giây', '15 giây']);
+const VIDEO_RATIO_CHOICES = Object.freeze(['16:9', '9:16']);
+let currentSelectedDuration = "15 giây";
 let currentSelectedModel = "Seedance 2.5";
-let currentSelectedRatio = "Dọc";
+let currentSelectedRatio = "16:9";
 let currentSelectedQuality = "Chất lượng";
 
 function setVideoQuality(val, btn) {
@@ -1566,22 +1591,49 @@ function setVideoQuality(val, btn) {
   if (btn) btn.className = 'mode-btn px-2.5 py-0.5 rounded text-[11px] font-bold bg-cyan-500 text-black shadow transition';
 }
 
-function setVideoDuration(val, btn) {
-  currentSelectedDuration = val;
-  document.querySelectorAll('.dur-btn').forEach(b => {
-    b.className = 'dur-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition';
+function _highlightButtons(selector, dataKey, value, activeClass, idleClass) {
+  document.querySelectorAll(selector).forEach(b => {
+    b.className = (b.dataset[dataKey] === value) ? activeClass : idleClass;
   });
-  if (btn) btn.className = 'dur-btn px-2 py-0.5 rounded text-[11px] font-bold bg-purple-600 text-white shadow transition';
+}
+
+function setVideoDuration(val, btn) {
+  if (!VIDEO_DURATION_CHOICES.includes(val)) {
+    showToast(`Thời lượng '${val}' không được Dola hỗ trợ (chỉ 4-15 giây), giữ ${currentSelectedDuration}`, 'warning');
+    return;
+  }
+  currentSelectedDuration = val;
+  _highlightButtons('.dur-btn', 'duration', val,
+    'dur-btn px-2.5 py-0.5 rounded text-[11px] font-bold bg-purple-600 text-white shadow transition',
+    'dur-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition');
   const sel = document.getElementById('batchDurationSelect');
   if (sel) sel.value = val;
 }
 
 function setVideoRatio(val, btn) {
+  if (val === 'Dọc') val = '9:16';
+  if (val === 'Ngang') val = '16:9';
+  if (!VIDEO_RATIO_CHOICES.includes(val)) {
+    showToast(`Tỷ lệ '${val}' không hợp lệ (chỉ 16:9 hoặc 9:16), giữ ${currentSelectedRatio}`, 'warning');
+    return;
+  }
   currentSelectedRatio = val;
-  document.querySelectorAll('.ratio-btn').forEach(b => {
-    b.className = 'ratio-btn px-2.5 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition';
-  });
-  if (btn) btn.className = 'ratio-btn px-2.5 py-0.5 rounded text-[11px] font-bold bg-cyan-500 text-black shadow transition';
+  _highlightButtons('.ratio-btn', 'ratio', val,
+    'ratio-btn px-2.5 py-0.5 rounded text-[11px] font-bold bg-cyan-500 text-black shadow transition',
+    'ratio-btn px-2.5 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition');
+  const sel = document.getElementById('batchRatioSelect');
+  if (sel) sel.value = val;
+}
+
+// Cài đặt (default_duration / default_ratio / default_model) → giá trị chọn sẵn ở thanh điều khiển và modal lô prompt
+function applyVideoDefaults(duration, ratio, model) {
+  if (duration && VIDEO_DURATION_CHOICES.includes(duration)) setVideoDuration(duration, null);
+  if (ratio && VIDEO_RATIO_CHOICES.includes(ratio)) setVideoRatio(ratio, null);
+  if (model) {
+    const sel = document.getElementById('batchModelSelect');
+    if (sel && Array.from(sel.options).some(o => o.value === model)) sel.value = model;
+    currentSelectedModel = model;
+  }
 }
 
 function setVideoModel(val, btn) {

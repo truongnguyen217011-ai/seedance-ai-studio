@@ -373,3 +373,63 @@ def test_technical_error_auto_retries_then_fails_with_max_attempts(db, fake_dola
     assert fake_dola.get_state()["chat_get_count"] == opens, "worker vẫn mở Chrome lần thứ 4 sau khi đã Thất bại"
     assert db.job(job_id)["status"] == JobStatus.THAT_BAI
     assert get_active_browser_count() in (0, None)
+
+
+# ---------------------------------------------------------------- BH-46/BH-47: Dola hỏi lại tỷ lệ → tool tự trả lời một lần
+def test_dola_asks_ratio_tool_answers_once_and_completes(db, fake_dola, worker_runner):
+    """mode=ask_ratio: tin nhắn đầu không tạo video, chain trả nguyên văn câu hỏi của Dola (tỷ lệ/thời lượng).
+    dola_service đọc câu trả lời, tự gửi "15 giây, tỷ lệ 16:9 ..." đúng MỘT lần, rồi Dola render → Hoàn thành."""
+    fake_dola.control(mode="ask_ratio", render_seconds=2, credits=4)
+    acc_id = db.add_account("nick bị hỏi tỷ lệ")
+    job_id = db.add_job("Người nhện đánh nhau với robot")
+
+    worker_runner.start()
+    jobs = _assert_completed(db, [job_id], timeout=150)
+    assert jobs[job_id]["account_id"] == acc_id
+    assert jobs[job_id]["duration"] == "15 giây" and jobs[job_id]["ratio"] == "16:9"
+    assert "Which option would you like?" in (jobs[job_id]["dola_reply"] or ""), jobs[job_id]["dola_reply"]
+
+    st = fake_dola.get_state()
+    assert len(st["conversations"]) == 1, st["conversations"]
+    assert len(st["sent_prompts"]) == 2, st["sent_prompts"]
+    assert "Người nhện đánh nhau với robot" in st["sent_prompts"][0]
+    assert st["sent_prompts"][0].startswith("Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 16:9 (ngang).")
+    assert st["sent_prompts"][1] == "15 giây, tỷ lệ 16:9. Hãy tạo video ngay, không cần hỏi thêm."
+    messages = [r["message"] or "" for r in db.system_logs() if r["job_id"] == job_id]
+    assert any("Dola hỏi lại" in m and "đã tự trả lời" in m for m in messages), messages
+    sess = next(v for k, v in st["sessions"].items() if k != "__anonymous__")
+    assert sess["credits"] == 3, "hỏi lại không trừ credit, trả lời xong mới trừ đúng 1: %r" % (sess,)
+    wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
+    assert db.account(acc_id)["status"] == AccountStatus.READY
+
+
+# ---------------------------------------------------------------- BH-47: Dola trả lời bằng chữ, không tạo video → Thất bại sớm
+def test_dola_replies_text_job_fails_fast_with_reply_in_reason(db, fake_dola, worker_runner):
+    """mode=reply_text: chain chỉ có văn bản "I cannot create that video" (không phải câu hỏi, không video).
+    Sau REPLY_NO_VIDEO_SECONDS (60 s) không có video/không "generating" → Thất bại ngay (không chờ 8 phút), lý do
+    chứa nguyên văn câu Dola nói; không tính lỗi kỹ thuật: attempts == 1, không tự chạy lại, nick vẫn ready."""
+    fake_dola.control(mode="reply_text", credits=4)
+    acc_id = db.add_account("nick bị từ chối")
+    job_id = db.add_job("Job bị Dola trả lời bằng chữ")
+
+    t0 = time.time()
+    worker_runner.start()
+    job = wait_until(lambda: (lambda j: j if j["status"] == JobStatus.THAT_BAI else None)(db.job(job_id)), 150,
+                     what="job Thất bại vì Dola trả lời bằng chữ")
+    assert time.time() - t0 < 120, "phải dừng sớm sau ~60 s có văn bản, không chờ hết RENDER_TIMEOUT"
+    msg = job["status_message"] or ""
+    assert "Dola trả lời bằng chữ" in msg and "cannot create" in msg, msg
+    assert "[ảnh:" in msg, msg
+    assert "tự chạy lại" not in msg and "Đã thử" not in msg, msg
+    assert job["attempts"] == 1, job
+    assert "cannot create" in (job["dola_reply"] or ""), job["dola_reply"]
+
+    wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
+    acc = db.account(acc_id)
+    assert acc["status"] == AccountStatus.READY and acc["needs_manual"] is None, acc
+    opens = fake_dola.get_state()["chat_get_count"]
+    assert opens == 1, opens
+    time.sleep(6)
+    assert fake_dola.get_state()["chat_get_count"] == opens, "không được tự chạy lại khi Dola trả lời bằng chữ"
+    assert db.job(job_id)["status"] == JobStatus.THAT_BAI
+    assert len(fake_dola.get_state()["sent_prompts"]) == 1

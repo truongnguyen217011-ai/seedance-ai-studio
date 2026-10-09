@@ -268,3 +268,66 @@ def test_crash_mode_drops_connection(fake_dola):
         urllib.request.urlopen(fake_dola.base_url + "/chat/", timeout=10).read()
     # đường /__* vẫn sống để test điều khiển được
     assert fake_dola.get_state()["mode"] == "crash"
+
+
+def test_ask_ratio_mode(fake_dola, page):
+    """BH-46/BH-47: tin nhắn đầu tạo conversation nhưng chain chỉ có câu hỏi của Dola (content là chuỗi JSON lồng,
+    không URL video, không trừ credit); tin nhắn kế tiếp trong cùng /chat/{id} có "16:9" → render như normal."""
+    from fake_dola import ASK_RATIO_TEXT
+    fake_dola.control(mode="ask_ratio", render_seconds=1, credits=4)
+    page.goto(fake_dola.base_url + "/chat/", wait_until="domcontentloaded")
+    box = page.locator("div.ProseMirror").first
+    box.click()
+    box.fill("Tạo video dài 30 giây. người nhện đánh nhau với robot")
+    page.keyboard.press("Enter")
+    page.wait_for_url(re.compile(r"/chat/\d+"), timeout=10000)
+    conv_id = re.search(r"/chat/(\d+)", page.url).group(1)
+    chain = page.evaluate(SINGLE_JS, conv_id)
+    dumped = json.dumps(chain, ensure_ascii=False)
+    assert ASK_RATIO_TEXT.replace('"', '\\"') in dumped or ASK_RATIO_TEXT in dumped
+    assert "/video/tos/" not in dumped and "generating" not in dumped.lower()
+    inner = json.loads(chain["data"]["messages"][1]["content"])
+    assert inner["text"] == ASK_RATIO_TEXT, "content phải là chuỗi JSON lồng chứa text"
+    st = fake_dola.get_state()
+    assert st["sent_prompts"] == ["Tạo video dài 30 giây. người nhện đánh nhau với robot"]
+    def real_session(state):
+        return next(v for k, v in state["sessions"].items() if k != "__anonymous__")
+    assert real_session(st)["credits"] == 4, "hỏi lại thì chưa trừ credit"
+    # trả lời trong cùng conversation
+    box.click()
+    box.fill("15 giây, tỷ lệ 16:9. Hãy tạo video ngay, không cần hỏi thêm.")
+    page.keyboard.press("Enter")
+    time.sleep(1)
+    page.evaluate("1")  # BH-41: bơm sự kiện trước khi đọc URL
+    assert re.search(r"/chat/(\d+)", page.url).group(1) == conv_id, "trả lời không được tạo conversation mới"
+    deadline = time.time() + 10
+    url = None
+    while time.time() < deadline:
+        chain = page.evaluate(SINGLE_JS, conv_id)
+        m = re.search(r'https?://[^"\s]+/video/tos/\d+\.mp4', json.dumps(chain))
+        if m:
+            url = m.group(0)
+            break
+        time.sleep(0.5)
+    assert url and url.endswith(f"/video/tos/{conv_id}.mp4"), chain
+    st = fake_dola.get_state()
+    assert len(st["sent_prompts"]) == 2 and len(st["conversations"]) == 1
+    assert real_session(st)["credits"] == 3
+
+
+def test_reply_text_mode(fake_dola, page):
+    """mode=reply_text: chain luôn là văn bản từ chối, không bao giờ có video."""
+    from fake_dola import REPLY_TEXT
+    fake_dola.control(mode="reply_text", render_seconds=0)
+    page.goto(fake_dola.base_url + "/chat/", wait_until="domcontentloaded")
+    box = page.locator("div.ProseMirror").first
+    box.click()
+    box.fill("prompt bị từ chối")
+    page.keyboard.press("Enter")
+    page.wait_for_url(re.compile(r"/chat/\d+"), timeout=10000)
+    conv_id = re.search(r"/chat/(\d+)", page.url).group(1)
+    time.sleep(1.5)
+    chain = page.evaluate(SINGLE_JS, conv_id)
+    dumped = json.dumps(chain, ensure_ascii=False)
+    assert "/video/tos/" not in dumped
+    assert json.loads(chain["data"]["messages"][1]["content"])["text"] == REPLY_TEXT

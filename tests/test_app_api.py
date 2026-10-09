@@ -9,9 +9,11 @@ import pathlib
 
 import pytest
 
+import director
 from constants import JobStatus
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+H15 = director.build_header("Seedance 2.5", "15 giây", "16:9")
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient", reason="cần fastapi + httpx (requirements-dev.txt)")
 
@@ -143,7 +145,9 @@ def test_director_preview_returns_composed_prompts_without_creating_jobs(client,
     assert [it["prompt"] for it in items] == ["Tiểu Vũ nói chuyện với mẹ trong bếp", "Cao bồi cưỡi ngựa qua sa mạc"]
     assert items[0]["archetype_code"] == "T1" and items[0]["characters"] == ["Tiểu Vũ"]
     assert "Nhân vật: Tiểu Vũ: cô gái 20 tuổi áo dài trắng." in items[0]["prompt_final"]
-    assert items[0]["prompt_final"].startswith("Tạo video Seedance 2.5 dài 15 giây. Tiểu Vũ nói chuyện với mẹ trong bếp.")
+    assert items[0]["prompt_final"].startswith(
+        "Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 16:9 (ngang). Không hỏi lại, tạo video ngay. Tiểu Vũ nói chuyện với mẹ trong bếp.")
+    assert data["duration"] == "15 giây" and data["ratio"] == "16:9" and data["warnings"] == []
     assert items[1]["archetype_code"] == "W1"
     assert db.jobs() == [], "preview không được tạo job"
 
@@ -157,7 +161,14 @@ def test_director_preview_returns_composed_prompts_without_creating_jobs(client,
     # tắt đạo diễn theo yêu cầu → chỉ câu mở đầu + prompt
     r = client.post("/api/director/preview", json={"prompts": ["Cao bồi cưỡi ngựa"], "director": False})
     it = r.json()["items"][0]
-    assert it["prompt_final"] == "Tạo video Seedance 2.5 dài 30 giây. Cao bồi cưỡi ngựa." and it["archetype_code"] == ""
+    assert it["prompt_final"] == f"{H15} Cao bồi cưỡi ngựa." and it["archetype_code"] == ""
+    # BH-46: "30 giây" ngoài khoảng Dola hỗ trợ → ép về 15 và báo warnings; tỷ lệ 9:16 đi vào câu mở đầu
+    r = client.post("/api/director/preview", json={"prompts": ["Cao bồi cưỡi ngựa"], "director": False,
+                                                   "duration": "30 giây", "ratio": "9:16"})
+    data = r.json()
+    assert data["duration"] == "15 giây" and data["ratio"] == "9:16"
+    assert any("30 giây" in w and "15 giây" in w for w in data["warnings"]), data["warnings"]
+    assert data["items"][0]["prompt_final"].startswith("Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 9:16 (dọc).")
 
 
 def test_batch_jobs_store_prompt_final_and_archetype(client, db):
@@ -169,12 +180,14 @@ def test_batch_jobs_store_prompt_final_and_archetype(client, db):
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["success"] is True and data["created"] == 2
+    assert data["duration"] == "15 giây" and data["ratio"] == "16:9" and len(data["warnings"]) == 1  # BH-46
     assert [j["archetype"] for j in data["jobs"]] == ["Cine-Master", "A1"]
     rows = db.jobs()
     assert len(rows) == 2
     assert rows[0]["prompt"] == "01. Lão Trần chống gậy qua đồng lúa"
     assert rows[0]["prompt_final"] == data["jobs"][0]["prompt_final"]
-    assert rows[0]["prompt_final"].startswith("Tạo video Seedance 2.5 dài 30 giây. Lão Trần chống gậy qua đồng lúa. Nhân vật: Lão Trần: ông lão râu bạc.")
+    assert rows[0]["prompt_final"].startswith(f"{H15} Lão Trần chống gậy qua đồng lúa. Nhân vật: Lão Trần: ông lão râu bạc.")
+    assert rows[0]["duration"] == "15 giây" and rows[0]["ratio"] == "16:9"
     assert rows[0]["archetype_code"] == "Cine-Master" and rows[1]["archetype_code"] == "A1"
     assert "Hollywood blockbuster action masterpiece" not in rows[0]["prompt_final"]
 
@@ -183,13 +196,18 @@ def test_batch_jobs_store_prompt_final_and_archetype(client, db):
     assert db.job(r.json()["jobs"][0]["id"])["archetype_code"] == "C2"
     r = client.post("/api/jobs/batch", json={"prompts": ["Cảnh phố"], "director": False})
     j = db.job(r.json()["jobs"][0]["id"])
-    assert j["archetype_code"] == "" and j["prompt_final"] == "Tạo video Seedance 2.5 dài 30 giây. Cảnh phố."
+    assert j["archetype_code"] == "" and j["prompt_final"] == f"{H15} Cảnh phố."
+    r = client.post("/api/jobs/batch", json={"prompts": ["Cảnh phố"], "director": False, "ratio": "9:16", "duration": "10 giây"})
+    j = db.job(r.json()["jobs"][0]["id"])
+    assert j["duration"] == "10 giây" and j["ratio"] == "9:16"
+    assert j["prompt_final"].startswith("Tạo video Seedance 2.5 dài 10 giây, tỷ lệ khung hình 9:16 (dọc).")
 
     # setting director_enabled=0 → mặc định tắt cho job đơn lẻ
     db.set_setting("director_enabled", "0")
     r = client.post("/api/jobs", json={"prompt": "Cô gái cười", "duration": "15 giây"})
     j = db.job(r.json()["id"])
-    assert j["prompt_final"] == "Tạo video Seedance 2.5 dài 15 giây. Cô gái cười."
+    assert j["prompt_final"] == f"{H15} Cô gái cười."
+    assert j["ratio"] == "16:9" and r.json()["warnings"] == []
     db.set_setting("director_enabled", "1")
     r = client.post("/api/jobs", json={"prompt": "Cô gái cười", "duration": "15 giây"})
     j = db.job(r.json()["id"])

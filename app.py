@@ -20,7 +20,8 @@ import config
 import director
 from account_pool import AccountPool
 from batch_dispatcher import get_batch_progress, import_b3_batch
-from constants import JobStatus, Reason
+from constants import (DEFAULT_DURATION, DEFAULT_RATIO, JobStatus, Reason, duration_label, normalize_duration,
+                       normalize_ratio)
 from database import get_connection, init_db, log_event
 from diagnostics import build_bundle, diagnose_account
 from dola_service import (
@@ -88,7 +89,8 @@ class CreateJobRequest(BaseModel):
     title: Optional[str] = ""
     prompt: str
     model: Optional[str] = "Seedance 2.5"
-    duration: Optional[str] = "30 giây"
+    duration: Optional[str] = None      # None = setting default_duration; ngoài 4-15 giây bị ép về 15 + warnings (BH-46)
+    ratio: Optional[str] = None         # "16:9" | "9:16"; None = setting default_ratio
     account_id: Optional[int] = None
     reference_image: Optional[str] = ""
 
@@ -96,7 +98,8 @@ class CreateJobRequest(BaseModel):
 class BatchJobsRequest(BaseModel):
     prompts: List[str]
     model: Optional[str] = "Seedance 2.5"
-    duration: Optional[str] = "30 giây"
+    duration: Optional[str] = None
+    ratio: Optional[str] = None
     style_code: Optional[str] = ""      # "" = tự nhận diện; mã trong director.ARCHETYPE_BY_CODE để ép trường phái
     director: Optional[bool] = None     # None = theo setting director_enabled
 
@@ -105,6 +108,7 @@ class DirectorPreviewRequest(BaseModel):
     prompts: List[str]
     style_code: Optional[str] = ""
     duration: Optional[str] = None
+    ratio: Optional[str] = None
     model: Optional[str] = None
     director: Optional[bool] = None
 
@@ -543,29 +547,38 @@ def _load_assets() -> list:
         conn.close()
 
 
-def _director_context(director_flag: Optional[bool], model: Optional[str], duration: Optional[str]) -> dict:
-    """Đọc settings + assets một lần cho cả lô; director_flag (True/False) ghi đè setting director_enabled."""
+def _director_context(director_flag: Optional[bool], model: Optional[str], duration: Optional[str],
+                      ratio: Optional[str] = None) -> dict:
+    """Đọc settings + assets một lần cho cả lô; director_flag (True/False) ghi đè setting director_enabled.
+
+    Thời lượng và tỷ lệ là tham số thật của job (BH-46): thời lượng ngoài 4-15 giây bị ép về biên (thường 15)
+    và tỷ lệ lạ về mặc định; mỗi lần ép sinh một dòng trong ctx["warnings"] để trả về giao diện.
+    """
     settings = _load_settings_dict()
     options = director.options_from_settings(settings)
     if director_flag is not None:
         options["director_enabled"] = "1" if director_flag else "0"
+    seconds, dur_warning = normalize_duration(duration or settings.get("default_duration") or DEFAULT_DURATION)
+    ratio_value, ratio_warning = normalize_ratio(ratio or settings.get("default_ratio") or DEFAULT_RATIO)
     return {
         "options": options,
         "assets": _load_assets(),
         "model": model or settings.get("default_model") or "Seedance 2.5",
-        "duration": duration or settings.get("default_duration") or "30 giây",
+        "duration": duration_label(seconds),
+        "ratio": ratio_value,
+        "warnings": [w for w in (dur_warning, ratio_warning) if w],
     }
 
 
 def _compose_for_job(prompt: str, ctx: dict, style_code: Optional[str]) -> dict:
-    return director.compose(prompt, duration_label=ctx["duration"], model=ctx["model"], options=ctx["options"],
-                            assets=ctx["assets"], style_override=style_code)
+    return director.compose(prompt, duration_label=ctx["duration"], ratio=ctx["ratio"], model=ctx["model"],
+                            options=ctx["options"], assets=ctx["assets"], style_override=style_code)
 
 
 @app.post("/api/director/preview")
 async def director_preview(req: DirectorPreviewRequest):
     """Xem trước prompt đã đạo diễn, KHÔNG tạo job. Trả về một mục cho mỗi dòng prompt không rỗng."""
-    ctx = _director_context(req.director, req.model, req.duration)
+    ctx = _director_context(req.director, req.model, req.duration, req.ratio)
     items = []
     try:
         for p in req.prompts:
@@ -585,13 +598,14 @@ async def director_preview(req: DirectorPreviewRequest):
             })
     except ValueError as e:  # mã trường phái lạ
         return {"success": False, "message": str(e), "items": []}
-    return {"success": True, "items": items, "director_enabled": director.is_enabled(ctx["options"])}
+    return {"success": True, "items": items, "director_enabled": director.is_enabled(ctx["options"]),
+            "duration": ctx["duration"], "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
 
 
 @app.post("/api/jobs")
 async def create_job(req: CreateJobRequest):
     title = req.title if req.title else req.prompt[:40] + "..."
-    ctx = _director_context(None, req.model, req.duration)
+    ctx = _director_context(None, req.model, req.duration, req.ratio)
     try:
         composed = _compose_for_job(req.prompt, ctx, None)
     except ValueError as e:
@@ -601,11 +615,11 @@ async def create_job(req: CreateJobRequest):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO jobs (account_id, title, prompt, prompt_final, archetype_code, model, duration, status, status_message,
-                              progress, reference_image, attempts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
-        """, (req.account_id, title, req.prompt, composed["prompt_final"], composed["archetype_code"], req.model, req.duration,
-              JobStatus.CHO, "Chờ worker nhặt", reference_image))
+            INSERT INTO jobs (account_id, title, prompt, prompt_final, archetype_code, model, duration, ratio, status,
+                              status_message, progress, reference_image, attempts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
+        """, (req.account_id, title, req.prompt, composed["prompt_final"], composed["archetype_code"], ctx["model"],
+              ctx["duration"], ctx["ratio"], JobStatus.CHO, "Chờ worker nhặt", reference_image))
         new_id = cursor.lastrowid
         conn.commit()
     finally:
@@ -613,12 +627,13 @@ async def create_job(req: CreateJobRequest):
     log_event(f"Tạo job video #{new_id} ({title}) · trường phái {composed['archetype_code'] or 'tắt đạo diễn'}",
               "INFO", "Queue", job_id=new_id)
     return {"success": True, "id": new_id, "prompt": req.prompt, "prompt_final": composed["prompt_final"],
-            "archetype": composed["archetype_code"]}
+            "archetype": composed["archetype_code"], "duration": ctx["duration"], "ratio": ctx["ratio"],
+            "warnings": ctx["warnings"]}
 
 
 @app.post("/api/jobs/batch")
 async def create_batch_jobs(req: BatchJobsRequest):
-    ctx = _director_context(req.director, req.model, req.duration)
+    ctx = _director_context(req.director, req.model, req.duration, req.ratio)
     try:
         prepared = []
         for seq, p in enumerate(req.prompts, 1):
@@ -635,20 +650,23 @@ async def create_batch_jobs(req: BatchJobsRequest):
         cursor = conn.cursor()
         for seq, p, composed in prepared:
             cursor.execute("""
-                INSERT INTO jobs (title, prompt, prompt_final, archetype_code, model, duration, status, status_message,
-                                  progress, seq, reference_image, attempts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+                INSERT INTO jobs (title, prompt, prompt_final, archetype_code, model, duration, ratio, status,
+                                  status_message, progress, seq, reference_image, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
             """, (p[:40] + "...", p, composed["prompt_final"], composed["archetype_code"], ctx["model"], ctx["duration"],
-                  JobStatus.CHO, "Chờ worker nhặt", seq, composed["reference_image"] or ""))
+                  ctx["ratio"], JobStatus.CHO, "Chờ worker nhặt", seq, composed["reference_image"] or ""))
             created.append({"id": cursor.lastrowid, "prompt": p, "prompt_final": composed["prompt_final"],
                             "archetype": composed["archetype_code"], "characters": composed["characters"]})
         conn.commit()
     finally:
         conn.close()
     codes = sorted({c["archetype"] for c in created if c["archetype"]})
-    log_event(f"Nạp {len(created)} prompt vào hàng đợi video · Đạo diễn AI: "
+    log_event(f"Nạp {len(created)} prompt vào hàng đợi video ({ctx['duration']}, {ctx['ratio']}) · Đạo diễn AI: "
               + (", ".join(codes) if codes else "tắt"), "SUCCESS", "Queue")
-    return {"success": True, "created": len(created), "jobs": created}
+    for w in ctx["warnings"]:
+        log_event(f"Nạp lô prompt: {w}", "WARNING", "Queue")
+    return {"success": True, "created": len(created), "jobs": created, "duration": ctx["duration"],
+            "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
 
 
 @app.put("/api/jobs/{job_id}/prompt_final")
@@ -944,6 +962,17 @@ async def get_settings():
 
 @app.post("/api/settings")
 async def update_settings(req: dict):
+    warnings = []
+    req = dict(req)
+    if "default_duration" in req:  # BH-46: chỉ nhận thời lượng Dola hỗ trợ (4-15 giây)
+        seconds, w = normalize_duration(req["default_duration"])
+        req["default_duration"] = duration_label(seconds)
+        if w:
+            warnings.append(w)
+    if "default_ratio" in req:
+        req["default_ratio"], w = normalize_ratio(req["default_ratio"])
+        if w:
+            warnings.append(w)
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -955,7 +984,7 @@ async def update_settings(req: dict):
     if "chrome_path" in req:
         browser.refresh_chrome()
     log_event("Cập nhật cài đặt hệ thống", "INFO", "Settings")
-    return {"success": True}
+    return {"success": True, "warnings": warnings}
 
 
 # --- API MUSE AI (không còn hỗ trợ: không mở Chrome ngoài slot/pool; muse_service.py gỡ ở giai đoạn 5) & BATCH B3 ---

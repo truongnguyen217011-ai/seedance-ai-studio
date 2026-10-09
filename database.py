@@ -6,7 +6,8 @@ import sqlite3
 from datetime import datetime
 
 import config
-from constants import JobStatus, LEGACY_JOB_STATUS_MAP, Reason
+from constants import (DEFAULT_DURATION, DEFAULT_RATIO, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, JobStatus,
+                       LEGACY_JOB_STATUS_MAP, Reason, normalize_duration)
 
 # Giữ tên cũ để mã cũ còn tham chiếu database.DB_PATH không vỡ
 DB_PATH = config.DB_PATH
@@ -63,7 +64,8 @@ def init_db():
         title TEXT,
         prompt TEXT NOT NULL,
         model TEXT DEFAULT 'Seedance 2.5',
-        duration TEXT DEFAULT '30 giây',
+        duration TEXT DEFAULT '{DEFAULT_DURATION}',
+        ratio TEXT,
         status TEXT DEFAULT '{JobStatus.CHO}',
         status_message TEXT DEFAULT '',
         progress INTEGER DEFAULT 0,
@@ -165,6 +167,10 @@ def init_db():
         ("finished_at", "TIMESTAMP"),
         # Giai đoạn 4: mã trường phái Đạo diễn AI đã dùng khi ghép prompt_final (docs/KIEN_TRUC.md mục 8)
         ("archetype_code", "TEXT"),
+        # BH-46: tỷ lệ khung hình là tham số thật của job (Dola hỏi lại nếu prompt không nói)
+        ("ratio", "TEXT"),
+        # BH-47: câu trả lời bằng chữ cuối cùng của Dola trong lúc chờ render (hiện trong modal Prompt)
+        ("dola_reply", "TEXT"),
     ]
     for col, decl in job_columns:
         _add_column_if_missing(cursor, "jobs", col, decl)
@@ -183,7 +189,8 @@ def init_db():
         "chrome_path": "",
         "dola_base_url": "",
         "default_model": "Seedance 2.5",
-        "default_duration": "30 giây",
+        "default_duration": DEFAULT_DURATION,
+        "default_ratio": DEFAULT_RATIO,
         "proxy_type": "http",
         "auto_download": "true",
         "delay_between_jobs": "5",
@@ -194,8 +201,21 @@ def init_db():
     for k, v in defaults.items():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 
+    # BH-46: bản cũ mặc định "30 giây" nhưng Dola chỉ hỗ trợ 4-15 giây → ghi đè giá trị ngoài khoảng, báo một dòng INFO
+    notices = []
+    row = cursor.execute("SELECT value FROM settings WHERE key = 'default_duration'").fetchone()
+    old_duration = row["value"] if row is not None else None
+    seconds, warning = normalize_duration(old_duration)
+    if warning:
+        cursor.execute("UPDATE settings SET value = ? WHERE key = 'default_duration'", (DEFAULT_DURATION,))
+        notices.append(f"Cài đặt thời lượng mặc định '{old_duration}' ngoài khoảng Dola hỗ trợ "
+                       f"({DURATION_MIN_SECONDS}-{DURATION_MAX_SECONDS} giây), đã đổi thành '{DEFAULT_DURATION}'")
+
     conn.commit()
     conn.close()
+    # Ghi log SAU khi đóng kết nối (log_event mở kết nối riêng để ghi system_logs, tránh chờ khóa WAL)
+    for msg in notices:
+        log_event(msg, "INFO", "Database")
 
 
 def reset_orphans_on_startup() -> int:

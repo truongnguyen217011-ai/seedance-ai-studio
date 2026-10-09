@@ -20,6 +20,13 @@ Thiết kế:
   gõ ngay khi captcha được giải (như Dola thật đôi khi làm): lúc chuyển mode về normal, server tạo conversation
   cho mọi phiên đã bị captcha chặn với đúng prompt họ đã gửi và trừ 1 credit. Ô nhập trên trang vẫn còn chữ
   (giống thật: trang không biết server đã gửi). Dùng để kiểm dola_service KHÔNG gửi lại (tốn thêm credit, BH-45).
+- mode=ask_ratio (BH-46/BH-47, bằng chứng: HTML trang Dola lúc job #23 hết 8 phút chờ): tin nhắn ĐẦU của một
+  conversation không tạo video; chain/single trả về văn bản trợ lý đúng nguyên văn câu Dola hỏi lại
+  (ASK_RATIO_TEXT, không có URL video), không trừ credit. Tin nhắn KẾ TIẾP trong CÙNG conversation (trang gửi
+  ``conversation_id`` lấy từ URL /chat/{id}) có chứa "9:16" hoặc "16:9" → bắt đầu render như normal (trừ 1 credit).
+  Cấu trúc chain: ``content`` là CHUỖI JSON ``{"text": ...}`` lồng trong JSON (dạng tin nhắn Doubao/Dola) để kiểm
+  dola_service._assistant_texts parse được JSON trong chuỗi.
+- mode=reply_text: mọi conversation chỉ trả văn bản REPLY_TEXT ("I cannot create that video"), không bao giờ có video.
 """
 from __future__ import annotations
 
@@ -35,7 +42,13 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-MODES = ("normal", "captcha", "daily_limit", "slow", "crash")
+MODES = ("normal", "captcha", "daily_limit", "slow", "crash", "ask_ratio", "reply_text")
+# Nguyên văn câu Dola hỏi lại (HTML trang Dola của người dùng, job #23) khi prompt nói "dài 30 giây" và không nêu tỷ lệ
+ASK_RATIO_TEXT = ("Video generation currently supports durations from 4 to 15 seconds. I can generate it at the nearest "
+                  "supported duration of 15 seconds. I also need to confirm the aspect ratio you want: "
+                  "A. 16:9 cinematic wide screen B. 9:16 vertical short video C. 2.39:1 anamorphic film look. "
+                  "Which option would you like?")
+REPLY_TEXT = "I cannot create that video, please try a different description."
 FAKE_MP4_SIZE = 120 * 1024  # > 50 000 byte theo điều kiện của dola_service
 DAILY_LIMIT_TEXT = "You have reached the daily limit for video generation"
 CAPTCHA_TEXT = "Verify to continue"
@@ -98,7 +111,7 @@ class FakeDolaState:
             s["requests"] += 1
             return s
 
-    def new_conversation(self, sid: str, prompt: str) -> str:
+    def new_conversation(self, sid: str, prompt: str, **extra) -> str:
         with self.lock:
             self._next_conv += 1
             cid = str(self._next_conv)
@@ -106,7 +119,13 @@ class FakeDolaState:
                 "prompt": prompt,
                 "created_at": time.time(),
                 "session": sid,
+                # ask_ratio: True = đang chờ người dùng trả lời tỷ lệ; answered_at = lúc trả lời (bắt đầu render)
+                "asked": False,
+                "answered_at": None,
+                "reply_text": False,
+                "messages": [prompt],
             }
+            self.conversations[cid].update(extra)
             self.sent_prompts.append(prompt)
             return cid
 
@@ -251,10 +270,12 @@ __CAPTCHA__
   async function sendPrompt() {
     const text = box.innerText;
     if (!text.trim()) return;
+    // Giống thật: tin nhắn gửi trong /chat/{id} thuộc conversation đó (ask_ratio: câu trả lời tỷ lệ)
+    const m = location.pathname.match(new RegExp('/chat/([0-9]+)'));
     const resp = await fetch('/__send', {
       method: 'POST', credentials: 'include',
       headers: {'content-type': 'application/json'},
-      body: JSON.stringify({text: text})
+      body: JSON.stringify({text: text, conversation_id: m ? m[1] : null})
     });
     const data = await resp.json();
     if (data.captcha) {
@@ -267,7 +288,7 @@ __CAPTCHA__
     if (data.daily_limit) { addMsg('__DAILY_LIMIT_TEXT__', 'limit'); document.getElementById('credits').textContent = 'You have 0 video credits left'; return; }
     if (data.conversation_id) {
       addMsg(text, 'user');
-      addMsg('Generating video...', 'bot');
+      addMsg(data.assistant_text || 'Generating video...', 'bot');
       box.innerText = '';
       if (typeof data.credits_left === 'number') {
         document.getElementById('credits').textContent = 'You have ' + data.credits_left + ' video credits left';
@@ -360,6 +381,25 @@ async def send_prompt(request: Request):
     if STATE.daily_limited(sid):
         return {"daily_limit": True, "credits_left": 0}
     sess = STATE.session(sid)
+    conv_id = str(body.get("conversation_id") or "")
+    conv = STATE.conversations.get(conv_id)
+    if conv is not None and conv["session"] == sid and conv.get("asked") and not conv.get("answered_at"):
+        # ask_ratio: tin nhắn kế tiếp trong cùng conversation
+        with STATE.lock:
+            conv["messages"].append(text)
+            STATE.sent_prompts.append(text)
+            if "9:16" in text or "16:9" in text:
+                conv["answered_at"] = time.time()
+                conv["created_at"] = time.time()  # render tính từ lúc có đủ tham số
+                sess["credits"] = max(0, sess["credits"] - 1)
+                return {"conversation_id": conv_id, "credits_left": sess["credits"], "answered": True}
+            return {"conversation_id": conv_id, "credits_left": sess["credits"], "assistant_text": ASK_RATIO_TEXT}
+    if STATE.mode == "ask_ratio":
+        cid = STATE.new_conversation(sid, text, asked=True)
+        return {"conversation_id": cid, "credits_left": sess["credits"], "assistant_text": ASK_RATIO_TEXT}
+    if STATE.mode == "reply_text":
+        cid = STATE.new_conversation(sid, text, reply_text=True)
+        return {"conversation_id": cid, "credits_left": sess["credits"], "assistant_text": REPLY_TEXT}
     with STATE.lock:
         sess["credits"] = max(0, sess["credits"] - 1)
         credits_left = sess["credits"]
@@ -401,6 +441,13 @@ async def single_chain(request: Request):
     conv = STATE.conversations.get(conv_id)
     if not conv:
         return JSONResponse({"data": {"status": "error", "message": "conversation not found"}}, status_code=404)
+    user_msg = {"content_type": "text", "role": "user", "content": json.dumps({"text": conv["prompt"]}, ensure_ascii=False)}
+    if conv.get("reply_text"):
+        return {"data": {"messages": [user_msg, {"content_type": "text", "role": "assistant",
+                                                 "content": json.dumps({"text": REPLY_TEXT}, ensure_ascii=False)}]}}
+    if conv.get("asked") and not conv.get("answered_at"):
+        return {"data": {"messages": [user_msg, {"content_type": "text", "role": "assistant",
+                                                 "content": json.dumps({"text": ASK_RATIO_TEXT}, ensure_ascii=False)}]}}
     if time.time() - conv["created_at"] < STATE.render_seconds:
         return {"data": {"status": "generating", "text": "Generating video..."}}
     base = str(request.base_url).rstrip("/")  # http://127.0.0.1:PORT (server không có TLS)

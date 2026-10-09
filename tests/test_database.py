@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "tests" / "fixtures" / "old_database.py"
 
 NEW_ACCOUNT_COLS = ["busy_job_id", "needs_manual", "last_error", "last_ip", "chrome_ok"]
-NEW_JOB_COLS = ["batch_name", "seq", "prompt_final", "attempts", "started_at", "finished_at"]
+NEW_JOB_COLS = ["batch_name", "seq", "prompt_final", "attempts", "started_at", "finished_at", "ratio", "dola_reply"]
 NEW_LOG_COLS = ["job_id", "account_id"]
 
 
@@ -101,12 +101,14 @@ def test_migration_maps_legacy_statuses_and_adds_columns(old_db, env_tmp):
     conn = database.get_connection()
     try:
         statuses = {r["status"] for r in conn.execute("SELECT status FROM jobs").fetchall()}
-        n_logs = conn.execute("SELECT COUNT(*) AS n FROM system_logs").fetchone()["n"]
+        log_messages = [r["message"] for r in conn.execute("SELECT message FROM system_logs ORDER BY id").fetchall()]
         n_acc = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]
     finally:
         conn.close()
     assert statuses <= set(JobStatus.ALL), f"còn trạng thái lạ: {statuses - set(JobStatus.ALL)}"
-    assert n_logs == 1 and n_acc == 2, "migration không được mất dữ liệu cũ"
+    assert log_messages[0] == "log cũ" and n_acc == 2, "migration không được mất dữ liệu cũ"
+    # BH-46: CSDL cũ có default_duration "30 giây" (Dola không hỗ trợ) → đổi thành 15 giây, báo đúng 1 dòng INFO
+    assert len(log_messages) == 2 and "30 giây" in log_messages[1] and "15 giây" in log_messages[1], log_messages
 
     # 2) Cột mới tồn tại
     assert set(NEW_ACCOUNT_COLS) <= _cols(database, "accounts")
@@ -119,9 +121,10 @@ def test_migration_maps_legacy_statuses_and_adds_columns(old_db, env_tmp):
         keys = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
     finally:
         conn.close()
-    for k in ("max_concurrent_jobs", "chrome_path", "dola_base_url"):
+    for k in ("max_concurrent_jobs", "chrome_path", "dola_base_url", "default_ratio"):
         assert k in keys, f"thiếu setting {k}"
     assert int(keys["max_concurrent_jobs"]) >= 1
+    assert keys["default_duration"] == "15 giây" and keys["default_ratio"] == "16:9"
 
 
 def test_reset_orphans_after_migration(old_db, env_tmp):
@@ -158,6 +161,14 @@ def test_init_db_is_idempotent_and_works_on_fresh_db(env_tmp):
     import database
     database.init_db()
     database.init_db()  # chạy lại không được lỗi (ALTER có kiểm tra cột)
+    # BH-46: CSDL mới không bị ghi dòng "đã đổi thời lượng" (chỉ CSDL cũ có 30 giây mới bị ghi đè)
+    conn = database.get_connection()
+    try:
+        n = conn.execute("SELECT COUNT(*) AS n FROM system_logs WHERE message LIKE '%thời lượng mặc định%'").fetchone()["n"]
+        dur = conn.execute("SELECT value FROM settings WHERE key = 'default_duration'").fetchone()["value"]
+    finally:
+        conn.close()
+    assert n == 0 and dur == "15 giây"
     assert set(NEW_ACCOUNT_COLS) <= _cols(database, "accounts")
     assert set(NEW_JOB_COLS) <= _cols(database, "jobs")
     assert os.path.exists(env_tmp.db_path)

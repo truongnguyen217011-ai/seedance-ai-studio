@@ -1,4 +1,62 @@
 """Hằng số dùng chung cho backend và frontend (xem docs/KIEN_TRUC.md mục 3-4)."""
+import re
+from typing import Optional, Tuple
+
+# ---- Tham số video gửi sang Dola (BH-46): chỉ những giá trị Dola THẬT chấp nhận ----
+# Bằng chứng (HTML trang Dola, job #23): "Video generation currently supports durations from 4 to 15 seconds";
+# Dola hỏi lại tỷ lệ khung hình nếu prompt không nói. Người dùng chốt mặc định 15 giây, 16:9 (ngang).
+DURATION_MIN_SECONDS = 4
+DURATION_MAX_SECONDS = 15
+DURATION_CHOICES = ("5 giây", "10 giây", "15 giây")
+RATIO_CHOICES = ("16:9", "9:16")
+DEFAULT_DURATION = "15 giây"
+DEFAULT_RATIO = "16:9"
+RATIO_ORIENTATION = {"16:9": "ngang", "9:16": "dọc"}
+
+_RE_FIRST_INT = re.compile(r"\d+")
+
+
+def normalize_duration(label) -> Tuple[int, Optional[str]]:
+    """Nhãn/giá trị thời lượng → (số giây đã ép vào 4..15, cảnh báo tiếng Việt hoặc None).
+
+    "30 giây" → (15, "Thời lượng 30 giây ngoài khoảng Dola hỗ trợ (4-15 giây), đã ép về 15 giây");
+    "15 giây" / 15 / "15" → (15, None); rỗng hoặc không có số → (15, cảnh báo dùng mặc định).
+    """
+    raw = str(label if label is not None else "").strip()
+    m = _RE_FIRST_INT.search(raw)
+    default_seconds = int(_RE_FIRST_INT.search(DEFAULT_DURATION).group(0))
+    if not m:
+        if not raw:
+            return default_seconds, None
+        return default_seconds, f"Thời lượng '{raw}' không hợp lệ, dùng mặc định {DEFAULT_DURATION}"
+    seconds = int(m.group(0))
+    if seconds < DURATION_MIN_SECONDS or seconds > DURATION_MAX_SECONDS:
+        clamped = max(DURATION_MIN_SECONDS, min(DURATION_MAX_SECONDS, seconds))
+        return clamped, (f"Thời lượng {seconds} giây ngoài khoảng Dola hỗ trợ "
+                         f"({DURATION_MIN_SECONDS}-{DURATION_MAX_SECONDS} giây), đã ép về {clamped} giây")
+    return seconds, None
+
+
+def duration_label(seconds: int) -> str:
+    return f"{int(seconds)} giây"
+
+
+def normalize_ratio(value) -> Tuple[str, Optional[str]]:
+    """Tỷ lệ khung hình → (một trong RATIO_CHOICES, cảnh báo hoặc None). Chấp nhận "Dọc"/"Ngang" của giao diện cũ."""
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        return DEFAULT_RATIO, None
+    low = raw.lower()
+    if low in ("dọc", "doc", "vertical", "portrait"):
+        return "9:16", None
+    if low in ("ngang", "horizontal", "landscape"):
+        return "16:9", None
+    compact = low.replace(" ", "")
+    for r in RATIO_CHOICES:
+        if compact == r:
+            return r, None
+    return DEFAULT_RATIO, f"Tỷ lệ khung hình '{raw}' không hợp lệ, dùng mặc định {DEFAULT_RATIO}"
+
 
 class JobStatus:
     CHO = "Chờ"
@@ -44,6 +102,9 @@ class Reason:
     NO_CREDIT_WAIT = "Nick '{name}' hết credit hôm nay, chưa có nick khác, chờ hồi phục lúc 00:05"
     NO_NEW_CONV = "Dola không tạo cuộc trò chuyện mới cho prompt này (không lấy lại video cũ)"
     RENDER_TIMEOUT = "Quá {seconds}s chưa nhận được video từ Dola"
+    RENDER_TIMEOUT_WITH_REPLY = "Quá {seconds}s chưa nhận được video từ Dola; Dola trả lời: '{text}'"
+    # Dola trả lời bằng chữ (hỏi lại lần hai, từ chối, giải thích) thay vì tạo video: lỗi nội dung, không tự chạy lại
+    DOLA_REPLIED_TEXT = "Dola trả lời bằng chữ thay vì tạo video: '{text}'"
     POLICY_REFUSED = "Dola từ chối tạo video do chính sách nội dung"
     DOWNLOAD_FAILED = "Tải video về máy thất bại: {error}"
     BROWSER_ERROR = "Lỗi trình duyệt: {error}"

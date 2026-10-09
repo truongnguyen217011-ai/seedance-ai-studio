@@ -84,11 +84,14 @@ def build_markdown() -> str:
         "## Cách ghép",
         "",
         "```",
-        "Tạo video {model} dài {N} giây. {prompt gốc nguyên văn, chỉ bỏ số thứ tự đầu dòng}.",
+        "Tạo video {model} dài {N} giây, tỷ lệ khung hình {tỷ lệ} (dọc|ngang). Không hỏi lại, tạo video ngay.",
+        "{prompt gốc nguyên văn, chỉ bỏ số thứ tự đầu dòng}.",
         "Nhân vật: {tên}: {mô tả đã lưu trong Kho nhân vật}; ...",
         "Hình ảnh: {trường phái}; {cỡ cảnh}; {góc máy}; {ống kính}; {ánh sáng}; {bảng màu}; {6 thành tố}.",
         "```",
         "",
+        "- N là số giây đã ép vào khoảng Dola hỗ trợ 4-15 (\"30 giây\" cũ → 15); tỷ lệ 16:9 (ngang, mặc định) hoặc 9:16 (dọc). "
+        "Câu mở đầu nêu rõ cả ba tham số để Dola không hỏi lại (BH-46).",
         "- Lớp nào prompt đã tự mô tả (có `ống kính 85mm`, `cận cảnh`, `ánh sáng ...`, `FPV`, `bảng màu`...) thì **không chèn lại** (P3).",
         "- Lớp tắt trong Cài đặt → Đạo diễn AI thì không chèn (P6). Tắt hẳn Đạo diễn AI → chỉ còn câu mở đầu + prompt gốc.",
         "- Trường phái: tự nhận diện theo từ khóa (bảng dưới), hoặc ép bằng ô \"Trường phái\" khi nạp lô / Cài đặt.",
@@ -108,12 +111,12 @@ def build_markdown() -> str:
         lines.append(f"| {a['code']} | {a['name']} | {kw} |")
     lines += [
         "",
-        "## 30 prompt mẫu (Kho nhân vật giả định: Tiểu Vũ/TV01, Lão Trần/LT02; mọi lớp bật; Seedance 2.5, 30 giây)",
+        "## 30 prompt mẫu (Kho nhân vật giả định: Tiểu Vũ/TV01, Lão Trần/LT02; mọi lớp bật; Seedance 2.5, 15 giây, 16:9)",
         "",
     ]
     for i, p in enumerate(SAMPLE_PROMPTS, 1):
-        r = director.compose(p, duration_label="30 giây", model="Seedance 2.5", options=options, assets=SAMPLE_ASSETS,
-                             path_exists=lambda _p: False)
+        r = director.compose(p, duration_label="15 giây", ratio="16:9", model="Seedance 2.5", options=options,
+                             assets=SAMPLE_ASSETS, path_exists=lambda _p: False)
         lines += [
             f"### {i:02d}. [{r['archetype_code']}] {r['archetype_name']}",
             "",

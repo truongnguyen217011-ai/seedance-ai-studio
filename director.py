@@ -14,6 +14,8 @@ import re
 import unicodedata
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set
 
+from constants import DEFAULT_DURATION, DEFAULT_RATIO, RATIO_ORIENTATION, normalize_duration, normalize_ratio
+
 # ---------------------------------------------------------------- bộ mẫu trường phái
 # Thứ tự trong danh sách = thứ tự ưu tiên nhận diện (nhánh đầu tiên khớp từ khóa thắng), giống if/else trong JS;
 # nhánh T1 (Đối thoại) đặt đầu vì ngữ pháp máy quay của cảnh nói chuyện quan trọng hơn bối cảnh.
@@ -417,11 +419,44 @@ def options_from_settings(settings: Optional[Dict]) -> Dict:
 
 
 # ---------------------------------------------------------------- ghép prompt (P1..P6)
-def _duration_seconds(duration_label) -> str:
-    """'30 giây' → '30'; 15 → '15'; chuỗi không có số → giữ nguyên."""
-    s = str(duration_label if duration_label is not None else "").strip()
-    m = re.search(r"\d+", s)
-    return m.group(0) if m else (s or "30")
+def _duration_seconds(duration_label) -> int:
+    """'15 giây' → 15; 10 → 10; "30 giây" → 15 (ép vào khoảng Dola hỗ trợ, BH-46); rỗng → mặc định."""
+    return normalize_duration(duration_label)[0]
+
+
+DEFAULT_MODEL = "Seedance 2.5"
+# Câu mở đầu do tool tự chèn (không phải prompt của người dùng). Khớp cả bản cũ "Tạo video X dài N giây." để
+# build_full_prompt sửa lại header của job tạo trước khi có tỷ lệ/ép thời lượng (xem fix_header).
+HEADER_RE = re.compile(r"^Tạo video (?P<model>.+?) dài (?P<seconds>\d+) giây(?P<ratio>, tỷ lệ khung hình [^.]*)?\."
+                       r"(?: Không hỏi lại, tạo video ngay\.)?", re.S)
+
+
+def build_header(model=DEFAULT_MODEL, duration_label=DEFAULT_DURATION, ratio=DEFAULT_RATIO) -> str:
+    """Câu mở đầu gửi Dola, nêu rõ ba tham số Dola cần (BH-46): model, số giây (4-15), tỷ lệ khung hình.
+
+    "Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 16:9 (ngang). Không hỏi lại, tạo video ngay."
+    """
+    model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    seconds = _duration_seconds(duration_label)
+    ratio_value = normalize_ratio(ratio)[0]
+    orientation = RATIO_ORIENTATION.get(ratio_value, "")
+    return (f"Tạo video {model} dài {seconds} giây, tỷ lệ khung hình {ratio_value} ({orientation}). "
+            f"Không hỏi lại, tạo video ngay.")
+
+
+def fix_header(prompt_final: str, duration_label, ratio, model=None) -> str:
+    """Thay câu mở đầu của prompt_final đã lưu bằng câu mở đầu hiện tại (thời lượng đã ép, có tỷ lệ).
+
+    Job tạo trước bản này có header "Tạo video Seedance 2.5 dài 30 giây." → "... dài 15 giây, tỷ lệ ... ".
+    Không có header nhận ra được (người dùng đã sửa tay toàn bộ) → giữ nguyên văn, không chèn gì.
+    """
+    text = (prompt_final or "").strip()
+    m = HEADER_RE.match(text)
+    if not m:
+        return text
+    header = build_header(model or m.group("model"), duration_label, ratio)
+    rest = text[m.end():].lstrip()
+    return f"{header} {rest}".strip()
 
 
 def _sentence(text: str) -> str:
@@ -429,12 +464,13 @@ def _sentence(text: str) -> str:
     return text if text.endswith((".", "!", "?")) else text + "."
 
 
-def compose(prompt: str, *, duration_label="30 giây", model="Seedance 2.5", options: Optional[Dict] = None,
-            assets: Optional[Sequence[Dict]] = None, style_override: Optional[str] = None,
-            path_exists: Callable[[str], bool] = os.path.isfile) -> Dict:
+def compose(prompt: str, *, duration_label=DEFAULT_DURATION, ratio=DEFAULT_RATIO, model=DEFAULT_MODEL,
+            options: Optional[Dict] = None, assets: Optional[Sequence[Dict]] = None,
+            style_override: Optional[str] = None, path_exists: Callable[[str], bool] = os.path.isfile) -> Dict:
     """Ghép prompt cuối cùng gửi Dola.
 
-    Cấu trúc: "Tạo video {model} dài {N} giây. {prompt gốc nguyên văn, chỉ bỏ số thứ tự đầu dòng}.
+    Cấu trúc: "Tạo video {model} dài {N} giây, tỷ lệ khung hình {ratio} ({dọc|ngang}). Không hỏi lại, tạo video ngay.
+    {prompt gốc nguyên văn, chỉ bỏ số thứ tự đầu dòng}.
     Nhân vật: {mô tả đã lưu của từng nhân vật khớp}. Hình ảnh: {visual_group}; {shot}; {angle}; {lens}; {lighting};
     {palette}; {six_elements}." — chỉ gồm lớp được bật trong options và chưa có sẵn trong prompt (P3, P6).
     style_override (mã F1..A1/P1/T1) ép trường phái; "" → options['director_default_style']; "" nữa → tự nhận diện.
@@ -443,8 +479,8 @@ def compose(prompt: str, *, duration_label="30 giây", model="Seedance 2.5", opt
     """
     options = options_from_settings(options)
     clean = strip_leading_number(prompt)
-    model = str(model or "Seedance 2.5").strip() or "Seedance 2.5"
-    header = f"Tạo video {model} dài {_duration_seconds(duration_label)} giây."
+    model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    header = build_header(model, duration_label, ratio)
     enabled = _flag(options, "director_enabled")
 
     result = {

@@ -63,7 +63,9 @@ Hệ thống tích hợp bộ phân tích thông minh chuẩn Notebook ChatGPT &
 * Hỗ trợ tạo đơn lẻ hoặc tạo hàng loạt hàng chục video cùng lúc.
 * Tự động gán tài khoản rảnh và xoay vòng IP proxy.
 * Nếu 1 tài khoản hết token hoặc bị rate limit, hệ thống tự động xoay sang nick khác để tiếp tục render.
-* Thời gian render chuẩn cho video Seedance 2.5 (30s) là **3 - 5 phút**.
+* Thời lượng video Dola hỗ trợ: **4 đến 15 giây (mặc định 15)**; tool chỉ cho chọn 5 / 10 / 15 giây. Tỷ lệ khung hình: **16:9 (ngang, mặc định)** hoặc 9:16 (dọc). Hai tham số này được ghi rõ trong câu mở đầu của prompt gửi Dola để Dola không hỏi lại; job cũ còn "30 giây" trong hàng đợi sẽ tự được ép về 15 giây (có dòng nhật ký).
+* Thời gian render chuẩn cho một video Seedance 2.5 (4 đến 15 giây, mặc định 15) là **3 - 5 phút**.
+* Nếu Dola vẫn hỏi lại (ví dụ hỏi tỷ lệ), tool tự trả lời **một lần** bằng đúng thời lượng và tỷ lệ của job rồi chờ render tiếp (nhật ký có dòng "Dola hỏi lại ... đã tự trả lời"). Nếu Dola trả lời bằng chữ mà không tạo video (hỏi lần hai, từ chối), job **Thất bại ngay** với nguyên văn câu Dola nói (xem trong nút **Prompt** của job, mục "Dola trả lời:"), không chờ hết 8 phút và không tự chạy lại.
 
 ---
 

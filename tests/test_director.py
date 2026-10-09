@@ -14,6 +14,9 @@ import director
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# Câu mở đầu do tool tự chèn (BH-46: nêu rõ số giây 4-15 và tỷ lệ khung hình, bảo Dola không hỏi lại)
+H15 = director.build_header("Seedance 2.5", "15 giây", "16:9")
+
 ASSETS = [
     {"id": 1, "name": "Tiểu Vũ", "character_code": "TV01", "image_url": "",
      "description": "cô gái 20 tuổi, tóc đen dài ngang lưng, áo dài trắng, ánh mắt kiên định"},
@@ -149,7 +152,7 @@ def test_dialogue_beats_setting_keywords_but_style_override_wins():
 ])
 def test_original_prompt_verbatim_inside_final(prompt):
     r = director.compose(prompt, duration_label="15 giây", model="Seedance 2.0", assets=ASSETS)
-    assert r["prompt_final"].startswith("Tạo video Seedance 2.0 dài 15 giây. ")
+    assert r["prompt_final"].startswith("Tạo video Seedance 2.0 dài 15 giây, tỷ lệ khung hình 16:9 (ngang). Không hỏi lại, tạo video ngay. ")
     assert prompt in r["prompt_final"]
     assert ".." not in r["prompt_final"]
 
@@ -188,9 +191,28 @@ def test_bh43_ordinal_with_separator_is_stripped(prompt, expected):
 
 
 def test_duration_and_model_header():
-    assert director.compose("x", duration_label="30 giây")["prompt_final"].startswith("Tạo video Seedance 2.5 dài 30 giây.")
-    assert director.compose("x", duration_label=15)["prompt_final"].startswith("Tạo video Seedance 2.5 dài 15 giây.")
-    assert director.compose("x", duration_label="", model="")["prompt_final"].startswith("Tạo video Seedance 2.5 dài 30 giây.")
+    """BH-46: câu mở đầu nêu đủ model, số giây (ép vào 4-15, "30 giây" → 15) và tỷ lệ khung hình (mặc định 16:9 ngang)."""
+    assert director.compose("x", duration_label="30 giây")["prompt_final"].startswith(
+        "Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 16:9 (ngang). Không hỏi lại, tạo video ngay.")
+    assert director.compose("x", duration_label=10)["prompt_final"].startswith("Tạo video Seedance 2.5 dài 10 giây, tỷ lệ khung hình 16:9 (ngang).")
+    assert director.compose("x", duration_label="", model="")["prompt_final"].startswith("Tạo video Seedance 2.5 dài 15 giây,")
+    assert director.compose("x", ratio="9:16")["prompt_final"].startswith("Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 9:16 (dọc). Không hỏi lại, tạo video ngay.")
+    assert director.compose("x", ratio="Dọc")["prompt_final"].startswith("Tạo video Seedance 2.5 dài 15 giây, tỷ lệ khung hình 9:16 (dọc).")
+    assert director.compose("x", duration_label="3 giây", ratio="4:3")["prompt_final"].startswith("Tạo video Seedance 2.5 dài 4 giây, tỷ lệ khung hình 16:9 (ngang).")
+    assert director.build_header() == H15
+    assert "?" not in H15
+
+
+def test_bh46_fix_header_rewrites_old_header_only():
+    """Job cũ trong hàng đợi có prompt_final "dài 30 giây." (không tỷ lệ) → header mới, phần sau nguyên văn;
+    prompt_final người dùng tự viết (không có header nhận ra được) → giữ nguyên."""
+    old = "Tạo video Seedance 2.5 dài 30 giây. Cô gái cười. Hình ảnh: abc; def."
+    assert director.fix_header(old, "30 giây", "16:9") == f"{H15} Cô gái cười. Hình ảnh: abc; def."
+    new = f"{director.build_header('Seedance 2.0', '10 giây', '9:16')} Cô gái cười."
+    assert director.fix_header(new, "10 giây", "9:16") == new
+    assert director.fix_header(new, "15 giây", "16:9") == f"{director.build_header('Seedance 2.0', '15 giây', '16:9')} Cô gái cười."
+    assert director.fix_header("Prompt tay không có câu mở đầu, 30 giây.", "30 giây", "16:9") == "Prompt tay không có câu mở đầu, 30 giây."
+    assert director.fix_header("", "15 giây", "16:9") == ""
 
 
 def test_visual_section_order_and_layers_added():
@@ -238,7 +260,7 @@ def test_fully_described_prompt_only_gets_header_and_characters():
               "Rembrandt Lighting, visual style P1, Teal and Orange cinema color palette, 8k resolution, cinematic masterpiece")
     r = director.compose(old_js)
     assert r["layers_added"] == []
-    assert r["prompt_final"] == f"Tạo video Seedance 2.5 dài 30 giây. {old_js}."
+    assert r["prompt_final"] == f"{H15} {old_js}."
 
 
 # ---------------------------------------------------------------- P4: nhân vật
@@ -297,7 +319,7 @@ def test_p6_disabled_layers_are_not_inserted():
 def test_p6_director_disabled_sends_header_plus_raw_prompt():
     r = director.compose("Tiểu Vũ chân dung", options={"director_enabled": "0"}, assets=ASSETS)
     assert r["enabled"] is False
-    assert r["prompt_final"] == "Tạo video Seedance 2.5 dài 30 giây. Tiểu Vũ chân dung."
+    assert r["prompt_final"] == f"{H15} Tiểu Vũ chân dung."
     assert r["archetype_code"] == "" and r["layers_added"] == [] and r["characters"] == []
 
 

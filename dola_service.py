@@ -25,7 +25,8 @@ from playwright.sync_api import sync_playwright
 import config
 from account_pool import AccountPool
 from browser import ChromeNotFoundError, browser_session, hide_window, show_window
-from constants import AccountStatus, JobStatus, NeedsManual, Reason
+from constants import (DEFAULT_DURATION, DEFAULT_RATIO, AccountStatus, JobStatus, NeedsManual, Reason,
+                       duration_label, normalize_duration, normalize_ratio)
 from database import get_connection
 from diagnostics import mask_proxy
 from logger import artifact_suffix, get_logger, log_event, save_failure_artifacts
@@ -1028,31 +1029,156 @@ def _fetch_single_chain(page, conv_id: str, job_id=None):
         return None
 
 
+def _load_settings_dict() -> dict:
+    conn = get_connection()
+    try:
+        return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
+    finally:
+        conn.close()
+
+
+def job_video_params(job: dict, settings: Optional[dict] = None) -> tuple:
+    """(số giây đã ép vào 4-15, tỷ lệ khung hình, cảnh báo thời lượng | None) của một job (BH-46).
+
+    Job cũ còn duration "30 giây" trong hàng đợi → 15 giây kèm cảnh báo; ratio rỗng → setting default_ratio.
+    """
+    settings = settings if settings is not None else _load_settings_dict()
+    seconds, warning = normalize_duration(job.get("duration") or settings.get("default_duration") or DEFAULT_DURATION)
+    ratio, _ = normalize_ratio(job.get("ratio") or settings.get("default_ratio") or DEFAULT_RATIO)
+    return seconds, ratio, warning
+
+
 def build_full_prompt(job: dict) -> str:
     """Prompt cuối cùng gửi Dola = prompt đã đạo diễn (jobs.prompt_final, BH-42).
 
     Job tạo trước khi có Đạo diễn AI chưa có prompt_final → ghép bằng director.compose với
     cài đặt và kho nhân vật hiện tại. Không còn câu "FPV bom tấn" cố định.
+    BH-46: thời lượng ngoài 4-15 giây (job cũ "30 giây") bị ép về 15 và câu mở đầu được viết lại
+    (director.fix_header) để luôn nêu số giây hợp lệ + tỷ lệ khung hình; jobs.duration/ratio được ghi lại.
     """
+    import director  # import muộn: director là hàm thuần, không phụ thuộc module này
+    settings = _load_settings_dict()
+    seconds, ratio, warning = job_video_params(job, settings)
+    label = duration_label(seconds)
+    fields = {}
+    if (job.get("duration") or "") != label:
+        fields["duration"] = label
+    if (job.get("ratio") or "") != ratio:
+        fields["ratio"] = ratio
+    if warning:
+        log_event(f"Job #{job['id']}: {warning}", "WARNING", "Job", job_id=job["id"], account_id=job.get("account_id"))
+    if fields:
+        _set_job_fields(job["id"], **fields)
+        job.update(fields)
+
     ready = (job.get("prompt_final") or "").strip()
     if ready:
-        return ready
-    import director  # import muộn: director là hàm thuần, không phụ thuộc module này
+        return director.fix_header(ready, label, ratio)
     conn = get_connection()
     try:
-        settings = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings").fetchall()}
         assets = [dict(r) for r in conn.execute(
             "SELECT id, name, character_code, image_url, description FROM assets").fetchall()]
     finally:
         conn.close()
     res = director.compose(
         job.get("prompt") or "",
-        duration_label=job.get("duration") or settings.get("default_duration") or "30 giây",
+        duration_label=label,
+        ratio=ratio,
         model=job.get("model") or settings.get("default_model") or "Seedance 2.5",
         options=director.options_from_settings(settings),
         assets=assets,
     )
     return res["prompt_final"]
+
+
+# ==================== ĐỌC CÂU TRẢ LỜI CỦA DOLA TRONG LÚC CHỜ RENDER (BH-47) ====================
+_REPLY_KEYS = ("content", "text", "message")
+_RE_URL = re.compile(r"https?://", re.IGNORECASE)
+_QUESTION_PHRASES = ("which option", "would you like", "aspect ratio", "duration", "confirm",
+                     "bạn muốn", "tỷ lệ", "thời lượng", "lựa chọn", "chọn")
+# Chữ Dola/fake hiện trong lúc đang render: không phải "trả lời bằng chữ"
+_GENERATING_MARKERS = ("generating", "đang tạo")
+REPLY_MIN_CHARS = 20
+# Có văn bản trả lời (không phải câu hỏi) mà sau chừng này giây vẫn không có video/không "generating" → Thất bại
+REPLY_NO_VIDEO_SECONDS = 60
+# Sau khi tự trả lời câu hỏi của Dola, mốc chờ render được đặt lại nhưng tổng không quá RENDER_TIMEOUT + chừng này
+REPLY_EXTRA_RENDER_SECONDS = 120
+
+
+def _maybe_json(value: str):
+    """Chuỗi trông như JSON ({...} / [...]) → đối tượng; không phải → None."""
+    v = value.strip()
+    if len(v) < 2 or v[0] not in "{[" or v[-1] not in "}]":
+        return None
+    try:
+        return json.loads(v)
+    except ValueError:
+        return None
+
+
+def _assistant_texts(chain_json, sent_prompt: str = "") -> list:
+    """Trích các đoạn văn bản trợ lý trả lời từ JSON chain/single của Dola.
+
+    Duyệt đệ quy mọi dict/list; chuỗi JSON lồng trong chuỗi (Dola để `content` là một chuỗi JSON chứa `text`)
+    được parse và duyệt tiếp. Lấy chuỗi > REPLY_MIN_CHARS ký tự ở các khóa content/text/message; bỏ chuỗi chứa URL
+    (đó là video/ảnh) và bỏ chính prompt đã gửi (tin nhắn của người dùng nằm cùng chain). Thứ tự xuất hiện, không trùng.
+    """
+    out: list = []
+    seen: set = set()
+    prompt_norm = " ".join((sent_prompt or "").split())
+    prompt_head = prompt_norm[:PROMPT_PREFIX_CHECK_CHARS]
+
+    def is_own_prompt(text: str) -> bool:
+        if not prompt_norm:
+            return False
+        t = " ".join(text.split())
+        return t == prompt_norm or t in prompt_norm or (len(prompt_head) >= 20 and prompt_head in t)
+
+    def add(text: str) -> None:
+        t = text.strip()
+        if len(t) <= REPLY_MIN_CHARS or _RE_URL.search(t) or is_own_prompt(t) or t in seen:
+            return
+        seen.add(t)
+        out.append(t)
+
+    def walk(node, key: Optional[str] = None, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, str(k), depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v, key, depth + 1)
+        elif isinstance(node, str):
+            nested = _maybe_json(node)
+            if nested is not None:
+                walk(nested, key, depth + 1)
+            elif key and key.lower() in _REPLY_KEYS:
+                add(node)
+
+    walk(chain_json)
+    return out
+
+
+def _looks_like_question(text: str) -> bool:
+    """Dola hỏi lại (tỷ lệ, thời lượng, lựa chọn A/B/C) thay vì tạo video."""
+    t = (text or "").lower()
+    return "?" in t and any(phrase in t for phrase in _QUESTION_PHRASES)
+
+
+def _is_generating_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _GENERATING_MARKERS)
+
+
+def _auto_answer_text(seconds: int, ratio: str) -> str:
+    return f"{seconds} giây, tỷ lệ {ratio}. Hãy tạo video ngay, không cần hỏi thêm."
+
+
+def _short(text: str, n: int) -> str:
+    t = " ".join((text or "").split())
+    return t if len(t) <= n else t[:n]
 
 
 def update_job_status(job_id, status, status_message, progress, local_video_path=None, **fields):
@@ -1422,15 +1548,24 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         _fail_job(job_id, account_id, JobStatus.THAT_BAI, Reason.NO_NEW_CONV, page, "no_new_conv", module="Engine")
         return
 
-    # 4. Chờ render & tải video
+    # 4. Chờ render & tải video. BH-47: đọc mọi câu trả lời bằng chữ của Dola trong lúc chờ; Dola hỏi lại
+    # (tỷ lệ/thời lượng) → tự trả lời đúng MỘT lần; hỏi lần hai hoặc trả lời bằng chữ mà không render → Thất bại sớm.
     dest_file = os.path.join(config.OUTPUTS_DIR, f"video_{job_id}.mp4")
     downloaded = False
     download_error = None
     start_poll = time.time()
-    max_wait_seconds = config.RENDER_TIMEOUT_SECONDS
-    log_event(f"Job #{job_id}: theo dõi Dola render (conv_id={conv_id})", "INFO", "Render", job_id=job_id, account_id=account_id)
+    max_wait_seconds = int(config.RENDER_TIMEOUT_SECONDS)
+    render_deadline = start_poll + max_wait_seconds
+    hard_deadline = start_poll + max_wait_seconds + REPLY_EXTRA_RENDER_SECONDS
+    duration_seconds, ratio, _ = job_video_params(job)
+    seen_replies: list = []          # mọi câu trả lời bằng chữ đã thấy (theo thứ tự)
+    pending_reply: Optional[str] = None   # câu trả lời mới nhất chưa được xử lý
+    pending_since = 0.0
+    auto_answered = False
+    log_event(f"Job #{job_id}: theo dõi Dola render (conv_id={conv_id}, {duration_seconds} giây, tỷ lệ {ratio})",
+              "INFO", "Render", job_id=job_id, account_id=account_id)
 
-    while time.time() - start_poll < max_wait_seconds:
+    while time.time() < min(render_deadline, hard_deadline):
         elapsed_sec = int(time.time() - start_poll)
         est_progress = min(88, 35 + int((elapsed_sec / 120) * 50))
         update_job_status(job_id, JobStatus.DANG_CHAY, f"Dola đang render Seedance 2.5 ({elapsed_sec}s)", est_progress)
@@ -1449,6 +1584,16 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
                 and "generating" not in chain_lower:
             _fail_job(job_id, account_id, JobStatus.THAT_BAI, Reason.POLICY_REFUSED, page, "policy", module="Policy")
             return
+
+        # Câu trả lời bằng chữ mới của trợ lý (bỏ "Generating video..." và prompt của chính mình)
+        new_replies = [t for t in _assistant_texts(chain_res, full_prompt)
+                       if t not in seen_replies and not _is_generating_text(t)]
+        if new_replies:
+            seen_replies.extend(new_replies)
+            pending_reply = new_replies[-1]
+            pending_since = time.time()
+            log.debug("Dola trả lời bằng chữ: '%s'", _short(pending_reply, 160), extra={"job_id": job_id, "account_id": account_id})
+            _set_job_fields(job_id, dola_reply=pending_reply)
 
         clean_urls = []
         for raw in re.findall(r'https?://[^\s"\'<>]+', chain_str):
@@ -1479,6 +1624,30 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
             except Exception as dl_err:  # noqa: BLE001
                 download_error = str(dl_err)[:100]
                 log_event(f"Job #{job_id}: tải video lỗi: {download_error}", "WARNING", "Download", job_id=job_id, account_id=account_id)
+        elif pending_reply:
+            if _looks_like_question(pending_reply):
+                if auto_answered:
+                    _fail_job(job_id, account_id, JobStatus.THAT_BAI,
+                              Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)) + " (đã tự trả lời một lần, Dola vẫn hỏi lại)",
+                              page, "dola_replied_text", module="Render")
+                    return
+                answer = _auto_answer_text(duration_seconds, ratio)
+                sent = _send_prompt(page, answer)
+                auto_answered = True
+                msg = (f"Dola hỏi lại: '{_short(pending_reply, 80)}' → đã tự trả lời \"{answer}\""
+                       if sent else f"Dola hỏi lại: '{_short(pending_reply, 80)}' nhưng không thấy ô nhập để trả lời")
+                log_event(f"Job #{job_id}: {msg}", "WARNING", "Render", job_id=job_id, account_id=account_id)
+                update_job_status(job_id, JobStatus.DANG_CHAY, msg, est_progress)
+                pending_reply = None
+                # Dola bắt đầu render từ lúc này: đặt lại mốc chờ, tổng không quá RENDER_TIMEOUT + 120 s
+                start_poll = time.time()
+                render_deadline = min(start_poll + max_wait_seconds, hard_deadline)
+            elif time.time() - pending_since >= REPLY_NO_VIDEO_SECONDS and "generating" not in chain_lower \
+                    and "đang tạo" not in chain_lower:
+                _fail_job(job_id, account_id, JobStatus.THAT_BAI,
+                          Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)), page, "dola_replied_text",
+                          module="Render")
+                return
 
         time.sleep(5)
 
@@ -1493,6 +1662,10 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         log_event(f"Job #{job_id}: hoàn thành bằng nick '{acc['name']}'", "SUCCESS", "Job", job_id=job_id, account_id=account_id)
     elif download_error:
         _fail_technical(job_id, acc, Reason.DOWNLOAD_FAILED.format(error=download_error), page, "download_failed", module="Download")
+    elif seen_replies:
+        # BH-47: hết giờ mà Dola có nói gì thì lý do phải kèm nguyên văn (200 ký tự) để người dùng biết vì sao
+        _fail_technical(job_id, acc, Reason.RENDER_TIMEOUT_WITH_REPLY.format(seconds=max_wait_seconds, text=_short(seen_replies[-1], 200)),
+                        page, "render_timeout", module="Render")
     else:
         _fail_technical(job_id, acc, Reason.RENDER_TIMEOUT.format(seconds=max_wait_seconds), page, "render_timeout", module="Render")
 
