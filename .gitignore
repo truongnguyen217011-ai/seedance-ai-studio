@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Profiles & Sessions (Chứa cookies & token bảo mật)
+profiles/
+*.session
+
+# Outputs (Video & Ảnh render)
+outputs/
+*.mp4
+*.webm
+*.png
+*.jpg
+*.jpeg
+
+# Extracted & Temporary
+hali_extracted/
+scratch/
+test_*.py
+inspect_*.py
+diagnose_*.py
+check_*.py
+
+# Environment & Database (Chứa tài khoản, 2FA, token mật)
+.env
+venv/
+.venv/
+studio.db
+*.db

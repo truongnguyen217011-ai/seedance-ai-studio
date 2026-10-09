@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="vi" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Seedance AI Studio</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            studio: {
+              bg: '#080c11',
+              sidebar: '#070a0f',
+              card: '#0d121a',
+              border: '#141d2a',
+              hover: '#131b26',
+              cyan: '#00f2fe',
+              emerald: '#05c793',
+              red: '#ea3943'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      background-color: #080c11;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      user-select: none;
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #070a0f; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #334155; }
+    .sidebar-active {
+      background: linear-gradient(90deg, rgba(5, 199, 147, 0.15) 0%, rgba(5, 199, 147, 0.03) 100%);
+      border-left: 3px solid #05c793;
+      color: #05c793 !important;
+    }
+  </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden text-sm">
+
+  <!-- TOP TITLEBAR -->
+  <header class="h-10 bg-[#06090e] border-b border-[#131b26] flex items-center justify-between px-4 select-none">
+    <div class="flex items-center space-x-2">
+      <div class="w-5 h-5 rounded bg-gradient-to-tr from-cyan-500 to-emerald-400 flex items-center justify-center text-[10px] font-bold text-black">
+        <i data-lucide="play" class="w-3 h-3 fill-black"></i>
+      </div>
+      <span class="text-xs font-semibold tracking-wide text-gray-300">Seedance AI Studio</span>
+    </div>
+    <div class="flex items-center space-x-3 text-xs">
+      <div class="flex items-center space-x-1.5 bg-[#0e171e] px-2.5 py-1 rounded-full border border-[#16272b] text-emerald-400">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span class="text-[11px] font-medium">Đã kết nối</span>
+      </div>
+      <div class="bg-[#101722] border border-[#1b2636] px-2.5 py-1 rounded-full text-cyan-400 text-[11px] font-medium flex items-center space-x-1">
+        <span id="headerRunningJobs">0</span> <span>job</span>
+      </div>
+      <div class="bg-[#101722] border border-[#1b2636] px-2.5 py-1 rounded-full text-gray-400 text-[11px] font-medium flex items-center space-x-1">
+        <span id="headerTotalAccounts">0</span> <span>Tài khoản</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN CONTAINER (SIDEBAR + CONTENT) -->
+  <div class="flex-1 flex overflow-hidden">
+    
+    <!-- LEFT SIDEBAR -->
+    <aside class="w-56 bg-[#070a0f] border-r border-[#131b26] flex flex-col justify-between p-3 select-none">
+      <div class="space-y-4 overflow-y-auto pr-1">
+        <!-- Logo Branding -->
+        <div class="flex items-center space-x-2.5 px-2 py-1">
+          <div class="w-8 h-8 rounded-lg bg-[#0e1722] border border-[#1a2838] flex items-center justify-center text-cyan-400">
+            <i data-lucide="sparkles" class="w-4 h-4"></i>
+          </div>
+          <div>
+            <div class="font-bold text-xs tracking-wider text-gray-200">Seedance AI</div>
+            <div class="text-[9px] text-gray-500 uppercase font-semibold">STUDIO EDITION</div>
+          </div>
+        </div>
+
+        <!-- Group: SÁNG TẠO -->
+        <div>
+          <div class="text-[10px] uppercase font-bold tracking-wider text-gray-500 px-2 mb-1">Sáng tạo</div>
+          <nav class="space-y-0.5">
+            <button onclick="switchTab('overview')" id="nav-overview" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="layout-grid" class="w-4 h-4"></i>
+              <span>Tổng quan</span>
+            </button>
+            <button onclick="switchTab('image')" id="nav-image" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="image" class="w-4 h-4"></i>
+              <span>Tạo Ảnh</span>
+            </button>
+            <button onclick="switchTab('video')" id="nav-video" class="nav-btn sidebar-active w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-xs transition">
+              <i data-lucide="video" class="w-4 h-4"></i>
+              <span class="font-medium">Tạo Video</span>
+            </button>
+            <button onclick="switchTab('tut')" id="nav-tut" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="award" class="w-4 h-4 text-amber-400"></i>
+              <span>TUT VIP AI</span>
+            </button>
+            <button onclick="switchTab('assets')" id="nav-assets" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="users" class="w-4 h-4"></i>
+              <span>Kho Nhân Vật & Asset</span>
+            </button>
+          </nav>
+        </div>
+
+        <!-- Group: QUẢN LÝ -->
+        <div>
+          <div class="text-[10px] uppercase font-bold tracking-wider text-gray-500 px-2 mb-1">Quản lý</div>
+          <nav class="space-y-0.5">
+            <button onclick="switchTab('accounts')" id="nav-accounts" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="user-check" class="w-4 h-4"></i>
+              <span>Tài khoản & Proxy</span>
+            </button>
+          </nav>
+        </div>
+
+        <!-- Group: TIỆN ÍCH -->
+        <div>
+          <div class="text-[10px] uppercase font-bold tracking-wider text-gray-500 px-2 mb-1">Tiện ích</div>
+          <nav class="space-y-0.5">
+            <button onclick="switchTab('check-media')" id="nav-check-media" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="folder-check" class="w-4 h-4"></i>
+              <span>Check Ảnh/Video Nick</span>
+            </button>
+            <button onclick="switchTab('audio')" id="nav-audio" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="mic" class="w-4 h-4"></i>
+              <span>Xử Lý Âm Thanh</span>
+            </button>
+          </nav>
+        </div>
+
+        <!-- Group: HỆ THỐNG -->
+        <div>
+          <div class="text-[10px] uppercase font-bold tracking-wider text-gray-500 px-2 mb-1">Hệ thống</div>
+          <nav class="space-y-0.5">
+            <button onclick="switchTab('logs')" id="nav-logs" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="file-text" class="w-4 h-4"></i>
+              <span>Nhật ký (Logs)</span>
+            </button>
+            <button onclick="switchTab('settings')" id="nav-settings" class="nav-btn w-full flex items-center space-x-2.5 px-2.5 py-2 rounded text-gray-400 hover:text-gray-200 hover:bg-[#0e141e] text-xs transition">
+              <i data-lucide="settings" class="w-4 h-4"></i>
+              <span>Cài đặt</span>
+            </button>
+          </nav>
+        </div>
+      </div>
+
+      <!-- Bottom Status in Sidebar -->
+      <div class="bg-[#0b1017] border border-[#141d2a] rounded-lg p-2.5 text-[11px] space-y-1.5 mt-2">
+        <div class="flex justify-between items-center text-gray-400">
+          <span>Job đang chạy</span>
+          <span id="sideRunningJobs" class="font-bold text-cyan-400">0</span>
+        </div>
+        <div class="flex justify-between items-center text-gray-400">
+          <span>Tài khoản</span>
+          <span id="sideTotalAccounts" class="font-bold text-emerald-400">0</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- MAIN WORKSPACE -->
+    <main class="flex-1 bg-[#090d13] flex flex-col overflow-hidden">
+
+      <!-- ==================== TAB: TỔNG QUAN (OVERVIEW) ==================== -->
+      <section id="tab-overview" class="hidden flex-1 overflow-y-auto p-5 space-y-5">
+        <h1 class="text-base font-bold text-gray-100">Bảng Điều Khiển Hệ Thống</h1>
+        
+        <!-- Stats Cards -->
+        <div class="grid grid-cols-4 gap-4">
+          <div class="bg-[#0d131d] border border-[#182333] p-4 rounded-xl flex items-center justify-between">
+            <div>
+              <div class="text-[11px] text-gray-400 uppercase font-semibold">Video Hoàn Thành</div>
+              <div id="statCompletedJobs" class="text-2xl font-bold text-emerald-400 mt-1">0</div>
+              <div class="text-[10px] text-gray-500 mt-0.5">Tỷ lệ thành công 98.5%</div>
+            </div>
+            <div class="w-10 h-10 rounded-lg bg-[#11241f] text-emerald-400 flex items-center justify-center">
+              <i data-lucide="video" class="w-5 h-5"></i>
+            </div>
+          </div>
+
+          <div class="bg-[#0d131d] border border-[#182333] p-4 rounded-xl flex items-center justify-between">
+            <div>
+              <div class="text-[11px] text-gray-400 uppercase font-semibold">Ảnh AI Đã Tạo</div>
+              <div id="statTotalImages" class="text-2xl font-bold text-cyan-400 mt-1">0</div>
+              <div class="text-[10px] text-gray-500 mt-0.5">Model Seedance Image 2.5</div>
+            </div>
+            <div class="w-10 h-10 rounded-lg bg-[#0e212b] text-cyan-400 flex items-center justify-center">
+              <i data-lucide="image" class="w-5 h-5"></i>
+            </div>
+          </div>
+
+          <div class="bg-[#0d131d] border border-[#182333] p-4 rounded-xl flex items-center justify-between">
+            <div>
+              <div class="text-[11px] text-gray-400 uppercase font-semibold">Tài Khoản Hoạt Động</div>
+              <div id="statTotalAccounts" class="text-2xl font-bold text-purple-400 mt-1">0</div>
+              <div class="text-[10px] text-gray-500 mt-0.5">Tất cả tài khoản sẵn sàng</div>
+            </div>
+            <div class="w-10 h-10 rounded-lg bg-[#22172f] text-purple-400 flex items-center justify-center">
+              <i data-lucide="users" class="w-5 h-5"></i>
+            </div>
+          </div>
+
+          <div class="bg-[#0d131d] border border-[#182333] p-4 rounded-xl flex items-center justify-between">
+            <div>
+              <div class="text-[11px] text-gray-400 uppercase font-semibold">Nhân Vật Trong Kho</div>
+              <div id="statTotalAssets" class="text-2xl font-bold text-amber-400 mt-1">0</div>
+              <div class="text-[10px] text-gray-500 mt-0.5">Character Consistency</div>
+            </div>
+            <div class="w-10 h-10 rounded-lg bg-[#272111] text-amber-400 flex items-center justify-center">
+              <i data-lucide="sparkles" class="w-5 h-5"></i>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick Launch Guide & Shortcuts -->
+        <div class="grid grid-cols-2 gap-4">
+          <div class="bg-[#0d131d] border border-[#182333] p-5 rounded-xl">
+            <h3 class="font-semibold text-gray-200 text-xs mb-3 flex items-center space-x-2">
+              <i data-lucide="zap" class="w-4 h-4 text-emerald-400"></i>
+              <span>Thao tác nhanh</span>
+            </h3>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+              <button onclick="switchTab('video'); openBatchPromptModal()" class="p-2.5 bg-[#121c29] hover:bg-[#182638] rounded-lg border border-[#1b2a3d] text-left transition flex items-center space-x-2">
+                <i data-lucide="plus-circle" class="w-4 h-4 text-emerald-400"></i>
+                <span>Nạp Prompt Video</span>
+              </button>
+              <button onclick="switchTab('image')" class="p-2.5 bg-[#121c29] hover:bg-[#182638] rounded-lg border border-[#1b2a3d] text-left transition flex items-center space-x-2">
+                <i data-lucide="image" class="w-4 h-4 text-cyan-400"></i>
+                <span>Tạo Ảnh Minh Họa</span>
+              </button>
+              <button onclick="switchTab('accounts'); openAddAccountModal()" class="p-2.5 bg-[#121c29] hover:bg-[#182638] rounded-lg border border-[#1b2a3d] text-left transition flex items-center space-x-2">
+                <i data-lucide="user-plus" class="w-4 h-4 text-purple-400"></i>
+                <span>Thêm Nick FB + Proxy</span>
+              </button>
+              <button onclick="switchTab('tut')" class="p-2.5 bg-[#121c29] hover:bg-[#182638] rounded-lg border border-[#1b2a3d] text-left transition flex items-center space-x-2">
+                <i data-lucide="book-open" class="w-4 h-4 text-amber-400"></i>
+                <span>Xem Bí Kíp TUT VIP</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="bg-[#0d131d] border border-[#182333] p-5 rounded-xl">
+            <h3 class="font-semibold text-gray-200 text-xs mb-3 flex items-center space-x-2">
+              <i data-lucide="shield-check" class="w-4 h-4 text-cyan-400"></i>
+              <span>Trạng thái bảo mật Proxy & Nick</span>
+            </h3>
+            <div class="space-y-2 text-xs text-gray-400">
+              <div class="flex justify-between items-center py-1 border-b border-[#162232]">
+                <span>Chống Checkpoint FB:</span>
+                <span class="text-emerald-400 font-semibold">Bật (Profile Browser riêng)</span>
+              </div>
+              <div class="flex justify-between items-center py-1 border-b border-[#162232]">
+                <span>Tự động xoay vòng tài khoản:</span>
+                <span class="text-emerald-400 font-semibold">Tự động khi hết lượt</span>
+              </div>
+              <div class="flex justify-between items-center py-1">
+                <span>Model AI Active:</span>
+                <span class="text-cyan-400 font-semibold">Seedance 2.5 (ByteDance Engine)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: TẠO ẢNH (IMAGE GENERATION) ==================== -->
+      <section id="tab-image" class="hidden flex-1 overflow-hidden p-4 flex flex-col">
+        <div class="flex items-center justify-between mb-3 pb-3 border-b border-[#141d2a]">
+          <div>
+            <h1 class="text-base font-semibold text-gray-100">Tạo Ảnh AI (Seedance Image 2.5)</h1>
+            <p class="text-xs text-gray-500">Tạo ảnh nhân vật, cảnh quan chất lượng cao hoặc dùng làm ảnh tham chiếu video</p>
+          </div>
+        </div>
+
+        <!-- Form Tạo Ảnh -->
+        <div class="bg-[#0b1017] border border-[#15202d] rounded-xl p-4 mb-4 space-y-3">
+          <div class="flex space-x-2">
+            <input type="text" id="imagePromptInput" class="flex-1 bg-[#070b10] border border-[#182536] rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Mô tả hình ảnh bạn muốn tạo (Ví dụ: Chân dung cô gái bên tháp cổ trong rừng sương mù)...">
+            <button onclick="submitCreateImage()" class="px-5 py-2 bg-gradient-to-r from-cyan-500 to-emerald-400 text-black font-bold text-xs rounded-lg hover:opacity-90 transition flex items-center space-x-1.5">
+              <i data-lucide="sparkles" class="w-4 h-4"></i>
+              <span>Tạo Ảnh Ngay</span>
+            </button>
+          </div>
+
+          <!-- Nút Đạo Diễn AI Cho Tạo Ảnh -->
+          <button type="button" onclick="autoEnhanceImagePrompt()" class="w-full py-2 bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 text-black font-extrabold text-xs rounded-lg shadow hover:opacity-95 flex items-center justify-center space-x-2 transition cursor-pointer">
+            <i data-lucide="wand-2" class="w-4 h-4 fill-black"></i>
+            <span>🤖 ĐẠO DIỄN AI: PHÂN TÍCH PROMPT & TỰ ÁP DỤNG 11 TRƯỜNG PHÁI CHATGPT + GÓC MÁY BRUCTA (1-CLICK)</span>
+          </button>
+
+          <!-- ChatGPT 11 Trường Phái Thị Giác & Bảng Màu Toolbar -->
+          <div class="bg-[#0e1520] border border-[#182638] p-2.5 rounded-lg space-y-2">
+            <div class="flex items-center justify-between text-[11px]">
+              <span class="font-bold text-cyan-400 flex items-center space-x-1">
+                <i data-lucide="palette" class="w-3.5 h-3.5"></i>
+                <span>Trường Phái Thị Giác ChatGPT (11 Visual Groups) & Bảng Màu:</span>
+              </span>
+              <span class="text-gray-400 text-[10px]">Bấm vào thẻ để tự động ghép vào prompt</span>
+            </div>
+            
+            <!-- Quick Chips: 11 Visual Archetypes -->
+            <div class="flex flex-wrap gap-1.5 text-[10px]">
+              <button type="button" onclick="insertTagToImagePrompt('F1 Fantasy thiên nhiên và cổ tích (Alan Lee style, leading path, deep depth of field, mossy stone and organic roots, soft misty light, moss green and cream palette, clean negative space)')" class="px-2 py-0.5 rounded bg-[#13231f] hover:bg-emerald-900/40 text-emerald-300 border border-emerald-800/50">F1 Cổ Tích Rêu Phong</button>
+              <button type="button" onclick="insertTagToImagePrompt('F2 Fantasy kịch tính và tối (Frank Frazetta style, bold heroic silhouette, dark background, fiery rim light, rough rock, red and black palette)')" class="px-2 py-0.5 rounded bg-[#27151a] hover:bg-red-900/40 text-rose-300 border border-rose-800/50">F2 Fantasy Hắc Ám</button>
+              <button type="button" onclick="insertTagToImagePrompt('C1 Không gian lớn và ánh màu (Alena Aenami style, tiny human vs colossal structure scale, vibrant colorful sky, warm and cool color contrast, wide horizon, deep space)')" class="px-2 py-0.5 rounded bg-[#13222a] hover:bg-cyan-900/40 text-cyan-300 border border-cyan-800/50">C1 Vũ Trụ Khoáng Đạt</button>
+              <button type="button" onclick="insertTagToImagePrompt('C2 Khoa học viễn tưởng và mô-đun (Syd Mead style, modular high-tech structure, mechanical panel seams, industrial lighting, chrome and painted metal textures)')" class="px-2 py-0.5 rounded bg-[#1c1c28] hover:bg-indigo-900/40 text-indigo-300 border border-indigo-800/50">C2 Cơ Khí Syd Mead</button>
+              <button type="button" onclick="insertTagToImagePrompt('E1 Tạo hình mảng và dấu cọ (Craig Mullins painterly style, visible brush strokes, broken edges, expressive light and shadow masses)')" class="px-2 py-0.5 rounded bg-[#271f15] hover:bg-amber-900/40 text-amber-300 border border-amber-800/50">E1 Nét Cọ Expressive</button>
+              <button type="button" onclick="insertTagToImagePrompt('G1 Đồ họa đường nét và mảng phẳng (Moebius & Kilian Eng style, crisp line-art, bold graphic silhouette, flat color planes, high visual clarity)')" class="px-2 py-0.5 rounded bg-[#24172a] hover:bg-purple-900/40 text-purple-300 border border-purple-800/50">G1 Đồ Họa Moebius</button>
+              <button type="button" onclick="insertTagToImagePrompt('P1 Chân dung điện ảnh (Steve McCurry & Helmut Newton photographic language, intentional catchlight in eyes, 85mm shallow focus, Rembrandt chiaroscuro)')" class="px-2 py-0.5 rounded bg-[#1e2518] hover:bg-lime-900/40 text-lime-300 border border-lime-800/50">P1 Chân Dung Điện Ảnh</button>
+              <button type="button" onclick="insertTagToImagePrompt('D1 Gothic sinh cơ khí (H.R. Giger biomechanical style, ribbed biomechanical structures, dark shadows, cold rim light, mysterious gothic vibe)')" class="px-2 py-0.5 rounded bg-[#161c22] hover:bg-slate-800 text-slate-300 border border-slate-700">D1 Biomechanical Giger</button>
+            </div>
+
+            <!-- Quick Chips: Classic Palettes -->
+            <div class="flex items-center space-x-2 pt-1 border-t border-[#162333] text-[10px]">
+              <span class="text-gray-400 font-semibold">Bảng Màu:</span>
+              <button type="button" onclick="insertTagToImagePrompt('Teal and Orange cinema color palette, Blue Key Light, Warm Amber Fill Light')" class="px-2 py-0.5 rounded bg-[#122228] hover:bg-cyan-900/40 text-cyan-400 border border-cyan-800/40">Cam - Xanh Cyan</button>
+              <button type="button" onclick="insertTagToImagePrompt('Sunset Golden Hour and Violet Twilight color palette')" class="px-2 py-0.5 rounded bg-[#25152b] hover:bg-purple-900/40 text-fuchsia-400 border border-purple-800/40">Vàng - Tím Hoàng Hôn</button>
+              <button type="button" onclick="insertTagToImagePrompt('Moss Green, Earth Brown and Pale Cream antique palette')" class="px-2 py-0.5 rounded bg-[#152317] hover:bg-emerald-900/40 text-emerald-400 border border-emerald-800/40">Xanh Rêu - Kem Cổ Kính</button>
+              <button type="button" onclick="insertTagToImagePrompt('Dramatic Crimson Red and Deep Shadow Black palette')" class="px-2 py-0.5 rounded bg-[#281316] hover:bg-red-900/40 text-red-400 border border-red-800/40">Đỏ - Đen Tương Phản</button>
+              <button type="button" onclick="insertTagToImagePrompt('Deep Monochrome Black and White with rich silver tonal range')" class="px-2 py-0.5 rounded bg-[#1a1f26] hover:bg-gray-700 text-gray-300 border border-gray-600">Đen Trắng Chiều Sâu</button>
+            </div>
+          </div>
+
+          <!-- Controls: Model, Ratio, Style -->
+          <div class="grid grid-cols-4 gap-3 text-xs">
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Model AI</label>
+              <select id="imageModelSelect" class="w-full bg-[#070b10] border border-[#182536] rounded p-1.5 text-xs text-gray-300">
+                <option value="Seedance Image 2.5">Seedance Image 2.5</option>
+                <option value="Doubao Pro Image">Doubao Pro Image</option>
+                <option value="Midjourney Style">Midjourney Style</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Tỉ lệ khung hình (Aspect Ratio)</label>
+              <select id="imageRatioSelect" class="w-full bg-[#070b10] border border-[#182536] rounded p-1.5 text-xs text-gray-300">
+                <option value="16:9">16:9 (Ngang - Youtube / PC)</option>
+                <option value="9:16">9:16 (Dọc - TikTok / Reels)</option>
+                <option value="1:1">1:1 (Vuông - Avatar)</option>
+                <option value="4:3">4:3 (Tiêu chuẩn)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Phong cách (Style)</label>
+              <select id="imageStyleSelect" class="w-full bg-[#070b10] border border-[#182536] rounded p-1.5 text-xs text-gray-300">
+                <option value="Cinematic">Điện ảnh (Cinematic)</option>
+                <option value="Anime">Anime Nhật Bản</option>
+                <option value="Photorealistic">Chân thực (Photorealistic)</option>
+                <option value="3D Render">3D Render Unreal Engine</option>
+                <option value="Cyberpunk">Cyberpunk Neon</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Tài khoản sinh ảnh</label>
+              <select id="imageAccountSelect" class="w-full bg-[#070b10] border border-[#182536] rounded p-1.5 text-xs text-gray-300">
+                <option value="">Tự động chọn tài khoản rảnh</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Image Gallery Grid -->
+        <div class="flex-1 overflow-y-auto">
+          <div id="imagesGrid" class="grid grid-cols-4 gap-4">
+            <!-- Rendered dynamically -->
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: TẠO VIDEO (DEFAULT ACTIVE) ==================== -->
+      <section id="tab-video" class="flex-1 flex flex-col overflow-hidden p-4">
+        <div class="flex items-center justify-between mb-2 pb-2 border-b border-[#141d2a]">
+          <div class="flex items-center space-x-3">
+            <h1 class="text-base font-semibold text-gray-100 flex items-center space-x-2">
+              <span>Hàng đợi Tạo Video</span>
+              <span class="text-xs text-cyan-400 font-semibold px-2 py-0.5 rounded bg-[#10242b] border border-[#1b3d48]">(Seedance 2.5 • ByteDance)</span>
+            </h1>
+          </div>
+          <div class="flex items-center space-x-2">
+            <button onclick="openImportB3Modal()" class="px-3 py-1.5 bg-gradient-to-r from-purple-600 to-indigo-500 hover:from-purple-500 hover:to-indigo-400 text-white font-bold text-xs rounded shadow flex items-center space-x-1.5 transition">
+              <i data-lucide="sparkles" class="w-3.5 h-3.5 text-amber-300"></i>
+              <span>⚡ Nạp 180 Clip B3 (TOOL AI)</span>
+            </button>
+            <button onclick="openBatchPromptModal()" class="px-3 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-black font-semibold text-xs rounded shadow flex items-center space-x-1.5 transition">
+              <i data-lucide="plus-circle" class="w-3.5 h-3.5"></i>
+              <span>Thêm Prompt Hàng Loạt</span>
+            </button>
+            <button onclick="refreshData()" class="p-1.5 bg-[#121a26] hover:bg-[#1a2638] text-gray-300 rounded border border-[#1b2636] transition" title="Làm mới">
+              <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Control Bar Chuẩn Studio Trong Video -->
+        <div class="bg-[#0b1017] border border-[#141e2b] rounded-xl p-2.5 mb-3 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+          <!-- Nhóm 1: Chất lượng -->
+          <div class="flex items-center space-x-1.5">
+            <span class="text-[10px] text-gray-400 font-bold uppercase">Chất Lượng:</span>
+            <div class="inline-flex rounded-lg border border-[#1b2a3c] p-0.5 bg-[#070b10]">
+              <button type="button" id="btnModeFast" onclick="setVideoQuality('Nhanh', this)" class="mode-btn px-2.5 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">Nhanh</button>
+              <button type="button" id="btnModeHQ" onclick="setVideoQuality('Chất lượng', this)" class="mode-btn px-2.5 py-0.5 rounded text-[11px] font-bold bg-cyan-500 text-black shadow transition">Chất lượng</button>
+            </div>
+          </div>
+
+          <!-- Nhóm 2: Thời lượng (5 nút chuẩn video) -->
+          <div class="flex items-center space-x-1.5">
+            <span class="text-[10px] text-gray-400 font-bold uppercase">Thời Lượng:</span>
+            <div class="inline-flex rounded-lg border border-[#1b2a3c] p-0.5 bg-[#070b10] space-x-0.5">
+              <button type="button" onclick="setVideoDuration('10 giây', this)" class="dur-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">10 giây</button>
+              <button type="button" onclick="setVideoDuration('15 giây', this)" class="dur-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">15 giây</button>
+              <button type="button" onclick="setVideoDuration('20 giây', this)" class="dur-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">20 giây</button>
+              <button type="button" onclick="setVideoDuration('25 giây', this)" class="dur-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">25 giây</button>
+              <button type="button" onclick="setVideoDuration('30 giây', this)" class="dur-btn px-2.5 py-0.5 rounded text-[11px] font-bold bg-purple-600 text-white shadow transition">30 giây</button>
+            </div>
+          </div>
+
+          <!-- Nhóm 3: Khung hình -->
+          <div class="flex items-center space-x-1.5">
+            <span class="text-[10px] text-gray-400 font-bold uppercase">Tỷ Lệ:</span>
+            <div class="inline-flex rounded-lg border border-[#1b2a3c] p-0.5 bg-[#070b10]">
+              <button type="button" id="btnRatioVertical" onclick="setVideoRatio('Dọc', this)" class="ratio-btn px-2 py-0.5 rounded text-[11px] font-bold bg-cyan-500 text-black shadow transition">Dọc (9:16)</button>
+              <button type="button" id="btnRatioHorizontal" onclick="setVideoRatio('Ngang', this)" class="ratio-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">Ngang (16:9)</button>
+            </div>
+          </div>
+
+          <!-- Nhóm 4: Model -->
+          <div class="flex items-center space-x-1.5">
+            <span class="text-[10px] text-gray-400 font-bold uppercase">Model:</span>
+            <div class="inline-flex rounded-lg border border-[#1b2a3c] p-0.5 bg-[#070b10]">
+              <button type="button" onclick="setVideoModel('Seedance 2.0', this)" class="model-btn px-2 py-0.5 rounded text-[11px] font-medium text-gray-400 hover:text-white transition">Seedance 2.0</button>
+              <button type="button" onclick="setVideoModel('Seedance 2.5', this)" class="model-btn px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500 text-black shadow transition">Seedance 2.5</button>
+            </div>
+          </div>
+
+          <!-- Nút Chạy Ngay -->
+          <button onclick="openBatchPromptModal()" class="px-3.5 py-1.5 bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-black font-extrabold text-xs rounded-lg shadow-lg flex items-center space-x-1.5 transition">
+            <i data-lucide="play" class="w-3.5 h-3.5 fill-black"></i>
+            <span>🎬 Chạy Video</span>
+          </button>
+        </div>
+
+        <div class="flex-1 bg-[#0a0f16] border border-[#141e2b] rounded-lg overflow-y-auto">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-[#070b10] border-b border-[#141e2b] text-[11px] uppercase font-bold text-gray-400 select-none z-10">
+              <tr>
+                <th class="p-2.5 w-10 text-center"><input type="checkbox" class="rounded bg-gray-800 border-gray-700"></th>
+                <th class="p-2.5 w-16">ID</th>
+                <th class="p-2.5 w-64">Trạng thái</th>
+                <th class="p-2.5 w-24">Thời lượng</th>
+                <th class="p-2.5 w-28">Model</th>
+                <th class="p-2.5 w-36">Tài khoản</th>
+                <th class="p-2.5 w-44">Proxy</th>
+                <th class="p-2.5">Tiêu đề / Prompt</th>
+                <th class="p-2.5 w-16 text-center">Xóa</th>
+              </tr>
+            </thead>
+            <tbody id="jobsTableBody" class="divide-y divide-[#101722] text-xs">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: TUT VIP AI ==================== -->
+      <section id="tab-tut" class="hidden flex-1 overflow-y-auto p-5 space-y-4 max-w-4xl">
+        <div class="flex items-center space-x-2 mb-2">
+          <i data-lucide="award" class="w-5 h-5 text-amber-400"></i>
+          <h1 class="text-base font-bold text-gray-100">Kho Bí Kíp & Prompt VIP Cho Seedance 2.5</h1>
+        </div>
+        <p class="text-xs text-gray-400">Tổng hợp các câu lệnh (prompt template) giúp video mượt mà, chuyển động camera chuẩn điện ảnh và không bị lỗi biến dạng mặt.</p>
+
+        <div class="space-y-3">
+          <!-- Card 1 -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-cyan-400 text-xs">TUT 1: Camera Chuyển Động Điện Ảnh (Cinematic Orbit & Zoom)</span>
+              <button onclick="copyPrompt('cinematic orbit shot around the subject, dramatic slow motion, volumetric fog, dynamic lighting, 8k resolution, strict continuity')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              cinematic orbit shot around the subject, dramatic slow motion, volumetric fog, dynamic lighting, 8k resolution, strict continuity
+            </p>
+          </div>
+
+          <!-- Card 2 -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-emerald-400 text-xs">TUT 2: Giữ Nhất Quán Khuôn Mặt Nhân Vật (Face Consistency)</span>
+              <button onclick="copyPrompt('STRICT CONTINUITY & STATIC CAMERA: character with exact same face, same clothes, high fidelity details, smooth realistic motion')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              STRICT CONTINUITY & STATIC CAMERA: character with exact same face, same clothes, high fidelity details, smooth realistic motion
+            </p>
+          </div>
+
+          <!-- Card 3 -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-purple-400 text-xs">TUT 3: Video Hành Động Cháy Nổ & Võ Thuật Không Biến Dạng</span>
+              <button onclick="copyPrompt('fast martial arts combat sequence, crisp frame rate, realistic physics, dust particles, motion blur controlled, blockbuster cinematic grade')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              fast martial arts combat sequence, crisp frame rate, realistic physics, dust particles, motion blur controlled, blockbuster cinematic grade
+            </p>
+          </div>
+
+          <!-- Card 4 (Bructa Cine Master) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-cyan-400 text-xs">TUT 4: Phối Màu Tương Phản Điện Ảnh & Nhựa Phim (Teal/Orange & Tungsten Film)</span>
+              <button onclick="copyPrompt('cinematic color grading, Blue Key Light, Orange Fill Light, 35mm Color Film Stock, Tungsten film, subtle film grain, deep shadows, Hollywood masterpiece --ar 16:9')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              cinematic color grading, Blue Key Light, Orange Fill Light, 35mm Color Film Stock, Tungsten film, subtle film grain, deep shadows, Hollywood masterpiece --ar 16:9
+            </p>
+          </div>
+
+          <!-- Card 5 (Bructa Rembrandt & Volumetric) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-amber-400 text-xs">TUT 5: Ánh Sáng Tương Phản Rembrandt & Tia Sáng Thể Tích (God Rays)</span>
+              <button onclick="copyPrompt('Rembrandt lighting, chiaroscuro, volumetric lighting, god rays through foggy air, warm rim light, catchlight in eyes, subsurface scattering, 85mm portrait lens')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Rembrandt lighting, chiaroscuro, volumetric lighting, god rays through foggy air, warm rim light, catchlight in eyes, subsurface scattering, 85mm portrait lens
+            </p>
+          </div>
+
+          <!-- Card 6 (Bructa Anamorphic Lens) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-rose-400 text-xs">TUT 6: Ống Kính Anamorphic & Vệt Sáng Elip Điện Ảnh (Anamorphic Look)</span>
+              <button onclick="copyPrompt('Anamorphic lens, elliptical lens flare, stretched bokeh, shallow depth of field, wide aspect ratio, cinematic lighting, sharp focus on subject, 8k raw footage --ar 2.35:1')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Anamorphic lens, elliptical lens flare, stretched bokeh, shallow depth of field, wide aspect ratio, cinematic lighting, sharp focus on subject, 8k raw footage --ar 2.35:1
+            </p>
+          </div>
+
+          <!-- Card 7 (ChatGPT C1: Không Gian Lớn & Ánh Màu Alena Aenami) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-cyan-400 text-xs">TUT 7: [Nhóm C1] Tương Phản Tỷ Lệ Vũ Trụ & Ánh Màu Hoàng Hôn (Alena Aenami & John Harris)</span>
+              <button onclick="copyPrompt('Alena Aenami style, tiny lone wanderer in colossal cosmic architecture, deep space scale contrast, vibrant twilight purple and golden hour sky, warm and cool atmospheric contrast, reflective waters, deep focus 24mm wide angle --ar 16:9')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Alena Aenami style, tiny lone wanderer in colossal cosmic architecture, deep space scale contrast, vibrant twilight purple and golden hour sky, warm and cool atmospheric contrast, reflective waters, deep focus 24mm wide angle --ar 16:9
+            </p>
+          </div>
+
+          <!-- Card 8 (ChatGPT F1: Cổ Tích Rêu Phong Alan Lee) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-emerald-400 text-xs">TUT 8: [Nhóm F1] Thế Giới Cổ Tích 3 Lớp Cảnh & Rêu Phong (Alan Lee & John Howe)</span>
+              <button onclick="copyPrompt('Alan Lee fantasy landscape, leading stone path winding through ancient colossal trees and overgrown roots, ancient castle tower in distant background, 3-layer depth of field, soft misty morning light, moss green earth and pale cream palette, weathered stone textures, breathing space --ar 16:9')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Alan Lee fantasy landscape, leading stone path winding through ancient colossal trees and overgrown roots, ancient castle tower in distant background, 3-layer depth of field, soft misty morning light, moss green earth and pale cream palette, weathered stone textures, breathing space --ar 16:9
+            </p>
+          </div>
+
+          <!-- Card 9 (ChatGPT C2: Sci-Fi Mô-đun Syd Mead) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-indigo-400 text-xs">TUT 9: [Nhóm C2] Siêu Đô Thị Sci-Fi Cơ Khí & Mô-đun Lắp Ghép (Syd Mead & Chris Foss)</span>
+              <button onclick="copyPrompt('Syd Mead futurism concept art, massive modular industrial spaceport, tiered architectural blocks, heavy mechanical panel seams and joints, weathered painted metal and chrome, industrial spotlights cutting through hazmat steam, high-tech vehicles, cinematic sci-fi masterpiece --ar 16:9')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Syd Mead futurism concept art, massive modular industrial spaceport, tiered architectural blocks, heavy mechanical panel seams and joints, weathered painted metal and chrome, industrial spotlights cutting through hazmat steam, high-tech vehicles, cinematic sci-fi masterpiece --ar 16:9
+            </p>
+          </div>
+
+          <!-- Card 10 (ChatGPT G1: Đồ Họa Moebius & Kilian Eng) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-purple-400 text-xs">TUT 10: [Nhóm G1] Nghệ Thuật Đồ Họa Nét Sắc & Mảng Phẳng (Moebius & Kilian Eng)</span>
+              <button onclick="copyPrompt('Moebius and Kilian Eng style, intricate precise graphic linework, bold clean silhouette, flat color planes with limited harmonic palette, teal and burnt orange sky, surreal desert monoliths, high visual clarity, clean composition with elegant negative space --ar 16:9')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Moebius and Kilian Eng style, intricate precise graphic linework, bold clean silhouette, flat color planes with limited harmonic palette, teal and burnt orange sky, surreal desert monoliths, high visual clarity, clean composition with elegant negative space --ar 16:9
+            </p>
+          </div>
+
+          <!-- Card 11 (ChatGPT P1: Chân Dung Điện Ảnh Nhiếp Ảnh Gia) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-lime-400 text-xs">TUT 11: [Nhóm P1] Chân Dung Nhiếp Ảnh Điện Ảnh Có Chủ Ý (Steve McCurry & Helmut Newton)</span>
+              <button onclick="copyPrompt('Steve McCurry photographic portrait, piercing eye contact, sharp catchlight in iris, hyper-detailed skin pores and fabric weave, 85mm prime lens f/1.4, shallow depth of field, directional Rembrandt lighting, cinematic documentary mood, vivid cultural shawl, National Geographic masterpiece')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              Steve McCurry photographic portrait, piercing eye contact, sharp catchlight in iris, hyper-detailed skin pores and fabric weave, 85mm prime lens f/1.4, shallow depth of field, directional Rembrandt lighting, cinematic documentary mood, vivid cultural shawl, National Geographic masterpiece
+            </p>
+          </div>
+
+          <!-- Card 12 (ChatGPT D1: Biomechanical Gothic H.R. Giger) -->
+          <div class="bg-[#0d131d] border border-[#1a2638] rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+              <span class="font-bold text-slate-400 text-xs">TUT 12: [Nhóm D1] Kiến Trúc Sinh Cơ Khí & Gothic Huyền Bí (H.R. Giger)</span>
+              <button onclick="copyPrompt('H.R. Giger biomechanical aesthetic, ribbed spine architecture, organic tubing and bone-like structures, deep ominous shadows, icy cold rim light, dark metallic sheen, mysterious gothic tension, cinematic monochromatic mood with subtle cold blue sheen --ar 16:9')" class="px-2.5 py-1 bg-[#152333] hover:bg-[#1e3249] text-xs text-gray-200 rounded border border-[#23354d]">Sao chép Prompt</button>
+            </div>
+            <p class="text-xs text-gray-300 font-mono bg-[#070b10] p-2.5 rounded border border-[#141e2b]">
+              H.R. Giger biomechanical aesthetic, ribbed spine architecture, organic tubing and bone-like structures, deep ominous shadows, icy cold rim light, dark metallic sheen, mysterious gothic tension, cinematic monochromatic mood with subtle cold blue sheen --ar 16:9
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: KHO NHÂN VẬT & ASSET ==================== -->
+      <section id="tab-assets" class="hidden flex-1 overflow-hidden p-4 flex flex-col">
+        <div class="flex items-center justify-between mb-3 pb-3 border-b border-[#141d2a]">
+          <div>
+            <h1 class="text-base font-semibold text-gray-100">Kho Nhân Vật & Asset Cố Định</h1>
+            <p class="text-xs text-gray-500">Lưu nhân vật mẫu để tái sử dụng xuyên suốt bộ phim/chuỗi video mà không bị đổi mặt</p>
+          </div>
+          <button onclick="openModal('modalAddAsset')" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-black font-semibold text-xs rounded transition flex items-center space-x-1">
+            <i data-lucide="plus" class="w-3.5 h-3.5"></i>
+            <span>Thêm Nhân Vật Mới</span>
+          </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto">
+          <div id="assetsGrid" class="grid grid-cols-3 gap-4">
+            <!-- Rendered dynamically -->
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: TÀI KHOẢN & PROXY ==================== -->
+      <section id="tab-accounts" class="hidden flex-1 overflow-hidden p-4 flex flex-col">
+        <!-- Action Toolbar Y Hệt Trong Video -->
+        <div class="bg-[#0b1017] border border-[#141e2b] rounded-xl p-2.5 mb-3 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+          <!-- Các nút thao tác bên trái -->
+          <div class="flex items-center space-x-2">
+            <!-- Toggle Facebook vs Google/Dola -->
+            <div class="inline-flex rounded-lg border border-[#1b2a3c] p-0.5 bg-[#070b10]">
+              <button type="button" id="filterTabAll" onclick="filterAccountType('all', this)" class="acc-filter-btn px-2.5 py-1 rounded text-[11px] font-bold bg-cyan-600 text-black shadow">Tất Cả</button>
+              <button type="button" id="filterTabFb" onclick="filterAccountType('facebook', this)" class="acc-filter-btn px-2.5 py-1 rounded text-[11px] font-medium text-gray-400 hover:text-white flex items-center space-x-1">
+                <i data-lucide="facebook" class="w-3 h-3 text-cyan-400"></i>
+                <span>Facebook</span>
+              </button>
+              <button type="button" id="filterTabGg" onclick="filterAccountType('google', this)" class="acc-filter-btn px-2.5 py-1 rounded text-[11px] font-medium text-gray-400 hover:text-white flex items-center space-x-1">
+                <i data-lucide="mail" class="w-3 h-3 text-rose-400"></i>
+                <span>Gmail / Dola</span>
+              </button>
+            </div>
+
+            <!-- Thẻ lọc trạng thái -->
+            <button type="button" onclick="filterAccountStatus('ready', this)" class="status-filter-btn px-2.5 py-1 bg-[#10231d] hover:bg-[#16382e] text-emerald-300 border border-emerald-800/50 rounded text-[11px] font-semibold flex items-center space-x-1 transition">
+              <span>✓ Dola đã log</span>
+            </button>
+            <button type="button" onclick="filterAccountStatus('no-proxy', this)" class="status-filter-btn px-2.5 py-1 bg-[#231a10] hover:bg-[#382816] text-amber-300 border border-amber-800/50 rounded text-[11px] font-semibold flex items-center space-x-1 transition">
+              <span>⚠ Chưa có proxy</span>
+            </button>
+          </div>
+
+          <!-- Các nút công cụ bên phải (Gán proxy, Xóa proxy, Luồng, Đổi IP) -->
+          <div class="flex items-center space-x-2">
+            <button onclick="openAddAccountModal()" class="px-2.5 py-1 bg-[#10241f] hover:bg-[#163a32] text-emerald-400 border border-[#1b433c] rounded text-[11px] font-semibold flex items-center space-x-1">
+              <i data-lucide="user-plus" class="w-3 h-3"></i>
+              <span>Thêm tài khoản</span>
+            </button>
+            <button onclick="openImportModal()" class="px-2.5 py-1 bg-[#142233] hover:bg-[#1c324c] text-cyan-300 border border-cyan-800/40 rounded text-[11px] font-semibold flex items-center space-x-1">
+              <i data-lucide="upload" class="w-3 h-3"></i>
+              <span>Nhập tài khoản</span>
+            </button>
+            <button onclick="exportAccounts()" class="px-2.5 py-1 bg-[#141e2b] hover:bg-[#1b2a3d] text-gray-300 border border-[#223145] rounded text-[11px] font-semibold flex items-center space-x-1">
+              <i data-lucide="download" class="w-3 h-3"></i>
+              <span>Xuất danh sách</span>
+            <button onclick="checkAllAccountsCredit()" class="px-2.5 py-1 bg-[#102422] hover:bg-[#163833] text-emerald-300 border border-emerald-700/50 rounded text-[11px] font-semibold flex items-center space-x-1" title="Kiểm tra số credit hôm nay của tất cả nick đã đăng nhập Dola">
+              <i data-lucide="sparkles" class="w-3 h-3 text-emerald-400"></i>
+              <span>Check Toàn Bộ Credit</span>
+            </button>
+            <button onclick="batchAssignProxy()" class="px-2.5 py-1 bg-[#1f1629] hover:bg-[#2f1f40] text-purple-300 border border-purple-800/40 rounded text-[11px] font-semibold flex items-center space-x-1">
+              <i data-lucide="network" class="w-3 h-3"></i>
+              <span>Gán proxy</span>
+            </button>
+            <div class="flex items-center space-x-1 bg-[#070b10] border border-[#1b2a3c] px-2 py-0.5 rounded text-[11px] text-gray-300">
+              <span class="text-gray-400">Luồng:</span>
+              <input type="number" id="accThreadsInput" value="2" min="1" max="10" class="w-8 bg-transparent text-cyan-400 font-bold text-center focus:outline-none">
+            </div>
+            <button onclick="rotateIPNotice()" class="px-2 py-1 bg-[#121c28] hover:bg-[#1a293c] text-cyan-400 border border-cyan-800/30 rounded text-[11px] font-semibold flex items-center space-x-1">
+              <i data-lucide="refresh-cw" class="w-3 h-3"></i>
+              <span>Đổi IP</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="flex-1 bg-[#0a0f16] border border-[#141e2b] rounded-lg overflow-y-auto">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-[#070b10] border-b border-[#141e2b] text-[11px] uppercase font-bold text-gray-400 select-none">
+              <tr>
+                <th class="p-2.5 w-12 text-center">ID</th>
+                <th class="p-2.5 w-24">Loại TK</th>
+                <th class="p-2.5 w-36">Tên Gợi Nhớ</th>
+                <th class="p-2.5 w-44">Định danh (UID / Email)</th>
+                <th class="p-2.5 w-40">Proxy Gán Kèm</th>
+                <th class="p-2.5 w-40 text-center">Trạng Thái Dola AI</th>
+                <th class="p-2.5 w-36 text-center">Credit Hôm Nay</th>
+                <th class="p-2.5 w-64 text-center">Thao Tác Kết Nối Dola</th>
+                <th class="p-2.5 w-12 text-center">Xóa</th>
+              </tr>
+            </thead>
+            <tbody id="accountsTableBody" class="divide-y divide-[#101722] text-xs">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: CHECK ẢNH/VIDEO NICK ==================== -->
+      <section id="tab-check-media" class="hidden flex-1 overflow-hidden p-4 flex flex-col">
+        <div class="flex items-center justify-between mb-3 pb-3 border-b border-[#141d2a]">
+          <div>
+            <h1 class="text-base font-semibold text-gray-100">Kiểm Tra Ảnh & Video Của Từng Nick</h1>
+            <p class="text-xs text-gray-500">Xem và tải toàn bộ tác phẩm mà từng tài khoản Facebook đã tạo ra</p>
+          </div>
+          <div class="flex items-center space-x-2">
+            <select id="filterNickMediaSelect" onchange="loadNickMedia()" class="bg-[#121c29] border border-[#1c2c3f] rounded px-3 py-1.5 text-xs text-gray-200">
+              <option value="">Xem tất cả tài khoản</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="flex-1 overflow-y-auto space-y-4">
+          <div>
+            <h3 class="text-xs font-bold text-gray-400 uppercase mb-2">Video đã tạo bởi nick</h3>
+            <div id="nickVideosGrid" class="grid grid-cols-3 gap-3"></div>
+          </div>
+          <div class="pt-3 border-t border-[#141e2b]">
+            <h3 class="text-xs font-bold text-gray-400 uppercase mb-2">Ảnh đã tạo bởi nick</h3>
+            <div id="nickImagesGrid" class="grid grid-cols-4 gap-3"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: XỬ LÝ ÂM THANH ==================== -->
+      <section id="tab-audio" class="hidden flex-1 overflow-y-auto p-5 max-w-2xl space-y-4">
+        <div>
+          <h1 class="text-base font-semibold text-gray-100">Xử Lý Âm Thanh & Lồng Tiếng AI (TTS)</h1>
+          <p class="text-xs text-gray-500">Tạo giọng đọc thuyết minh tiếng Việt cho video Seedance</p>
+        </div>
+
+        <div class="bg-[#0b1017] border border-[#15202d] rounded-xl p-4 space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-gray-300 mb-1">Nội dung thuyết minh (Kịch bản)</label>
+            <textarea id="audioTextInput" rows="5" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-3 text-xs text-gray-200 focus:outline-none focus:border-cyan-500" placeholder="Nhập lời thoại hoặc kịch bản thuyết minh cho video của bạn..."></textarea>
+          </div>
+          
+          <div class="grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Giọng đọc</label>
+              <select id="audioVoiceSelect" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-300">
+                <option value="vi-VN-Nu-NheNhang">Nữ nhẹ nhàng (Hà Nội)</option>
+                <option value="vi-VN-Nam-TramAm">Nam trầm ấm (Sài Gòn)</option>
+                <option value="vi-VN-DienAnh">Giọng Kể Chuyện Điện Ảnh</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Tốc độ đọc</label>
+              <select id="audioSpeedSelect" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-300">
+                <option value="1.0">1.0x (Bình thường)</option>
+                <option value="0.9">0.9x (Chậm)</option>
+                <option value="1.15">1.15x (Nhanh)</option>
+              </select>
+            </div>
+          </div>
+
+          <button onclick="submitGenerateAudio()" class="w-full py-2 bg-gradient-to-r from-emerald-500 to-teal-400 text-black font-bold text-xs rounded-lg hover:opacity-90 transition">
+            Tạo Giọng Đọc AI & Nghe Thử
+          </button>
+        </div>
+
+        <div id="audioResultCard" class="hidden bg-[#0d1520] border border-[#18293d] rounded-xl p-4 text-xs">
+          <div class="font-bold text-emerald-400 mb-2 flex items-center space-x-1">
+            <i data-lucide="check-circle" class="w-4 h-4"></i>
+            <span>Âm thanh đã tạo thành công</span>
+          </div>
+          <audio id="audioPlayer" controls class="w-full h-8"></audio>
+        </div>
+      </section>
+
+      <!-- ==================== TAB: NHẬT KÝ (LOGS) ==================== -->
+      <section id="tab-logs" class="hidden flex-1 overflow-hidden p-4 flex flex-col">
+        <div class="flex items-center justify-between mb-3 pb-3 border-b border-[#141d2a]">
+          <div>
+            <h1 class="text-base font-semibold text-gray-100">Nhật Ký Hệ Thống (System Logs)</h1>
+            <p class="text-xs text-gray-500">Theo dõi luồng chạy, trạng thái proxy, lỗi và sự kiện thời gian thực</p>
+          </div>
+          <div class="flex items-center space-x-2">
+            <button onclick="fetchLogs()" class="px-2.5 py-1 bg-[#121c28] hover:bg-[#1a2838] text-xs text-gray-300 rounded border border-[#1c2c3e]">Làm mới</button>
+            <button onclick="clearLogs()" class="px-2.5 py-1 bg-[#281316] hover:bg-red-900/50 text-xs text-red-400 rounded border border-[#441a20]">Xóa nhật ký</button>
+          </div>
+        </div>
+
+        <div class="flex-1 bg-[#06090e] border border-[#131d2a] rounded-lg p-3 overflow-y-auto font-mono text-[11px] space-y-1" id="logsContainer">
+          <!-- Rendered dynamically -->
+        </div>
+      </section>
+
+      <!-- ==================== TAB: CÀI ĐẶT ==================== -->
+      <section id="tab-settings" class="hidden flex-1 overflow-y-auto p-6 max-w-3xl">
+        <h1 class="text-lg font-bold text-gray-100 mb-4">Cài đặt Hệ thống Studio</h1>
+        <div class="bg-[#0b1017] border border-[#141e2b] rounded-lg p-5 space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-gray-300 mb-1">Số luồng chạy song song tối đa (Max Concurrent Jobs)</label>
+            <input type="number" id="settingMaxJobs" value="5" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 focus:outline-none focus:border-cyan-500">
+            <p class="text-[11px] text-gray-500 mt-1">Số lượng video được xử lý đồng thời (ví dụ: 5 - 20 luồng tùy cấu hình máy & số proxy)</p>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-300 mb-1">Delay giữa các job (Giây)</label>
+            <input type="number" id="settingDelay" value="5" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-300 mb-1">Model mặc định</label>
+            <select id="settingModel" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 focus:outline-none">
+              <option value="Seedance 2.5">Seedance 2.5 (Khuyên dùng)</option>
+              <option value="Seedance 2.0">Seedance 2.0</option>
+              <option value="Seedance Turbo">Seedance Turbo</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-300 mb-1">Thời lượng video mặc định</label>
+            <select id="settingDuration" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 focus:outline-none">
+              <option value="30 giây">30 giây</option>
+              <option value="15 giây">15 giây</option>
+              <option value="10 giây">10 giây</option>
+            </select>
+          </div>
+          <button onclick="saveSettings()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-black font-semibold text-xs rounded transition">
+            Lưu Cài Đặt
+          </button>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- BOTTOM FOOTER -->
+  <footer class="h-8 bg-[#06090e] border-t border-[#131b26] flex items-center justify-between px-4 text-[11px] text-gray-400 select-none">
+    <div class="flex items-center space-x-3">
+      <span class="flex items-center space-x-1.5 text-cyan-400 font-semibold">
+        <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+        <span>Seedance AI Studio (Dola 2.5)</span>
+      </span>
+      <span class="text-gray-600">|</span>
+      <span class="text-emerald-400 font-medium">Hệ Thống Tự Động Hóa Đa Luồng</span>
+    </div>
+    <div class="flex items-center space-x-2 text-gray-500">
+      <span>Seedance AI v1.0.127</span>
+    </div>
+  </footer>
+
+  <!-- MODALS -->
+  <!-- MODAL: BATCH PROMPTS -->
+  <div id="modalBatchPrompts" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-xl rounded-xl p-5 shadow-2xl">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="font-bold text-gray-100 text-sm">Thêm Hàng Loạt Prompt Tạo Video</h3>
+        <button onclick="closeModal('modalBatchPrompts')" class="text-gray-400 hover:text-white"><i data-lucide="x" class="w-4 h-4"></i></button>
+      </div>
+      <p class="text-xs text-gray-400 mb-2">Nhập danh sách mô tả video (Mỗi dòng là 1 prompt video riêng biệt):</p>
+      
+      <!-- Nút Đạo Diễn AI Tự Động Phân Tích Prompt -->
+      <button type="button" onclick="autoDetectAndEnhanceBructa()" class="w-full py-2.5 bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 text-black font-extrabold text-xs rounded-lg shadow-lg hover:opacity-95 flex items-center justify-center space-x-2 transition mb-2.5 cursor-pointer">
+        <i data-lucide="sparkles" class="w-4 h-4 fill-black"></i>
+        <span>🤖 ĐẠO DIỄN AI: TỰ ĐỘNG PHÂN TÍCH PROMPT & PHỐI GÓC MÁY BRUCTA (1-CLICK)</span>
+      </button>
+
+      <!-- Bructa Cinematic Quick-Pick Toolbar -->
+      <div class="bg-[#101722] border border-[#1b2838] p-3 rounded-lg mb-3 space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="text-[11px] font-bold text-gray-300 flex items-center space-x-1">
+            <i data-lucide="sliders" class="w-3.5 h-3.5 text-cyan-400"></i>
+            <span>Hoặc chọn thủ công góc máy & ánh sáng (Nâng cao):</span>
+          </span>
+          <button type="button" onclick="generate5ShotSequence()" class="px-2 py-0.5 bg-[#182638] text-cyan-300 border border-[#233852] font-semibold text-[10px] rounded hover:bg-[#20334a] flex items-center space-x-1">
+            <i data-lucide="clapperboard" class="w-3 h-3"></i>
+            <span>🎬 Tạo Combo 5 Phân Cảnh Phim</span>
+          </button>
+        </div>
+        
+        <div class="grid grid-cols-4 gap-2 text-[10px]">
+          <div>
+            <span class="text-gray-400 block mb-0.5 font-medium">Cỡ Cảnh (Shot)</span>
+            <select id="bructaShotSelect" onchange="insertTagToPrompt(this.value); this.value='';" class="w-full bg-[#070b10] border border-[#1b2838] rounded p-1 text-gray-200 text-[10px] focus:outline-none">
+              <option value="">-- Chọn Cỡ Cảnh --</option>
+              <option value="Close-Up (CU) portrait">Close-Up (CU) - Cận cảnh</option>
+              <option value="Extreme Close-Up (ECU), macro lens">Extreme Close-Up (ECU) - Siêu cận</option>
+              <option value="Cowboy Shot (CS)">Cowboy Shot (CS) - Cao bồi</option>
+              <option value="Full Shot (FS), head to toe">Full Shot (FS) - Toàn cảnh</option>
+              <option value="Medium Shot (MS)">Medium Shot (MS) - Cảnh trung</option>
+            </select>
+          </div>
+          <div>
+            <span class="text-gray-400 block mb-0.5 font-medium">Góc Máy (Angle)</span>
+            <select id="bructaAngleSelect" onchange="insertTagToPrompt(this.value); this.value='';" class="w-full bg-[#070b10] border border-[#1b2838] rounded p-1 text-gray-200 text-[10px] focus:outline-none">
+              <option value="">-- Chọn Góc Máy --</option>
+              <option value="Low Angle, Worm's eye view">Low Angle - Góc thấp quyền lực</option>
+              <option value="High Angle, Overhead Top-down view">High Angle - Góc cao nhìn xuống</option>
+              <option value="Dutch Angle, Dutch tilt">Dutch Angle - Góc nghiêng kịch tính</option>
+              <option value="Isometric 3D Angle">Isometric 3D - Góc nhìn 45°</option>
+            </select>
+          </div>
+          <div>
+            <span class="text-gray-400 block mb-0.5 font-medium">Ống Kính (Lens)</span>
+            <select id="bructaLensSelect" onchange="insertTagToPrompt(this.value); this.value='';" class="w-full bg-[#070b10] border border-[#1b2838] rounded p-1 text-gray-200 text-[10px] focus:outline-none">
+              <option value="">-- Chọn Ống Kính --</option>
+              <option value="85mm Portrait Lens, Shallow Depth of Field">85mm Portrait (Chân dung vàng)</option>
+              <option value="24mm Wide Angle Lens, Deep Focus">24mm Wide Angle (Góc rộng bối cảnh)</option>
+              <option value="50mm Prime Lens (Nifty Fifty)">50mm Prime (Tầm mắt chuẩn)</option>
+              <option value="Anamorphic Lens, Elliptical Lens Flare, Stretched Bokeh">Anamorphic (Vệt sáng elip cine)</option>
+            </select>
+          </div>
+          <div>
+            <span class="text-gray-400 block mb-0.5 font-medium">Ánh Sáng (Lighting)</span>
+            <select id="bructaLightSelect" onchange="insertTagToPrompt(this.value); this.value='';" class="w-full bg-[#070b10] border border-[#1b2838] rounded p-1 text-gray-200 text-[10px] focus:outline-none">
+              <option value="">-- Chọn Ánh Sáng --</option>
+              <option value="Three-point lighting, Blue Key Light, Orange Fill Light">Three-point Light (3 điểm chuẩn)</option>
+              <option value="Rembrandt Lighting, Chiaroscuro, Tenebrism">Rembrandt & Chiaroscuro (Tương phản)</option>
+              <option value="Volumetric Lighting, God Rays, Atmospheric Haze">Volumetric God Rays (Tia sáng khói)</option>
+              <option value="Warm Rim Light, Hair Light, Subsurface Scattering">Warm Rim Light (Đèn viền tóc tách nền)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- ChatGPT 11 Visual Groups & Palettes for Batch Video Prompts -->
+        <div class="pt-2 border-t border-[#1b2838]">
+          <div class="flex items-center justify-between mb-1.5 text-[10px]">
+            <span class="font-bold text-cyan-400 flex items-center space-x-1">
+              <i data-lucide="palette" class="w-3 h-3"></i>
+              <span>11 Trường Phái ChatGPT & Bảng Màu:</span>
+            </span>
+          </div>
+          <div class="flex flex-wrap gap-1 text-[9px]">
+            <button type="button" onclick="insertTagToPrompt('F1 Fantasy thiên nhiên và cổ tích (Alan Lee style, leading stone path, mossy trees, soft misty light, moss green and cream palette)')" class="px-1.5 py-0.5 rounded bg-[#13231f] text-emerald-300 border border-emerald-800/50 hover:bg-emerald-900/40">F1 Cổ Tích Alan Lee</button>
+            <button type="button" onclick="insertTagToPrompt('F2 Fantasy kịch tính và tối (Frank Frazetta style, bold heroic silhouette, dark background, fiery rim light, rough rock, red/black)')" class="px-1.5 py-0.5 rounded bg-[#27151a] text-rose-300 border border-rose-800/50 hover:bg-red-900/40">F2 Fantasy Hắc Ám</button>
+            <button type="button" onclick="insertTagToPrompt('C1 Không gian lớn và ánh màu (Alena Aenami style, tiny human vs colossal structure scale, vibrant colorful sky, deep space)')" class="px-1.5 py-0.5 rounded bg-[#13222a] text-cyan-300 border border-cyan-800/50 hover:bg-cyan-900/40">C1 Vũ Trụ Aenami</button>
+            <button type="button" onclick="insertTagToPrompt('C2 Khoa học viễn tưởng và mô-đun (Syd Mead style, modular high-tech structure, mechanical panel seams, industrial lighting)')" class="px-1.5 py-0.5 rounded bg-[#1c1c28] text-indigo-300 border border-indigo-800/50 hover:bg-indigo-900/40">C2 Cơ Khí Syd Mead</button>
+            <button type="button" onclick="insertTagToPrompt('G1 Đồ họa đường nét mảng phẳng (Moebius & Kilian Eng style, crisp line-art, bold graphic silhouette, flat color planes)')" class="px-1.5 py-0.5 rounded bg-[#24172a] text-purple-300 border border-purple-800/50 hover:bg-purple-900/40">G1 Đồ Họa Moebius</button>
+            <button type="button" onclick="insertTagToPrompt('P1 Chân dung điện ảnh (Steve McCurry & Helmut Newton photographic language, intentional catchlight in eyes, 85mm shallow focus)')" class="px-1.5 py-0.5 rounded bg-[#1e2518] text-lime-300 border border-lime-800/50 hover:bg-lime-900/40">P1 Chân Dung Cine</button>
+            <button type="button" onclick="insertTagToPrompt('D1 Gothic sinh cơ khí (H.R. Giger biomechanical style, ribbed spine architecture, dark shadows, cold rim light)')" class="px-1.5 py-0.5 rounded bg-[#161c22] text-slate-300 border border-slate-700 hover:bg-slate-800">D1 Biomechanical Giger</button>
+            <button type="button" onclick="insertTagToPrompt('Teal and Orange cinema color palette, Blue Key Light, Warm Amber Fill Light')" class="px-1.5 py-0.5 rounded bg-[#122228] text-cyan-400 border border-cyan-800/40 hover:bg-cyan-900/40">Cam-Xanh</button>
+            <button type="button" onclick="insertTagToPrompt('Sunset Golden Hour and Violet Twilight color palette')" class="px-1.5 py-0.5 rounded bg-[#25152b] text-fuchsia-400 border border-purple-800/40 hover:bg-purple-900/40">Vàng-Tím</button>
+            <button type="button" onclick="insertTagToPrompt('Moss Green, Earth Brown and Pale Cream antique palette')" class="px-1.5 py-0.5 rounded bg-[#152317] text-emerald-400 border border-emerald-800/40 hover:bg-emerald-900/40">Rêu-Kem</button>
+            <button type="button" onclick="insertTagToPrompt('Dramatic Crimson Red and Deep Shadow Black palette')" class="px-1.5 py-0.5 rounded bg-[#281316] text-red-400 border border-red-800/40 hover:bg-red-900/40">Đỏ-Đen</button>
+          </div>
+        </div>
+      </div>
+
+      <textarea id="batchPromptsInput" rows="6" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-3 text-xs text-gray-200 focus:outline-none focus:border-cyan-500 font-mono" placeholder="Nhập prompt của bạn... (Hoặc chọn các thuộc tính Bructa ở trên / bấm '⚡ Nâng Cấp Chuẩn Cine')"></textarea>
+      
+      <div class="grid grid-cols-2 gap-3 mt-3">
+        <div>
+          <label class="block text-[11px] text-gray-400 mb-1">Model</label>
+          <select id="batchModelSelect" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-300">
+            <option value="Seedance 2.5">Seedance 2.5</option>
+            <option value="Seedance 2.0">Seedance 2.0</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-[11px] text-gray-400 mb-1">Thời lượng</label>
+          <select id="batchDurationSelect" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-300">
+            <option value="30 giây">30 giây</option>
+            <option value="15 giây">15 giây</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="flex justify-end space-x-2 mt-4 pt-3 border-t border-[#141e2b]">
+        <button onclick="closeModal('modalBatchPrompts')" class="px-3 py-1.5 text-xs text-gray-400 hover:text-white">Hủy</button>
+        <button onclick="submitBatchPrompts()" class="px-4 py-1.5 bg-gradient-to-r from-emerald-500 to-teal-400 text-black font-semibold text-xs rounded hover:opacity-90">Bắt đầu tạo</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ADD ACCOUNT (CHÍNH XÁC NHƯ VIDEO) -->
+  <div id="modalAddAccount" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-lg rounded-2xl p-5 shadow-2xl">
+      <!-- Header với nút chuyển 1 nick / Nhiều nick -->
+      <div class="flex justify-between items-center mb-3 pb-2 border-b border-[#141e2b]">
+        <div>
+          <h3 class="font-bold text-gray-100 text-sm flex items-center space-x-2">
+            <span id="modalAddTitle">Đăng nhập Tài khoản</span>
+            <span id="modalAddSubtitle" class="text-[10px] text-cyan-400 font-normal bg-[#0f212a] px-2 py-0.5 rounded border border-[#1b3d4a]">Tự động nạp profile</span>
+          </h3>
+          <p class="text-[11px] text-gray-400 mt-0.5">Mở trình duyệt Google Chrome, bạn tự đăng nhập và tạo profile.</p>
+        </div>
+        <div class="flex items-center space-x-2">
+          <!-- Toggle 1 nick vs Nhiều nick -->
+          <div class="inline-flex rounded-lg border border-[#1e2a3c] p-0.5 bg-[#070b10]">
+            <button type="button" id="btnModeSingle" onclick="switchAccountModalMode('single')" class="px-2.5 py-1 rounded text-[11px] font-bold bg-cyan-600 text-black shadow">1 nick</button>
+            <button type="button" id="btnModeMulti" onclick="switchAccountModalMode('multi')" class="px-2.5 py-1 rounded text-[11px] font-medium text-gray-400 hover:text-white">Nhiều nick</button>
+          </div>
+          <button onclick="closeModal('modalAddAccount')" class="text-gray-400 hover:text-white p-1"><i data-lucide="x" class="w-4 h-4"></i></button>
+        </div>
+      </div>
+
+      <!-- Chọn Nền tảng (Facebook / Google / Muse AI) -->
+      <div class="grid grid-cols-3 gap-2 mb-3">
+        <button type="button" id="btnTypeMuse" onclick="selectAccountType('muse')" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-purple-500 bg-purple-950/40 text-purple-300">
+          <i data-lucide="sparkles" class="w-3.5 h-3.5 text-purple-400"></i>
+          <span>Muse AI (Mail)</span>
+        </button>
+        <button type="button" id="btnTypeFb" onclick="selectAccountType('facebook')" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-[#1e2a3c] bg-[#0c131d] text-gray-400 hover:text-gray-200">
+          <i data-lucide="facebook" class="w-3.5 h-3.5 text-cyan-400"></i>
+          <span>Facebook (Dola)</span>
+        </button>
+        <button type="button" id="btnTypeGoogle" onclick="selectAccountType('google')" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-[#1e2a3c] bg-[#0c131d] text-gray-400 hover:text-gray-200">
+          <i data-lucide="mail" class="w-3.5 h-3.5 text-rose-400"></i>
+          <span>Google (Dola)</span>
+        </button>
+      </div>
+      <input type="hidden" id="accTypeInput" value="muse">
+      <input type="hidden" id="accModalModeInput" value="single">
+
+      <!-- Tabs chọn cách nhập: Cookie vs UID/Pass/2FA -->
+      <div class="flex border-b border-[#141e2b] mb-3 text-xs">
+        <button type="button" id="tabInputCookie" onclick="switchInputMethod('cookie')" class="px-4 py-1.5 font-bold border-b-2 border-cyan-500 text-cyan-300">
+          Cookie
+        </button>
+        <button type="button" id="tabInputUid" onclick="switchInputMethod('uid')" class="px-4 py-1.5 font-medium text-gray-400 hover:text-gray-200">
+          UID | Pass | 2FA
+        </button>
+      </div>
+
+      <!-- Khung nhập dữ liệu (1 nick hoặc Nhiều nick) -->
+      <div class="space-y-3">
+        <!-- Chế độ 1 nick -->
+        <div id="containerSingleNick" class="space-y-3">
+          <!-- Dán nhanh 1 dòng từ shop (Chuẩn HaLi AI) -->
+          <div class="bg-[#0e1622] border border-cyan-900/40 rounded-xl p-2.5">
+            <label class="block text-[11px] text-cyan-300 font-bold mb-1 flex items-center space-x-1">
+              <i data-lucide="sparkles" class="w-3.5 h-3.5 text-cyan-400"></i>
+              <span>Dán nhanh 1 dòng từ file Shop (Tự bóc UID, Pass, 2FA, Cookie, Proxy):</span>
+            </label>
+            <input type="text" id="accRawLineInput" oninput="autoParseShopLine(this.value)" class="w-full bg-[#070b10] border border-[#1b2b3d] rounded p-2 text-xs text-gray-200 font-mono focus:border-cyan-500" placeholder="UID|Pass|2FA_Secret|c_user=...|103.151.246.12:8080">
+          </div>
+
+          <div class="grid grid-cols-3 gap-2">
+            <div class="col-span-2">
+              <label class="block text-[11px] text-gray-400 mb-1">Tên hiển thị</label>
+              <input type="text" id="accNameInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200" placeholder="Nick 13">
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1">Thứ tự</label>
+              <input type="number" id="accOrderInput" value="1" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200 text-center font-bold">
+            </div>
+          </div>
+
+          <!-- Nhập theo Cookie -->
+          <div id="boxInputCookie">
+            <label class="block text-[11px] text-gray-400 mb-1">Dán Cookie tài khoản (Bắt buộc để tự vượt Captcha)</label>
+            <textarea id="accCookieInput" rows="3" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-2.5 text-xs text-gray-200 font-mono focus:border-cyan-500" placeholder="c_user=...; xs=...; datr=..."></textarea>
+          </div>
+
+          <!-- Nhập theo UID | Pass | 2FA -->
+          <div id="boxInputUid" class="hidden space-y-2">
+            <div>
+              <label class="block text-[11px] text-gray-400 mb-1" id="lblIdentifier">Facebook UID / Gmail</label>
+              <input type="text" id="accUidInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200 font-mono" placeholder="61594883821... hoặc username@gmail.com">
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block text-[11px] text-gray-400 mb-1">Mật khẩu</label>
+                <input type="password" id="accPassInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200" placeholder="••••••••">
+              </div>
+              <div>
+                <label class="block text-[11px] text-gray-400 mb-1">Mã 2FA (Secret Key Base32)</label>
+                <input type="text" id="acc2faInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200 font-mono" placeholder="JBSWY3DPEHPK3PXP">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Chế độ Nhiều nick (Textarea hàng loạt) -->
+        <div id="containerMultiNick" class="hidden space-y-2">
+          <label class="block text-[11px] text-gray-400 mb-1">Dán danh sách nhiều nick (Mỗi dòng một nick):</label>
+          <textarea id="accMultiDataInput" rows="5" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-2.5 text-xs text-gray-200 font-mono focus:border-cyan-500" placeholder="uid_1|pass_1|2fa_1|c_user=...; xs=...&#10;uid_2|pass_2|2fa_2|c_user=...; xs=..."></textarea>
+          
+          <div class="flex items-center space-x-2 text-[11px]">
+            <span class="text-gray-400">Số luồng đăng nhập đồng thời:</span>
+            <div class="inline-flex space-x-1">
+              <button type="button" onclick="setThreadVal(1, this)" class="thread-chip px-2 py-0.5 rounded bg-[#162333] text-gray-300 border border-[#22364e]">1</button>
+              <button type="button" onclick="setThreadVal(2, this)" class="thread-chip px-2 py-0.5 rounded bg-cyan-600 text-black font-bold">2</button>
+              <button type="button" onclick="setThreadVal(3, this)" class="thread-chip px-2 py-0.5 rounded bg-[#162333] text-gray-300 border border-[#22364e]">3</button>
+              <button type="button" onclick="setThreadVal(5, this)" class="thread-chip px-2 py-0.5 rounded bg-[#162333] text-gray-300 border border-[#22364e]">5</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- CẤU HÌNH PROXY (3 CHẾ ĐỘ CHUẨN VIDEO) -->
+        <div class="pt-2 border-t border-[#141e2b] space-y-2">
+          <label class="block text-[11px] text-gray-400 font-semibold">ĐƯỜNG RA VÀ TÀI NGUYÊN PROXY</label>
+          <div class="grid grid-cols-3 gap-2">
+            <button type="button" id="btnProxyRotate" onclick="selectProxyMode('rotate')" class="proxy-mode-btn py-1.5 rounded-lg text-xs font-semibold border border-cyan-500 bg-cyan-950/40 text-cyan-300 transition">Proxy xoay</button>
+            <button type="button" id="btnProxyDirect" onclick="selectProxyMode('direct')" class="proxy-mode-btn py-1.5 rounded-lg text-xs font-semibold border border-[#1a2638] bg-[#0c121a] text-gray-400 hover:text-gray-200 transition">IP gốc (Máy thật)</button>
+            <button type="button" id="btnProxyCustom" onclick="selectProxyMode('custom')" class="proxy-mode-btn py-1.5 rounded-lg text-xs font-semibold border border-[#1a2638] bg-[#0c121a] text-gray-400 hover:text-gray-200 transition">Proxy riêng</button>
+          </div>
+          <input type="hidden" id="accProxyMode" value="rotate">
+
+          <div id="boxCustomProxyInput">
+            <input type="text" id="accProxyInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200 font-mono" placeholder="Nhập proxy (ip:port hoặc ip:port:user:pass)">
+          </div>
+
+          <!-- Tuỳ chọn tự động đăng nhập ngầm chuẩn HaLi AI -->
+          <div class="space-y-1.5 pt-2 border-t border-[#141e2b] text-[11px] text-gray-300">
+            <div class="flex items-center space-x-2">
+              <input type="checkbox" id="chkAutoLoginDola" checked class="rounded bg-[#070b10] border-gray-700 text-emerald-500">
+              <label for="chkAutoLoginDola" class="cursor-pointer select-none">
+                <span class="text-emerald-400 font-bold">⚡ Tự động đăng nhập Dola AI ngầm</span> (Tự giải 2FA TOTP & bấm Xác nhận OAuth)
+              </label>
+            </div>
+            <div class="flex items-center space-x-2">
+              <input type="checkbox" id="chkAutoLaunchChrome" class="rounded bg-[#070b10] border-gray-700 text-cyan-500">
+              <label for="chkAutoLaunchChrome" class="cursor-pointer select-none">
+                <span class="text-gray-400">🌐 Mở thêm cửa sổ Google Chrome thật</span> (Để kiểm tra thủ công)
+              </label>
+            </div>
+          </div>
+
+          <p class="text-[10px] text-gray-500 italic bg-[#06090e] p-2 rounded border border-[#111924]">
+            💡 <span class="text-cyan-400">LƯU Ý:</span> Tool sẽ tự động kết nối Dola AI bằng tài khoản Facebook, giải mã 2FA và lưu phiên vĩnh viễn!
+          </p>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="flex justify-end space-x-2 mt-4 pt-3 border-t border-[#141e2b]">
+        <button onclick="closeModal('modalAddAccount')" class="px-3.5 py-1.5 text-xs text-gray-400 hover:text-white">Hủy</button>
+        <button onclick="submitAddAccountFlow()" class="px-5 py-1.5 bg-gradient-to-r from-cyan-500 to-emerald-400 text-black font-extrabold text-xs rounded-lg hover:opacity-90 transition flex items-center space-x-1.5">
+          <i data-lucide="log-in" class="w-3.5 h-3.5"></i>
+          <span id="btnSubmitLoginText">Đăng nhập tài khoản</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: BATCH IMPORT ACCOUNTS -->
+  <div id="modalImport" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-lg rounded-xl p-5 shadow-2xl">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="font-bold text-gray-100 text-sm">Import Tài Khoản FB & Google Hàng Loạt</h3>
+        <button onclick="closeModal('modalImport')" class="text-gray-400 hover:text-white"><i data-lucide="x" class="w-4 h-4"></i></button>
+      </div>
+      <div class="bg-[#101923] border border-[#1b2a3d] p-2.5 rounded-lg mb-2 text-[11px] text-gray-300">
+        <span class="text-emerald-400 font-bold">✓ Tự động nhận diện FB & Google:</span> Hệ thống tự nhận diện nếu dòng chứa <code>@gmail.com</code> sẽ lưu dạng Google Account; nếu chứa <code>UID</code> / <code>c_user</code> sẽ lưu dạng Facebook.
+      </div>
+      <p class="text-[11px] text-gray-400 mb-1.5">Dán danh sách mỗi dòng theo một trong các định dạng:</p>
+      <div class="text-[10px] text-cyan-400/90 font-mono mb-2 bg-[#06090e] p-1.5 rounded border border-[#131d2a]">
+        • <b>Facebook:</b> Tên|Proxy|Cookie hoặc UID|Pass|2FA|Cookie|Proxy<br>
+        • <b>Google:</b> Email|Pass|MailKhôiPhục|Proxy hoặc Email|Proxy|Cookie<br>
+        • <b>Đơn giản:</b> Email|Proxy (Mở Chrome bấm đăng nhập lần đầu)
+      </div>
+      <textarea id="importDataInput" rows="7" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-3 text-xs text-gray-200 focus:outline-none focus:border-cyan-500 font-mono" placeholder="myclone@gmail.com|160.250.166.25:10060&#10;FB_Clone_01|160.250.166.36:10668|c_user=6159501192; xs=...&#10;100089274921029|Pass123|JBSWY3DPEHPK3PXP|c_user=...|103.151.246.12:8080"></textarea>
+      
+      <div class="flex items-center space-x-2 mt-2 pt-2 border-t border-[#141e2b] text-[11px] text-gray-300">
+        <input type="checkbox" id="chkBatchAutoLogin" checked class="rounded bg-[#070b10] border-gray-700 text-emerald-500">
+        <label for="chkBatchAutoLogin" class="cursor-pointer select-none">
+          <span class="text-emerald-400 font-bold">⚡ Tự động đăng nhập ngầm vào Dola AI</span> cho tất cả các nick vừa thêm (Dùng 2FA TOTP & vượt xác nhận)
+        </label>
+      </div>
+
+      <div class="flex justify-end space-x-2 mt-3 pt-3 border-t border-[#141e2b]">
+        <button onclick="closeModal('modalImport')" class="px-3 py-1.5 text-xs text-gray-400 hover:text-white">Hủy</button>
+        <button onclick="submitBatchImport()" class="px-4 py-1.5 bg-emerald-500 text-black font-semibold text-xs rounded hover:opacity-90">Import Tất Cả</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: NẠP COOKIE DOLA (CHUẨN HALI AI) -->
+  <div id="modalPasteCookie" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-lg rounded-2xl p-5 shadow-2xl">
+      <div class="flex justify-between items-center mb-3 pb-2 border-b border-[#141e2b]">
+        <div>
+          <h3 class="font-bold text-gray-100 text-sm flex items-center space-x-2">
+            <span id="pasteCookieTitle">Nạp Cookie Dola AI Cho Nick</span>
+          </h3>
+          <p class="text-[11px] text-gray-400 mt-0.5">Dán JSON từ Cookie-Editor, Netscape 7 cột, hoặc chuỗi Header sessionid=...</p>
+        </div>
+        <button onclick="closeModal('modalPasteCookie')" class="text-gray-400 hover:text-white p-1"><i data-lucide="x" class="w-4 h-4"></i></button>
+      </div>
+      <input type="hidden" id="pasteCookieAccountId">
+      <textarea id="pasteCookieText" rows="6" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-2.5 text-xs text-gray-200 font-mono focus:border-cyan-500" placeholder="[ { &quot;name&quot;: &quot;sessionid&quot;, &quot;value&quot;: &quot;...&quot; } ] hoặc sessionid=...; sid_tt=..."></textarea>
+      <div id="pasteCookieMsg" class="text-[11px] mt-2 hidden"></div>
+      <div class="flex justify-end space-x-2 mt-4 pt-3 border-t border-[#141e2b]">
+        <button onclick="closeModal('modalPasteCookie')" class="px-3.5 py-1.5 text-xs text-gray-400 hover:text-white">Hủy</button>
+        <button onclick="submitPasteCookie()" class="px-4 py-1.5 bg-gradient-to-r from-cyan-500 to-emerald-400 text-black font-extrabold text-xs rounded-lg hover:opacity-90">Lưu Cookie</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ADD ASSET -->
+  <div id="modalAddAsset" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-md rounded-xl p-5 shadow-2xl">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="font-bold text-gray-100 text-sm">Thêm Nhân Vật / Asset Mới</h3>
+        <button onclick="closeModal('modalAddAsset')" class="text-gray-400 hover:text-white"><i data-lucide="x" class="w-4 h-4"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-[11px] text-gray-400 mb-1">Tên nhân vật</label>
+          <input type="text" id="assetNameInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200" placeholder="Tiểu Vũ (Nữ sát thủ)">
+        </div>
+        <div>
+          <label class="block text-[11px] text-gray-400 mb-1">Mã định danh (Character Code)</label>
+          <input type="text" id="assetCodeInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200" placeholder="CHAR_V01">
+        </div>
+        <div>
+          <label class="block text-[11px] text-gray-400 mb-1">URL Ảnh mẫu (Face Reference)</label>
+          <input type="text" id="assetUrlInput" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200" placeholder="https://...">
+        </div>
+        <div>
+          <label class="block text-[11px] text-gray-400 mb-1">Mô tả đặc điểm ngoại hình</label>
+          <textarea id="assetDescInput" rows="2" class="w-full bg-[#070b10] border border-[#172333] rounded p-2 text-xs text-gray-200" placeholder="Tóc đen dài, mắt nâu, áo sơ mi trắng..."></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 mt-4 pt-3 border-t border-[#141e2b]">
+        <button onclick="closeModal('modalAddAsset')" class="px-3 py-1.5 text-xs text-gray-400 hover:text-white">Hủy</button>
+        <button onclick="submitAddAsset()" class="px-4 py-1.5 bg-emerald-500 text-black font-semibold text-xs rounded hover:opacity-90">Lưu Nhân Vật</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: VIDEO PLAYER (XEM VIDEO SIÊU MƯỢT NHƯ TRONG CLIP) -->
+  <div id="modalVideoPlayer" class="hidden fixed inset-0 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 z-50">
+    <div class="bg-[#0b1017] border border-[#1b2a3c] rounded-2xl max-w-md w-full overflow-hidden shadow-2xl flex flex-col">
+      <div class="flex justify-between items-center px-4 py-3 border-b border-[#141e2b] bg-[#070b10]">
+        <div class="flex items-center space-x-2">
+          <i data-lucide="play-circle" class="w-4 h-4 text-cyan-400"></i>
+          <span id="playerVideoTitle" class="font-bold text-gray-200 text-xs">Video Player (Seedance 2.5 • Siêu Mượt)</span>
+        </div>
+        <button onclick="closeModal('modalVideoPlayer'); pauseVideoPlayer();" class="text-gray-400 hover:text-white p-1">
+          <i data-lucide="x" class="w-4 h-4"></i>
+        </button>
+      </div>
+      <div class="relative bg-black flex items-center justify-center aspect-[9/16] max-h-[72vh] overflow-hidden">
+        <video id="studioMainPlayer" class="w-full h-full object-contain" controls autoplay loop playsinline preload="auto">
+          <source id="studioPlayerSource" src="/api/download-video/video_8.mp4" type="video/mp4">
+          Trình duyệt không hỗ trợ xem video trực tiếp.
+        </video>
+      </div>
+      <div class="p-3 bg-[#080c11] border-t border-[#141e2b] flex items-center justify-between text-xs">
+        <div class="text-[11px] text-gray-400">
+          <span class="text-emerald-400 font-bold">✓ 30 giây</span> • Seedance 2.5 • Siêu mượt
+        </div>
+        <a id="playerDownloadBtn" href="/api/download-video/video_8.mp4" download="video_8.mp4" class="px-3.5 py-1.5 bg-gradient-to-r from-cyan-500 to-emerald-400 text-black font-bold text-xs rounded hover:opacity-90 flex items-center space-x-1.5 cursor-pointer">
+          <i data-lucide="download" class="w-3.5 h-3.5"></i>
+          <span>Tải Video MP4</span>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- APP JAVASCRIPT -->
+  <script src="/static/js/app.js?v=2.5.2"></script>
+</body>
+</html>
