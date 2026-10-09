@@ -260,3 +260,10 @@ Mẫu một mục:
 - Nguyên nhân gốc: check_env.py kiểm Python, thư viện, Chrome nhưng không kiểm cổng; lỗi của uvicorn bằng tiếng Anh, không nói cách xử lý.
 - Quy tắc: mọi tài nguyên server cần (cổng, thư mục dữ liệu, Chrome) đều phải kiểm trước khi khởi động và báo bằng tiếng Việt kèm cách xử lý (PID, lệnh taskkill).
 - Kiểm: `tests/test_check_env_port.py`; thử tay: mở KHOI_DONG.bat hai lần, cửa sổ thứ hai phải báo "Cổng 8000 đang bị chiếm bởi PID ..." và không khởi động server.
+
+## BH-36 · Báo nhầm captcha trên trang Dola bình thường
+- Ngày: 2026-10-09 · Giai đoạn: 1 · Mã: Q4
+- Triệu chứng: job cứ Tạm dừng "Nick bị Dola yêu cầu kéo mảnh ghép" trong khi mở Chrome thật thì trang Dola bình thường, không có captcha.
+- Nguyên nhân gốc: bộ phát hiện coi "có bất kỳ icon lỗi nào trong DOM, kể cả ẩn" là captcha; nhánh khác chỉ cần chữ "verify" (khớp cả "verified") là báo captcha. Dấu hiệu quá rộng nên dương tính giả.
+- Quy tắc: một dấu hiệu chỉ được dùng để tạm dừng job khi nó là đặc trưng riêng của tình huống đó (khung captcha đang hiển thị và có kích thước, hoặc câu chữ nguyên văn của captcha). Mọi lần tạm dừng phải kèm ảnh chụp để người dùng đối chiếu.
+- Kiểm: `tests/test_captcha_detect.py`; thử tay: trang Dola thường không được báo captcha.

@@ -88,7 +88,6 @@ CAPTCHA_KEYWORDS = [
     "kéo mảnh ghép", "xác minh để tiếp tục", "vui lòng hoàn tất xác minh",
     "drag the slider", "security verification",
 ]
-ERROR_ICON_SELECTOR = "svg[class*='error'], div[class*='error-icon'], [data-icon='exclamation-circle']"
 
 RE_WRONG_PASS = re.compile(
     r'password you.{0,3}ve entered is incorrect|incorrect password|wrong credentials|'
@@ -512,16 +511,22 @@ def _click_if_visible(page, selectors, timeout_ms, what: str, account_id=None) -
 
 
 def _detect_captcha(page) -> bool:
-    """Có khung/chữ yêu cầu kéo mảnh ghép (slide captcha) trên trang không."""
+    """Có khung/chữ yêu cầu kéo mảnh ghép (slide captcha) đang HIỂN THỊ trên trang không.
+
+    BH-36: chỉ tính khung captcha đang hiện hoặc câu chữ đặc trưng của captcha; icon lỗi ẩn
+    trong DOM hay chữ "verify" nằm trong từ khác (verified) KHÔNG phải captcha.
+    """
     try:
         frames = page.locator(CAPTCHA_SELECTOR)
         for i in range(frames.count()):
-            if frames.nth(i).is_visible():
+            el = frames.nth(i)
+            if not el.is_visible():
+                continue
+            box = el.bounding_box()
+            if box and box["width"] >= 40 and box["height"] >= 40:
                 return True
         body_t = _safe_body_text(page).lower()
         if any(kw in body_t for kw in CAPTCHA_KEYWORDS):
-            return True
-        if page.locator(ERROR_ICON_SELECTOR).count() > 0:
             return True
     except Exception as e:  # noqa: BLE001
         log.debug("Kiểm tra captcha lỗi: %s", str(e)[:80])
@@ -1196,8 +1201,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         time.sleep(3)
 
     if not conv_id:
-        body_t = _safe_body_text(page).lower()
-        if any(kw in body_t for kw in ["verify", "xác minh", "puzzle", "kéo mảnh"]):
+        if _detect_captcha(page):
             _handle_captcha(job_id, acc, page)
         else:
             _fail_job(job_id, account_id, JobStatus.THAT_BAI, Reason.NO_NEW_CONV, page, "no_new_conv", module="Engine")
