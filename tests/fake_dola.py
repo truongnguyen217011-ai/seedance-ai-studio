@@ -574,15 +574,27 @@ class FakeDola:
     # --- HTTP tiện ích (dùng urllib để không phụ thuộc thư viện ngoài) ---
     def _request(self, method: str, path: str, payload: Optional[dict] = None, cookies: Optional[dict] = None) -> Any:
         import urllib.request
+        import urllib.error
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(self.base_url + path, data=data, method=method)
         req.add_header("content-type", "application/json")
+        req.add_header("Connection", "close")
         if cookies:
             req.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            ctype = resp.headers.get("content-type", "")
-            return json.loads(raw) if "json" in ctype else raw
+        last_err = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read()
+                    ctype = resp.headers.get("content-type", "")
+                    return json.loads(raw) if "json" in ctype else raw
+            except (ConnectionResetError, ConnectionAbortedError, urllib.error.URLError, OSError) as e:
+                last_err = e
+                if attempt == 2:
+                    raise
+                time.sleep(0.5)
+        if last_err:
+            raise last_err
 
     def control(self, **kwargs) -> Dict[str, Any]:
         return self._request("POST", "/__control", kwargs)

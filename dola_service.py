@@ -1328,8 +1328,8 @@ def _handle_no_credit(job_id: int, acc: dict) -> None:
     # Không tính là một lần thử của job vì lỗi thuộc về nick, không phải job
     _set_job_fields(job_id, attempts=max(0, int(_load_job(job_id).get("attempts") or 0) - 1))
     msg = Reason.NO_CREDIT_WAIT.format(name=acc["name"])
-    update_job_status(job_id, JobStatus.CHO, msg, 0)
     log_event(f"Job #{job_id}: {msg}", "WARNING", "Credit", job_id=job_id, account_id=acc["id"])
+    update_job_status(job_id, JobStatus.CHO, msg, 0)
 
 
 def _handle_captcha(job_id: int, acc: dict, page) -> None:
