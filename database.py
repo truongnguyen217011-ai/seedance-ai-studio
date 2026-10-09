@@ -1,20 +1,44 @@
+"""Cơ sở dữ liệu SQLite (docs/KIEN_TRUC.md mục 1.7, 1.8, 3).
+
+Mọi nơi khác chỉ được mở CSDL qua get_connection(). Thay đổi schema chỉ bằng migration trong init_db().
+"""
 import sqlite3
-import json
-import os
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "studio.db")
+import config
+from constants import JobStatus, LEGACY_JOB_STATUS_MAP, Reason
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+# Giữ tên cũ để mã cũ còn tham chiếu database.DB_PATH không vỡ
+DB_PATH = config.DB_PATH
+
+
+def get_connection() -> sqlite3.Connection:
+    """Kết nối SQLite dùng chung: timeout 30s, WAL, busy_timeout, khóa ngoại, row_factory=Row."""
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _table_columns(cursor, table: str) -> set:
+    return {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(cursor, table: str, column: str, decl: str) -> bool:
+    """Thêm cột nếu chưa có (kiểm bằng PRAGMA table_info). Trả về True nếu vừa thêm."""
+    if column in _table_columns(cursor, table):
+        return False
+    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    return True
+
 
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
-    
-    # Bảng tài khoản (Facebook Clone/Via hoặc Google Account + Proxy)
+
+    # ---- Tạo bảng (CSDL mới) ----
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,86 +50,13 @@ def init_db():
         status TEXT DEFAULT 'ready',
         profile_dir TEXT,
         cookies TEXT,
-        credits INTEGER DEFAULT 0,
+        credits INTEGER,
         last_used TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
-    # Safe migrations for existing databases
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN account_type TEXT DEFAULT 'facebook'")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN email TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN fb_pass TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN fb_2fa TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN login_method TEXT DEFAULT 'facebook'")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN session_expires TIMESTAMP")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN last_check TIMESTAMP")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN credits_date TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN rest_until TIMESTAMP")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN rest_reason TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN tokens_balance INTEGER DEFAULT 1000000000")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN otp_key TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE accounts ADD COLUMN mail_provider TEXT DEFAULT 'dongvanfb'")
-    except Exception:
-        pass
-
-    # Safe migrations for jobs
-    try:
-        cursor.execute("ALTER TABLE jobs ADD COLUMN batch_id TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE jobs ADD COLUMN clip_index INTEGER")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE jobs ADD COLUMN character_name TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE jobs ADD COLUMN scene_description TEXT")
-    except Exception:
-        pass
-    
-    # Bảng Hàng đợi Jobs (Tạo video)
-    cursor.execute("""
+    cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id INTEGER,
@@ -113,8 +64,8 @@ def init_db():
         prompt TEXT NOT NULL,
         model TEXT DEFAULT 'Seedance 2.5',
         duration TEXT DEFAULT '30 giây',
-        status TEXT DEFAULT 'Đang chờ',
-        status_message TEXT DEFAULT 'Chờ xử lý',
+        status TEXT DEFAULT '{JobStatus.CHO}',
+        status_message TEXT DEFAULT '',
         progress INTEGER DEFAULT 0,
         video_url TEXT,
         local_video_path TEXT,
@@ -125,7 +76,7 @@ def init_db():
     )
     """)
 
-    # Bảng Hàng đợi Tạo Ảnh
+    # Bảng ảnh / asset giữ nguyên (giai đoạn 5 mới gỡ)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS images (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,8 +92,7 @@ def init_db():
         FOREIGN KEY (account_id) REFERENCES accounts (id)
     )
     """)
-    
-    # Bảng Kho Nhân Vật & Assets
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS assets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,48 +105,147 @@ def init_db():
     )
     """)
 
-    # Bảng Nhật ký hệ thống (System Logs)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS system_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         level TEXT DEFAULT 'INFO',
         module TEXT DEFAULT 'System',
         message TEXT NOT NULL,
+        job_id INTEGER,
+        account_id INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
-    
-    # Bảng Cài đặt
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT
     )
     """)
-    
-    # Cài đặt mặc định
+
+    # ---- Migration cột cho CSDL cũ ----
+    account_columns = [
+        ("account_type", "TEXT DEFAULT 'facebook'"),
+        ("email", "TEXT"),
+        ("fb_pass", "TEXT"),
+        ("fb_2fa", "TEXT"),
+        ("login_method", "TEXT DEFAULT 'facebook'"),
+        ("session_expires", "TIMESTAMP"),
+        ("last_check", "TIMESTAMP"),
+        ("credits_date", "TEXT"),
+        ("rest_until", "TIMESTAMP"),
+        ("rest_reason", "TEXT"),
+        ("tokens_balance", "INTEGER"),
+        ("otp_key", "TEXT"),
+        ("mail_provider", "TEXT DEFAULT 'dongvanfb'"),
+        # Giai đoạn 1 (KIEN_TRUC.md mục 3)
+        ("busy_job_id", "INTEGER"),
+        ("needs_manual", "TEXT"),
+        ("last_error", "TEXT"),
+        ("last_ip", "TEXT"),
+        ("chrome_ok", "INTEGER"),
+        # Số lần lỗi kết nối Dola liên tiếp (chưa vào được trang); về 0 khi nick vào được trang (KIEN_TRUC.md mục 4)
+        ("consecutive_errors", "INTEGER DEFAULT 0"),
+    ]
+    for col, decl in account_columns:
+        _add_column_if_missing(cursor, "accounts", col, decl)
+
+    job_columns = [
+        ("batch_id", "TEXT"),
+        ("clip_index", "INTEGER"),
+        ("character_name", "TEXT"),
+        ("scene_description", "TEXT"),
+        # Giai đoạn 1
+        ("batch_name", "TEXT"),
+        ("seq", "INTEGER"),
+        ("prompt_final", "TEXT"),
+        ("attempts", "INTEGER DEFAULT 0"),
+        ("started_at", "TIMESTAMP"),
+        ("finished_at", "TIMESTAMP"),
+    ]
+    for col, decl in job_columns:
+        _add_column_if_missing(cursor, "jobs", col, decl)
+
+    _add_column_if_missing(cursor, "system_logs", "job_id", "INTEGER")
+    _add_column_if_missing(cursor, "system_logs", "account_id", "INTEGER")
+
+    # ---- Migration trạng thái job cũ → 5 trạng thái chuẩn ----
+    for old_status, new_status in LEGACY_JOB_STATUS_MAP.items():
+        cursor.execute("UPDATE jobs SET status = ? WHERE status = ?", (new_status, old_status))
+    cursor.execute("UPDATE jobs SET attempts = 0 WHERE attempts IS NULL")
+
+    # ---- Cài đặt mặc định (giữ giá trị người dùng đã có) ----
     defaults = {
-        "max_concurrent_jobs": "5",
+        "max_concurrent_jobs": str(config.DEFAULT_MAX_BROWSERS),
+        "chrome_path": "",
+        "dola_base_url": "",
         "default_model": "Seedance 2.5",
         "default_duration": "30 giây",
         "proxy_type": "http",
         "auto_download": "true",
-        "delay_between_jobs": "5"
+        "delay_between_jobs": "5",
     }
     for k, v in defaults.items():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-        
+
     conn.commit()
     conn.close()
 
-def log_event(message: str, level: str = "INFO", module: str = "System"):
+
+def reset_orphans_on_startup() -> int:
+    """Lúc khởi động: job 'Đang chạy' mồ côi → 'Chờ', bỏ khóa nick. Trả về số job đã reset."""
+    conn = get_connection()
     try:
-        conn = get_connection()
-        conn.execute("INSERT INTO system_logs (level, module, message) VALUES (?, ?, ?)", (level, module, message))
+        cur = conn.execute(
+            "UPDATE jobs SET status = ?, status_message = ?, progress = 0, updated_at = CURRENT_TIMESTAMP WHERE status = ?",
+            (JobStatus.CHO, Reason.APP_RESTARTED, JobStatus.DANG_CHAY),
+        )
+        reset_count = cur.rowcount if cur.rowcount is not None else 0
+        conn.execute("UPDATE accounts SET busy_job_id = NULL WHERE busy_job_id IS NOT NULL")
         conn.commit()
+    finally:
         conn.close()
-    except Exception:
-        pass
+    return reset_count
+
+
+def get_setting(key: str, default=None):
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    finally:
+        conn.close()
+    if row is None or row["value"] is None:
+        return default
+    return row["value"]
+
+
+def get_int_setting(key: str, default: int) -> int:
+    raw = get_setting(key, None)
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def set_setting(key: str, value) -> None:
+    conn = get_connection()
+    try:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_event(message: str, level: str = "INFO", module: str = "System", job_id=None, account_id=None):
+    """Wrapper giữ tương thích với mã cũ; việc ghi thật nằm ở logger.log_event."""
+    import logger as _logger  # import muộn để tránh vòng import
+    _logger.log_event(message, level, module, job_id=job_id, account_id=account_id)
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 if __name__ == "__main__":
     init_db()

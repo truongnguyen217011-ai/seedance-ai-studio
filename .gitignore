@@ -16,13 +16,9 @@ outputs/
 *.jpg
 *.jpeg
 
-# Extracted & Temporary
+# Extracted & Temporary (script thử tay để trong scratch/, không dùng mẫu test_*.py vì sẽ quét nhầm tests/)
 hali_extracted/
 scratch/
-test_*.py
-inspect_*.py
-diagnose_*.py
-check_*.py
 
 # Environment & Database (Chứa tài khoản, 2FA, token mật)
 .env
@@ -30,3 +26,11 @@ venv/
 .venv/
 studio.db
 *.db
+
+# File .bat mở Chrome theo máy tác giả (không đưa vào repo, xem BH-10)
+MO_CHROME_ACC_*.bat
+
+# check_env.py là mã thật của dự án, không phải script tạm
+
+# Log, anh chup loi, goi chan doan (du lieu may nguoi dung)
+logs/

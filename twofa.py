@@ -6,9 +6,12 @@ Bao gồm cả bù trừ thời gian (Clock Drift) [-30s, Hiện tại, +30s]
 import base64
 import hashlib
 import hmac
+import logging
 import struct
 import time
 import re
+
+log = logging.getLogger("twofa")
 
 def clean_base32_key(secret: str) -> str:
     """
@@ -67,8 +70,9 @@ def get_totp_candidates(secret: str, timestamp: int = None) -> list[str]:
             code = generate_totp_code(secret, t)
             if code not in candidates:
                 candidates.append(code)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - secret hỏng ở một mốc giờ: bỏ ứng viên đó, không chặn mốc khác (BH-08)
+            log.debug("Không tạo được mã TOTP tại mốc %s: %s", t, e)
+            continue
     return candidates
 
 if __name__ == "__main__":

@@ -1,3 +1,83 @@
+// Nếu CDN lucide không tải được (máy không có mạng), vẫn phải chạy được app: thay bằng bản rỗng
+if (typeof window !== 'undefined' && !window.lucide) {
+  window.lucide = { createIcons() {} };
+  console.warn('Không tải được thư viện icon lucide từ CDN; giao diện chạy không có icon.');
+}
+
+// ==================== HẰNG SỐ & TIỆN ÍCH CHUNG ====================
+// Khớp đúng 5 trạng thái trong constants.JobStatus (docs/KIEN_TRUC.md mục 4). Không viết chuỗi trạng thái tay ở nơi khác.
+const JOB_STATUS = Object.freeze({
+  CHO: 'Chờ',
+  DANG_CHAY: 'Đang chạy',
+  HOAN_THANH: 'Hoàn thành',
+  THAT_BAI: 'Thất bại',
+  TAM_DUNG: 'Tạm dừng'
+});
+
+// Cột accounts.needs_manual (constants.NeedsManual)
+const NEEDS_MANUAL_LABEL = Object.freeze({
+  captcha: { text: 'Cần kéo captcha', cls: 'bg-[#2a2210] text-amber-300 border-amber-700/60' },
+  login: { text: 'Cần đăng nhập lại', cls: 'bg-[#2a1215] text-rose-300 border-rose-800/60' },
+  proxy: { text: 'Proxy lỗi', cls: 'bg-[#2a1215] text-rose-300 border-rose-800/60' }
+});
+
+let currentTab = 'video';
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Gọi API, trả JSON; ném lỗi có nội dung đọc được khi HTTP lỗi hoặc mất mạng
+async function apiJson(url, options) {
+  const res = await fetch(url, options);
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    let detail = data && (data.detail || data.message);
+    if (detail && typeof detail !== 'string') detail = JSON.stringify(detail);
+    throw new Error(detail || `Máy chủ trả lỗi HTTP ${res.status}`);
+  }
+  return data || {};
+}
+
+// ==================== TOAST (thông báo góc màn hình) ====================
+function showToast(msg, type = 'info', timeoutMs = 4500) {
+  const container = document.getElementById('toastContainer');
+  if (!container) { console.log(`[toast:${type}]`, msg); return; }
+  const styles = {
+    info: 'border-cyan-700/60 text-cyan-200 bg-[#0b1a22]',
+    success: 'border-emerald-700/60 text-emerald-200 bg-[#0b2019]',
+    warning: 'border-amber-700/60 text-amber-200 bg-[#231b0b]',
+    error: 'border-red-700/60 text-red-200 bg-[#2a1215]'
+  };
+  const icons = { info: 'info', success: 'check-circle', warning: 'alert-triangle', error: 'x-circle' };
+  const el = document.createElement('div');
+  el.className = `pointer-events-auto border rounded-lg px-3 py-2 text-[11px] shadow-xl flex items-start space-x-2 transition-opacity duration-300 ${styles[type] || styles.info}`;
+  el.innerHTML = `<i data-lucide="${icons[type] || 'info'}" class="w-3.5 h-3.5 mt-0.5 shrink-0"></i><span class="flex-1 break-words">${escapeHtml(msg)}</span><button class="shrink-0 opacity-60 hover:opacity-100" title="Đóng">✕</button>`;
+  el.querySelector('button').onclick = () => el.remove();
+  container.appendChild(el);
+  if (window.lucide) lucide.createIcons({ nodes: [el] });
+  while (container.children.length > 5) container.removeChild(container.firstChild);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 350); }, timeoutMs);
+}
+
+// Báo lỗi mạng/API: ghi console + toast, nhưng không spam cùng một lỗi mỗi 3 giây
+const _lastFetchErrorAt = {};
+function reportFetchError(context, err) {
+  console.error(context + ':', err);
+  const now = Date.now();
+  if (_lastFetchErrorAt[context] && now - _lastFetchErrorAt[context] < 15000) return;
+  _lastFetchErrorAt[context] = now;
+  const detail = err && err.message ? err.message : String(err);
+  showToast(`${context}: ${detail}`, 'error');
+}
+
 // Tab switching
 function switchTab(tabId) {
   const tabs = ['overview', 'image', 'video', 'tut', 'assets', 'accounts', 'check-media', 'audio', 'logs', 'settings'];
@@ -12,12 +92,15 @@ function switchTab(tabId) {
   const activeNav = document.getElementById(`nav-${tabId}`);
   if (activeTab) activeTab.classList.remove('hidden');
   if (activeNav) activeNav.classList.add('sidebar-active');
+  currentTab = tabId;
 
   // Load specific tab data on switch
   if (tabId === 'image') fetchImages();
   if (tabId === 'assets') fetchAssets();
   if (tabId === 'check-media') loadNickMedia();
   if (tabId === 'logs') fetchLogs();
+  if (tabId === 'settings') loadSettings();
+  startLogsAutoRefresh(tabId === 'logs');
 }
 
 // Modal controls
@@ -57,22 +140,101 @@ async function fetchStats() {
       document.getElementById('statTotalAssets').innerText = data.total_assets || 0;
     }
   } catch (err) {
-    console.error('Lỗi lấy thống kê:', err);
+    reportFetchError('Lỗi lấy thống kê', err);
+  }
+}
+
+// 1b. Tình trạng hệ thống (GET /api/health, làm mới mỗi 10 giây)
+async function fetchHealth() {
+  const textEl = document.getElementById('headerHealthText');
+  const dotEl = document.getElementById('headerHealthDot');
+  const boxEl = document.getElementById('headerHealth');
+  const footerEl = document.getElementById('footerVersion');
+  if (!textEl) return;
+  try {
+    const h = await apiJson('/api/health');
+    const version = h.version ? `v${h.version}` : 'v?';
+    const chromeOk = h.chrome_found === true;
+    const active = (h.active_browsers === null || h.active_browsers === undefined) ? '?' : h.active_browsers;
+    const max = (h.max_browsers === null || h.max_browsers === undefined) ? '?' : h.max_browsers;
+    const chromeHtml = chromeOk
+      ? `<span class="text-emerald-400">Chrome: OK</span>`
+      : `<span class="text-red-400 font-bold">Chrome: Thiếu</span> <span class="text-red-300">(chạy CAI_TRINH_DUYET.bat)</span>`;
+    const workerHtml = h.worker_alive === false ? ` · <span class="text-red-400 font-bold">Worker dừng</span>` : '';
+    const dbHtml = h.db_ok === false ? ` · <span class="text-red-400 font-bold">CSDL lỗi</span>` : '';
+    textEl.innerHTML = `${escapeHtml(version)} · ${chromeHtml} · Trình duyệt đang mở ${escapeHtml(active)}/${escapeHtml(max)}${workerHtml}${dbHtml}`;
+    const healthy = h.ok !== false && chromeOk && h.worker_alive !== false && h.db_ok !== false;
+    if (dotEl) dotEl.className = `w-2 h-2 rounded-full ${healthy ? 'bg-emerald-400 animate-pulse' : 'bg-red-500 animate-pulse'}`;
+    if (boxEl) boxEl.className = `flex items-center space-x-1.5 px-2.5 py-1 rounded-full border ${healthy ? 'bg-[#0e171e] border-[#16272b] text-gray-300' : 'bg-[#2a1215] border-red-800/60 text-gray-200'}`;
+    if (boxEl) boxEl.title = `Chrome: ${h.chrome_path || 'không tìm thấy'}`;
+    if (footerEl) footerEl.innerText = `Seedance AI Studio ${version}`;
+  } catch (err) {
+    textEl.innerHTML = `<span class="text-red-400 font-bold">Mất kết nối máy chủ</span>`;
+    if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-red-500';
+    if (boxEl) boxEl.className = 'flex items-center space-x-1.5 px-2.5 py-1 rounded-full border bg-[#2a1215] border-red-800/60 text-gray-200';
+    reportFetchError('Không lấy được tình trạng hệ thống', err);
   }
 }
 
 // 2. Fetch and Render Video Jobs
+function jobStatusBadge(status, progress) {
+  const base = 'inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-semibold border whitespace-nowrap';
+  const pct = Number.isFinite(Number(progress)) ? Math.max(0, Math.min(100, Math.round(Number(progress)))) : 0;
+  switch (status) {
+    case JOB_STATUS.CHO:
+      return `<span class="${base} bg-[#1a2333] text-gray-400 border-[#233145]"><span>Chờ</span></span>`;
+    case JOB_STATUS.DANG_CHAY:
+      return `<span class="${base} bg-[#11242c] text-cyan-400 border-[#1b3945]"><span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span><span>Đang chạy ${pct}%</span></span>`;
+    case JOB_STATUS.HOAN_THANH:
+      return `<span class="${base} bg-[#0f2a1d] text-emerald-400 border-[#1a432e]"><span>✓ Hoàn thành</span></span>`;
+    case JOB_STATUS.THAT_BAI:
+      return `<span class="${base} bg-[#2a1215] text-red-400 border-[#441a1f]"><span>Thất bại</span></span>`;
+    case JOB_STATUS.TAM_DUNG:
+      return `<span class="${base} bg-[#2a2210] text-amber-300 border-amber-700/60"><span>⏸ Tạm dừng</span></span>`;
+    default:
+      // Trạng thái lạ (CSDL cũ hoặc backend mới hơn frontend): hiện nguyên chữ, không đoán
+      return `<span class="${base} bg-[#1a2333] text-gray-400 border-[#233145]" title="Trạng thái không nằm trong 5 trạng thái chuẩn"><span>${escapeHtml(status || 'Không rõ')}</span></span>`;
+  }
+}
+
+// Tách "[ảnh: ten.png]" trong status_message thành link mở ảnh chụp lỗi
+function renderStatusMessage(message) {
+  const raw = message || '';
+  const m = raw.match(/\[ảnh:\s*([^\]]+?)\s*\]/);
+  if (!m) return escapeHtml(raw);
+  const fileName = m[1].replace(/\\/g, '/').split('/').filter(Boolean).pop() || m[1];
+  const text = escapeHtml(raw.replace(m[0], '').trim());
+  const link = `<a href="/logs/screenshots/${encodeURIComponent(fileName)}" target="_blank" rel="noopener" class="text-cyan-400 hover:underline" onclick="event.stopPropagation()" title="Mở ảnh chụp màn hình lúc lỗi: ${escapeHtml(fileName)}">📷 Xem ảnh lỗi</a>`;
+  return text ? `${text} ${link}` : link;
+}
+
+function jobActionButtons(j) {
+  const btn = (fn, label, cls, title) => `<button type="button" onclick="${fn}(${j.id})" class="px-2 py-1 rounded text-[10px] font-semibold border transition ${cls}" title="${escapeHtml(title)}">${label}</button>`;
+  const parts = [];
+  if (j.status === JOB_STATUS.THAT_BAI) {
+    parts.push(btn('retryJob', '↻ Chạy lại', 'bg-[#10241f] hover:bg-[#163a32] text-emerald-300 border-emerald-800/50', 'Đưa job về Chờ để worker chạy lại từ đầu'));
+  }
+  if (j.status === JOB_STATUS.TAM_DUNG) {
+    parts.push(btn('resumeJob', '▶ Tiếp tục', 'bg-[#10241f] hover:bg-[#163a32] text-emerald-300 border-emerald-800/50', 'Đưa job về Chờ và xóa cờ cần can thiệp của nick'));
+  }
+  if (j.status === JOB_STATUS.CHO) {
+    parts.push(btn('pauseJob', '⏸ Tạm dừng', 'bg-[#2a2210] hover:bg-[#3a2e12] text-amber-300 border-amber-700/60', 'Giữ job lại, worker sẽ không nhặt cho tới khi bấm Tiếp tục'));
+  }
+  parts.push(`<button type="button" onclick="deleteJob(${j.id})" class="p-1.5 bg-[#251014] hover:bg-red-900/50 text-red-400 rounded border border-[#3e1b21] transition" title="Xóa job"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>`);
+  return `<div class="flex items-center justify-center space-x-1">${parts.join('')}</div>`;
+}
+
 async function fetchJobs() {
   try {
-    const res = await fetch('/api/jobs');
-    const data = await res.json();
+    const data = await apiJson('/api/jobs?limit=500');
     const tbody = document.getElementById('jobsTableBody');
     if (!tbody) return;
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
 
-    if (data.jobs.length === 0) {
+    if (jobs.length === 0) {
       tbody.innerHTML = `
         <tr>
-          <td colspan="9" class="p-8 text-center text-gray-500">
+          <td colspan="10" class="p-8 text-center text-gray-500">
             Chưa có job tạo video nào. Bấm <b>"Thêm Prompt Hàng Loạt"</b> ở góc trên để bắt đầu!
           </td>
         </tr>
@@ -80,102 +242,107 @@ async function fetchJobs() {
       return;
     }
 
-    tbody.innerHTML = data.jobs.map(j => {
-      const isRunning = j.status === 'Đang chạy';
-      const isCompleted = j.status === 'Hoàn thành';
-      const isError = j.status === 'Lỗi';
+    tbody.innerHTML = jobs.map(j => {
+      const isRunning = j.status === JOB_STATUS.DANG_CHAY;
+      const isCompleted = j.status === JOB_STATUS.HOAN_THANH;
+      const pct = Number.isFinite(Number(j.progress)) ? Math.max(0, Math.min(100, Math.round(Number(j.progress)))) : 0;
+      const statusMessage = j.status_message || '';
+      const attempts = (j.attempts === null || j.attempts === undefined) ? 0 : j.attempts;
+      const titleText = j.title || j.prompt || '';
+      const promptFull = j.prompt_final || j.prompt || '';
 
-      let statusBadge = `
-        <span class="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-[#11242c] text-cyan-400 border border-[#1b3945]">
-          <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
-          <span>Đang chạy</span>
-        </span>
-      `;
-      if (isCompleted) {
-        statusBadge = `
-          <span class="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-[#0f2a1d] text-emerald-400 border border-[#1a432e]">
-            <span>✓ Hoàn thành</span>
-          </span>
-        `;
-      } else if (isError) {
-        statusBadge = `
-          <span class="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-[#2a1215] text-red-400 border border-[#441a1f]">
-            <span>Lỗi</span>
-          </span>
-        `;
-      } else if (j.status === 'Đang chờ') {
-        statusBadge = `
-          <span class="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-[#1a2333] text-gray-400 border border-[#233145]">
-            <span>Đang chờ</span>
-          </span>
-        `;
+      let batchLabel = '';
+      if (j.batch_name || (j.seq !== null && j.seq !== undefined)) {
+        const seqText = (j.seq !== null && j.seq !== undefined) ? `#${String(j.seq).padStart(3, '0')}` : '';
+        batchLabel = `<div class="text-[9px] text-purple-300 truncate max-w-[70px]" title="Lô: ${escapeHtml(j.batch_name || '')} · Thứ tự ${escapeHtml(seqText)}">${escapeHtml([j.batch_name, seqText].filter(Boolean).join(' · '))}</div>`;
       }
 
       const accBadge = j.account_name ? `
-        <div class="inline-flex items-center space-x-1 bg-[#101722] border border-[#1b2636] px-2 py-1 rounded text-[11px] text-gray-300">
+        <div class="inline-flex items-center space-x-1 bg-[#101722] border border-[#1b2636] px-2 py-1 rounded text-[11px] text-gray-300" title="Nick #${escapeHtml(j.account_id)}">
           <i data-lucide="user" class="w-3 h-3 text-cyan-400"></i>
-          <span class="truncate max-w-[100px]">${j.account_name}</span>
+          <span class="truncate max-w-[100px]">${escapeHtml(j.account_name)}</span>
         </div>
-      ` : `<span class="text-gray-500 text-[11px]">Đang ghép acc...</span>`;
+      ` : `<span class="text-gray-500 text-[11px]">${isCompleted || j.status === JOB_STATUS.THAT_BAI ? 'Không có nick' : 'Chưa gán nick'}</span>`;
 
       const proxyBadge = j.account_proxy ? `
         <div class="bg-[#0e1620] border border-[#182433] px-2 py-0.5 rounded text-[10px] text-gray-300 font-mono">
-          <div class="text-cyan-400 truncate max-w-[130px]">${j.account_proxy}</div>
-          <div class="text-[9px] text-gray-500">IP mới - lượt 1/1 - proxy</div>
+          <div class="text-cyan-400 truncate max-w-[130px]" title="${escapeHtml(j.account_proxy)}">${escapeHtml(j.account_proxy)}</div>
         </div>
-      ` : `<span class="text-gray-500 text-[10px] italic">đang chờ IP</span>`;
+      ` : `<span class="text-gray-500 text-[10px] italic">Không proxy</span>`;
+
+      const progressBar = isRunning ? `
+              <div class="w-full bg-[#141d2a] h-1 rounded overflow-hidden">
+                <div class="bg-gradient-to-r from-cyan-400 to-emerald-400 h-1 transition-all duration-300" style="width: ${pct}%"></div>
+              </div>` : '';
+
+      const videoButtons = (isCompleted && j.local_video_path) ? `
+              <div class="mt-1 flex items-center space-x-1.5">
+                <button type="button" onclick="openVideoPlayer('${escapeHtml(j.local_video_path)}', '${encodeURIComponent(titleText)}', ${j.id})" class="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded bg-cyan-950/60 text-cyan-300 hover:bg-cyan-900/80 border border-cyan-800/40 text-[10px] font-semibold transition">
+                  <i data-lucide="play-circle" class="w-3.5 h-3.5 text-cyan-400"></i>
+                  <span>Xem video</span>
+                </button>
+                <a href="/api/download-video/video_${j.id}.mp4" download class="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded bg-[#10231d] text-emerald-300 hover:bg-[#16382e] border border-emerald-800/40 text-[10px] font-semibold transition" title="Tải video MP4 về máy">
+                  <i data-lucide="download" class="w-3 h-3 text-emerald-400"></i>
+                  <span>Tải MP4</span>
+                </a>
+              </div>` : '';
 
       return `
         <tr class="hover:bg-[#0c121a] transition select-none">
           <td class="p-2.5 text-center"><input type="checkbox" class="rounded bg-gray-800 border-gray-700"></td>
-          <td class="p-2.5 font-mono text-gray-400 font-semibold">#${j.id}</td>
+          <td class="p-2.5 font-mono text-gray-400 font-semibold">
+            <div>#${j.id}</div>
+            ${batchLabel}
+          </td>
           <td class="p-2.5">
-            <div class="space-y-1">
+            <div class="space-y-1" title="${escapeHtml(statusMessage)}">
               <div class="flex items-center justify-between">
-                ${statusBadge}
-                <span class="text-[10px] text-gray-500">${j.progress}%</span>
+                ${jobStatusBadge(j.status, j.progress)}
               </div>
-              <div class="w-full bg-[#141d2a] h-1 rounded overflow-hidden">
-                <div class="bg-gradient-to-r from-cyan-400 to-emerald-400 h-1 transition-all duration-300" style="width: ${j.progress}%"></div>
-              </div>
-              <div class="text-[10px] text-gray-400 truncate max-w-[220px]" title="${j.status_message || ''}">
-                ${j.status_message || 'Chờ khởi tạo...'}
+              ${progressBar}
+              <div class="text-[10px] text-gray-400 truncate max-w-[230px]">
+                ${renderStatusMessage(statusMessage) || '<span class="text-gray-600">Chưa có thông báo</span>'}
               </div>
             </div>
           </td>
-          <td class="p-2.5 text-gray-300 font-medium">${j.duration}</td>
-          <td class="p-2.5 text-gray-300 font-semibold">${j.model}</td>
+          <td class="p-2.5 text-center font-mono ${attempts > 1 ? 'text-amber-300' : 'text-gray-400'}" title="Số lần đã thử chạy job này">${escapeHtml(attempts)}</td>
+          <td class="p-2.5 text-gray-300 font-medium">${escapeHtml(j.duration || '')}</td>
+          <td class="p-2.5 text-gray-300 font-semibold">${escapeHtml(j.model || '')}</td>
           <td class="p-2.5">${accBadge}</td>
           <td class="p-2.5">${proxyBadge}</td>
           <td class="p-2.5">
-            <div class="font-medium text-gray-200 line-clamp-1" title="${j.prompt}">${j.title || j.prompt}</div>
-            ${j.local_video_path ? `
-              <div class="mt-1 flex items-center space-x-1.5">
-                <button type="button" onclick="openVideoPlayer('${j.local_video_path}', '${encodeURIComponent(j.title || j.prompt)}', ${j.id})" class="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded bg-cyan-950/60 text-cyan-300 hover:bg-cyan-900/80 border border-cyan-800/40 text-[10px] font-semibold transition">
-                  <i data-lucide="play-circle" class="w-3.5 h-3.5 text-cyan-400"></i>
-                  <span>Xem Video Siêu Mượt</span>
-                </button>
-                <a href="/api/download-video/video_${j.id}.mp4" download class="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded bg-[#10231d] text-emerald-300 hover:bg-[#16382e] border border-emerald-800/40 text-[10px] font-semibold transition" title="Tải Video MP4 về máy">
-                  <i data-lucide="download" class="w-3 h-3 text-emerald-400"></i>
-                  <span>Tải MP4</span>
-                </a>
-              </div>
-            ` : ''}
+            <div class="font-medium text-gray-200 line-clamp-1" title="${escapeHtml(promptFull)}">${escapeHtml(titleText)}</div>
+            ${videoButtons}
           </td>
-          <td class="p-2.5 text-center">
-            <button onclick="deleteJob(${j.id})" class="p-1.5 bg-[#251014] hover:bg-red-900/50 text-red-400 rounded border border-[#3e1b21] transition" title="Xóa Job">
-              <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
-            </button>
-          </td>
+          <td class="p-2.5 text-center">${jobActionButtons(j)}</td>
         </tr>
       `;
     }).join('');
 
     lucide.createIcons();
   } catch (err) {
-    console.error('Lỗi lấy danh sách job:', err);
+    reportFetchError('Không lấy được hàng đợi job', err);
   }
 }
+
+// Hành động trên job theo máy trạng thái (docs/KIEN_TRUC.md mục 4)
+async function _jobAction(id, action, label) {
+  try {
+    const data = await apiJson(`/api/jobs/${id}/${action}`, { method: 'POST' });
+    if (data.success === false) {
+      showToast(`${label} job #${id} không được: ${data.message || data.detail || 'máy chủ từ chối'}`, 'warning');
+    } else {
+      showToast(`${label} job #${id} thành công`, 'success');
+    }
+    fetchJobs();
+    fetchStats();
+  } catch (err) {
+    reportFetchError(`${label} job #${id} thất bại`, err);
+  }
+}
+function retryJob(id) { return _jobAction(id, 'retry', 'Chạy lại'); }
+function resumeJob(id) { return _jobAction(id, 'resume', 'Tiếp tục'); }
+function pauseJob(id) { return _jobAction(id, 'pause', 'Tạm dừng'); }
 
 // 3. Fetch and Render Images (Tạo Ảnh)
 async function fetchImages() {
@@ -216,7 +383,7 @@ async function fetchImages() {
 
     lucide.createIcons();
   } catch (err) {
-    console.error('Lỗi lấy danh sách ảnh:', err);
+    reportFetchError('Lỗi lấy danh sách ảnh', err);
   }
 }
 
@@ -244,13 +411,17 @@ async function submitCreateImage() {
       fetchStats();
     }
   } catch (err) {
-    alert('Lỗi tạo ảnh: ' + err.message);
+    showToast('Lỗi tạo ảnh: ' + err.message, 'error');
   }
 }
 
 async function deleteImage(id) {
   if (!confirm('Xóa ảnh này?')) return;
-  await fetch(`/api/images/${id}`, { method: 'DELETE' });
+  try {
+    await apiJson(`/api/images/${id}`, { method: 'DELETE' });
+  } catch (err) {
+    reportFetchError('Không xóa được ảnh', err);
+  }
   fetchImages();
   fetchStats();
 }
@@ -302,7 +473,7 @@ async function fetchAssets() {
 
     lucide.createIcons();
   } catch (err) {
-    console.error('Lỗi lấy nhân vật:', err);
+    reportFetchError('Lỗi lấy nhân vật', err);
   }
 }
 
@@ -334,13 +505,17 @@ async function submitAddAsset() {
       fetchStats();
     }
   } catch (err) {
-    alert('Lỗi thêm asset: ' + err.message);
+    showToast('Lỗi thêm asset: ' + err.message, 'error');
   }
 }
 
 async function deleteAsset(id) {
   if (!confirm('Xóa nhân vật này?')) return;
-  await fetch(`/api/assets/${id}`, { method: 'DELETE' });
+  try {
+    await apiJson(`/api/assets/${id}`, { method: 'DELETE' });
+  } catch (err) {
+    reportFetchError('Không xóa được nhân vật', err);
+  }
   fetchAssets();
   fetchStats();
 }
@@ -393,7 +568,7 @@ async function loadNickMedia() {
       `).join('') || `<div class="text-gray-500 text-xs">Không có ảnh nào</div>`;
     }
   } catch (err) {
-    console.error('Lỗi nạp nick media:', err);
+    reportFetchError('Lỗi nạp nick media', err);
   }
 }
 
@@ -423,51 +598,81 @@ async function submitGenerateAudio() {
       player.play();
     }
   } catch (err) {
-    alert('Lỗi tạo âm thanh: ' + err.message);
+    showToast('Lỗi tạo âm thanh: ' + err.message, 'error');
   }
 }
 
 // 7. Nhật ký (Logs)
-async function fetchLogs() {
-  try {
-    const res = await fetch('/api/logs');
-    const data = await res.json();
-    const container = document.getElementById('logsContainer');
-    if (!container) return;
+let _logsAutoTimer = null;
+function startLogsAutoRefresh(enabled) {
+  if (_logsAutoTimer) { clearInterval(_logsAutoTimer); _logsAutoTimer = null; }
+  if (enabled) _logsAutoTimer = setInterval(() => { if (currentTab === 'logs') fetchLogs(); }, 5000);
+}
 
-    if (data.logs.length === 0) {
-      container.innerHTML = `<div class="text-gray-600">Chưa có bản ghi nhật ký nào.</div>`;
+function resetLogFilters() {
+  ['logFilterJob', 'logFilterAcc', 'logFilterLevel'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  fetchLogs();
+}
+
+async function fetchLogs() {
+  const container = document.getElementById('logsContainer');
+  if (!container) return;
+  const val = id => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+  const params = new URLSearchParams({ limit: '500', job_id: val('logFilterJob'), account_id: val('logFilterAcc'), level: val('logFilterLevel') });
+  try {
+    const data = await apiJson(`/api/logs?${params.toString()}`);
+    const logs = Array.isArray(data.logs) ? data.logs : [];
+    const meta = document.getElementById('logsMeta');
+    if (meta) meta.innerText = `${logs.length} dòng (tối đa 500) · tự làm mới mỗi 5 giây khi mở tab này`;
+
+    if (logs.length === 0) {
+      container.innerHTML = `<div class="text-gray-600">Không có bản ghi nhật ký nào khớp bộ lọc.</div>`;
       return;
     }
 
-    container.innerHTML = data.logs.map(l => {
+    container.innerHTML = logs.map(l => {
       let color = 'text-gray-400';
       if (l.level === 'SUCCESS') color = 'text-emerald-400 font-semibold';
       if (l.level === 'WARNING') color = 'text-amber-400';
       if (l.level === 'ERROR') color = 'text-red-400 font-bold';
       if (l.level === 'INFO') color = 'text-cyan-400';
-
+      const ref = [];
+      if (l.job_id !== null && l.job_id !== undefined) ref.push(`<a href="#" onclick="event.preventDefault(); filterLogsByJob(${Number(l.job_id)})" class="text-purple-300 hover:underline" title="Chỉ xem nhật ký của job này">job #${escapeHtml(l.job_id)}</a>`);
+      if (l.account_id !== null && l.account_id !== undefined) ref.push(`<a href="#" onclick="event.preventDefault(); filterLogsByAccount(${Number(l.account_id)})" class="text-amber-300 hover:underline" title="Chỉ xem nhật ký của nick này">nick #${escapeHtml(l.account_id)}</a>`);
       return `
         <div class="leading-relaxed hover:bg-[#0c121a] px-1 rounded">
-          <span class="text-gray-600">[${l.created_at || 'Vừa xong'}]</span>
-          <span class="${color}">[${l.level}]</span>
-          <span class="text-purple-400">[${l.module}]:</span>
-          <span class="text-gray-300">${l.message}</span>
+          <span class="text-gray-600">[${escapeHtml(l.created_at || 'Vừa xong')}]</span>
+          <span class="${color}">[${escapeHtml(l.level || '?')}]</span>
+          <span class="text-purple-400">[${escapeHtml(l.module || '?')}]</span>
+          ${ref.length ? `<span class="text-gray-500">[${ref.join(' ')}]</span>` : ''}
+          <span class="text-gray-300">${escapeHtml(l.message)}</span>
         </div>
       `;
     }).join('');
   } catch (err) {
-    console.error('Lỗi lấy logs:', err);
+    reportFetchError('Không lấy được nhật ký', err);
   }
 }
 
+function filterLogsByJob(id) { const el = document.getElementById('logFilterJob'); if (el) el.value = id; fetchLogs(); }
+function filterLogsByAccount(id) { const el = document.getElementById('logFilterAcc'); if (el) el.value = id; fetchLogs(); }
+
 async function clearLogs() {
   if (!confirm('Xóa sạch nhật ký?')) return;
-  await fetch('/api/logs', { method: 'DELETE' });
+  try {
+    await apiJson('/api/logs', { method: 'DELETE' });
+    showToast('Đã xóa nhật ký', 'success');
+  } catch (err) {
+    reportFetchError('Không xóa được nhật ký', err);
+  }
   fetchLogs();
 }
 
 function selectAccountType(type) {
+  if (type === 'muse') {
+    showToast('Muse AI không còn được hỗ trợ từ phiên bản 1.1. Hãy chọn Facebook hoặc Google.', 'warning');
+    return;
+  }
   const input = document.getElementById('accTypeInput');
   const btnMuse = document.getElementById('btnTypeMuse');
   const btnFb = document.getElementById('btnTypeFb');
@@ -500,21 +705,125 @@ function selectAccountType(type) {
 }
 
 // 8. Accounts & Proxies
+// API /api/accounts không trả fb_pass/fb_2fa/cookies rõ; chỉ có has_pass, has_2fa, has_cookies (KIEN_TRUC mục 5)
+function accountCreditBadge(a) {
+  if (a.is_resting) {
+    const restTip = (a.rest_reason || 'Đang nghỉ') + (a.rest_until ? ` đến ${String(a.rest_until).slice(11, 16)}` : '');
+    return `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#291e0a] text-amber-300 border border-amber-600/50 inline-flex items-center space-x-1 cursor-help" title="${escapeHtml(restTip)}">
+      <span>⏸ Nghỉ (hết lượt)</span>
+    </span>`;
+  }
+  // Không bịa số: chưa đọc được credit thì hiện "Chưa rõ" (BH-09)
+  const value = (a.credits_today !== null && a.credits_today !== undefined) ? a.credits_today
+    : ((a.credits !== null && a.credits !== undefined) ? a.credits : null);
+  const checkedAt = a.last_check ? `Kiểm tra lúc ${a.last_check}` : 'Chưa kiểm tra lần nào';
+  if (value === null || Number.isNaN(Number(value))) {
+    return `<span class="px-2 py-0.5 rounded text-[10px] text-gray-400 bg-[#1a2333] border border-[#233145] cursor-help" title="${escapeHtml(checkedAt)}${a.last_error ? ' · Lỗi gần nhất: ' + escapeHtml(a.last_error) : ''}">Chưa rõ</span>`;
+  }
+  const n = Number(value);
+  if (n > 0) {
+    return `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#0d281a] text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1 cursor-help" title="${escapeHtml(checkedAt)}">
+      <i data-lucide="zap" class="w-3 h-3 text-emerald-400"></i>
+      <span>${n} credits</span>
+    </span>`;
+  }
+  return `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#291215] text-rose-300 border border-rose-800/50 inline-flex items-center space-x-1 cursor-help" title="${escapeHtml(checkedAt)}">
+    <span>0 credit (hết lượt)</span>
+  </span>`;
+}
+
+function accountStatusCell(a) {
+  const isMuse = a.account_type === 'muse';
+  const hasDola = a.has_dola === true;
+  const parts = [];
+  if (isMuse) {
+    parts.push(`<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#1a2333] text-gray-400 border border-[#233145] inline-flex items-center space-x-1" title="Muse AI đã bị gỡ khỏi phiên bản này">Muse: không còn hỗ trợ</span>`);
+  } else {
+    parts.push(hasDola
+      ? `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-[#0d281a] text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1 shadow">
+          <i data-lucide="check-circle" class="w-3.5 h-3.5 text-emerald-400"></i>
+          <span>Đã kết nối Dola</span>
+         </span>`
+      : `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-[#291215] text-rose-300 border border-rose-800/50 inline-flex items-center space-x-1 shadow">
+          <i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-rose-400"></i>
+          <span>Chưa kết nối Dola</span>
+         </span>`);
+  }
+  if (a.busy_job_id !== null && a.busy_job_id !== undefined) {
+    parts.push(`<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-[#11242c] text-cyan-400 border border-[#1b3945] inline-flex items-center space-x-1" title="Nick đang bị job #${escapeHtml(a.busy_job_id)} giữ, job khác phải chờ">
+      <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span><span>Đang chạy job #${escapeHtml(a.busy_job_id)}</span>
+    </span>`);
+  }
+  if (a.needs_manual) {
+    const nm = NEEDS_MANUAL_LABEL[a.needs_manual] || { text: `Cần can thiệp: ${a.needs_manual}`, cls: 'bg-[#2a2210] text-amber-300 border-amber-700/60' };
+    parts.push(`<span class="px-2 py-0.5 rounded text-[10px] font-bold border inline-flex items-center space-x-1 ${nm.cls}" title="Nick này sẽ không được chọn cho job mới cho tới khi bạn xử lý tay rồi bấm Tiếp tục ở job Tạm dừng hoặc Chẩn đoán lại">⚠ ${escapeHtml(nm.text)}</span>`);
+  }
+  if (a.last_error) {
+    parts.push(`<span class="text-[9px] text-rose-300/80 truncate max-w-[150px] block cursor-help" title="Lỗi gần nhất: ${escapeHtml(a.last_error)}">Lỗi: ${escapeHtml(a.last_error)}</span>`);
+  }
+  return `<div class="flex flex-col items-center space-y-1">${parts.join('')}</div>`;
+}
+
+function accountActionsCell(a) {
+  const isMuse = a.account_type === 'muse';
+  const hasDola = a.has_dola === true;
+  const safeName = encodeURIComponent(a.name || '');
+  const diagBtn = `<button onclick="diagnoseAccount(${a.id}, '${safeName}')" class="px-2 py-1 bg-[#101c2c] hover:bg-[#162a40] text-cyan-300 border border-cyan-800/40 text-[10px] font-semibold rounded transition flex items-center space-x-1" title="Kiểm tra từng bước: proxy, Chrome, cookie Facebook, phiên Dola, credit">
+      <i data-lucide="stethoscope" class="w-3 h-3 text-cyan-400"></i>
+      <span>Chẩn đoán</span>
+    </button>`;
+  if (isMuse) {
+    return `<div class="flex items-center justify-center space-x-1.5 text-[10px] text-gray-500 italic">Muse: không còn hỗ trợ</div>`;
+  }
+  if (hasDola) {
+    return `<div class="flex items-center justify-center space-x-1.5 flex-wrap gap-y-1">
+        <button onclick="checkAccountCredits(${a.id})" class="px-2 py-1 bg-[#102422] hover:bg-[#163833] text-emerald-300 border border-emerald-700/50 text-[10px] font-semibold rounded transition flex items-center space-x-1" title="Kiểm tra lượt tạo video hôm nay">
+          <i data-lucide="sparkles" class="w-3 h-3 text-emerald-400"></i>
+          <span>Check Credit</span>
+        </button>
+        <button onclick="openPasteCookieModal(${a.id}, '${safeName}')" class="px-2 py-1 bg-[#1a1727] hover:bg-[#282040] text-purple-300 border border-purple-800/40 text-[10px] rounded transition flex items-center space-x-1" title="Đổi hoặc nạp lại cookie Dola">
+          <i data-lucide="cookie" class="w-3 h-3 text-purple-400"></i>
+          <span>Cookie</span>
+        </button>
+        <button onclick="loginAccount(${a.id})" class="px-2 py-1 bg-[#121c28] hover:bg-[#1b2b3d] text-gray-300 border border-[#203146] text-[10px] rounded transition flex items-center space-x-1" title="Mở Chrome của nick này để kiểm tra hoặc kéo captcha">
+          <i data-lucide="external-link" class="w-3 h-3"></i>
+          <span>Chrome</span>
+        </button>
+        ${diagBtn}
+       </div>`;
+  }
+  return `<div class="flex items-center justify-center space-x-1.5 flex-wrap gap-y-1">
+      <button onclick="autoLoginAccount(${a.id})" class="px-2.5 py-1 bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-400 hover:opacity-90 text-black font-extrabold text-[10px] rounded transition flex items-center space-x-1 shadow-md" title="Tự động đăng nhập Facebook + giải 2FA ngầm">
+        <i data-lucide="sparkles" class="w-3 h-3"></i>
+        <span>⚡ Auto Login</span>
+      </button>
+      <button onclick="openPasteCookieModal(${a.id}, '${safeName}')" class="px-2 py-1 bg-[#1a1727] hover:bg-[#282040] text-purple-300 border border-purple-800/40 text-[10px] rounded transition flex items-center space-x-1" title="Dán cookie Dola từ Cookie-Editor">
+        <i data-lucide="cookie" class="w-3 h-3 text-purple-400"></i>
+        <span>Dán Cookie</span>
+      </button>
+      <button onclick="loginAccount(${a.id})" class="px-2 py-1 bg-[#121c28] hover:bg-[#1b2b3d] text-gray-400 border border-[#203146] text-[10px] rounded transition flex items-center space-x-1" title="Mở Chrome của nick này">
+        <i data-lucide="external-link" class="w-3 h-3"></i>
+        <span>Chrome</span>
+      </button>
+      ${diagBtn}
+     </div>`;
+}
+
 async function fetchAccounts() {
   try {
-    const res = await fetch('/api/accounts');
-    const data = await res.json();
+    const data = await apiJson('/api/accounts');
     const tbody = document.getElementById('accountsTableBody');
     const filterSelect = document.getElementById('filterNickMediaSelect');
     const imageAccSelect = document.getElementById('imageAccountSelect');
 
-    let accounts = data.accounts || [];
+    const allAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+    let accounts = allAccounts;
     if (typeof currentFilterType !== 'undefined' && currentFilterType !== 'all') {
       accounts = accounts.filter(a => a.account_type === currentFilterType);
     }
     if (typeof currentFilterStatus !== 'undefined') {
       if (currentFilterStatus === 'ready') {
-        accounts = accounts.filter(a => a.has_dola === true || a.account_type === 'muse');
+        accounts = accounts.filter(a => a.has_dola === true);
       } else if (currentFilterStatus === 'no-proxy') {
         accounts = accounts.filter(a => !a.proxy || a.proxy.trim() === '');
       }
@@ -524,8 +833,8 @@ async function fetchAccounts() {
       if (accounts.length === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="8" class="p-8 text-center text-gray-500">
-              Không có tài khoản nào phù hợp bộ lọc. Hãy bấm <b>"Thêm Tài Khoản"</b> (Muse AI, Facebook hoặc Google) để bắt đầu!
+            <td colspan="9" class="p-8 text-center text-gray-500">
+              Không có tài khoản nào phù hợp bộ lọc. Hãy bấm <b>"Thêm tài khoản"</b> (Facebook hoặc Google) để bắt đầu!
             </td>
           </tr>
         `;
@@ -535,139 +844,43 @@ async function fetchAccounts() {
           const isGoogle = a.account_type === 'google';
           let typeBadge = '';
           if (isMuse) {
-            typeBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#261536] text-purple-300 border border-purple-600/50 inline-flex items-center space-x-1"><i data-lucide="sparkles" class="w-3 h-3 text-purple-400"></i><span>Muse AI</span></span>`;
+            typeBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#1a2333] text-gray-500 border border-[#233145] inline-flex items-center space-x-1 line-through" title="Muse AI không còn được hỗ trợ"><span>Muse AI</span></span>`;
           } else if (isGoogle) {
             typeBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#291215] text-rose-400 border border-[#481c22] inline-flex items-center space-x-1"><i data-lucide="mail" class="w-3 h-3 text-rose-400"></i><span>Google</span></span>`;
           } else {
             typeBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#0d1e30] text-cyan-400 border border-[#163352] inline-flex items-center space-x-1"><i data-lucide="facebook" class="w-3 h-3 text-cyan-400"></i><span>Facebook</span></span>`;
           }
 
-          const twofaBadge = a.fb_2fa ? `<span class="px-1.5 py-0.2 rounded text-[9px] font-bold bg-[#1e2311] text-amber-300 border border-amber-700/50">2FA</span>` : '';
-          const passBadge = a.has_pass ? `<span class="px-1.5 py-0.2 rounded text-[9px] bg-[#141a24] text-gray-400 border border-[#1f2937]">Pass</span>` : '';
+          const twofaBadge = a.has_2fa ? `<span class="px-1.5 py-0.2 rounded text-[9px] font-bold bg-[#1e2311] text-amber-300 border border-amber-700/50" title="Đã lưu mã 2FA">2FA</span>` : '';
+          const passBadge = a.has_pass ? `<span class="px-1.5 py-0.2 rounded text-[9px] bg-[#141a24] text-gray-400 border border-[#1f2937]" title="Đã lưu mật khẩu">Pass</span>` : '';
+          const cookieBadge = a.has_cookies ? `<span class="px-1.5 py-0.2 rounded text-[9px] bg-[#1a1727] text-purple-300 border border-purple-800/40" title="Đã lưu cookie">Cookie</span>` : '';
+          const badges = `<div class="flex items-center space-x-1">${twofaBadge} ${passBadge} ${cookieBadge}</div>`;
 
           let identifier = '';
           if (isMuse) {
-            identifier = a.email ? `<div class="space-y-0.5"><div class="text-purple-300 font-mono text-[11px] font-semibold">${a.email}</div><span class="text-[9px] text-gray-500">Dongvanfb Mail</span></div>` : `<span class="text-gray-500 text-[11px]">Chưa gắn Mail</span>`;
+            identifier = a.email ? `<div class="text-gray-500 font-mono text-[11px]">${escapeHtml(a.email)}</div>` : `<span class="text-gray-500 text-[11px]">Chưa gắn Mail</span>`;
           } else if (isGoogle) {
-            identifier = a.email ? `<div class="space-y-0.5"><div class="text-rose-300 font-mono text-[11px]">${a.email}</div></div>` : `<span class="text-gray-500 text-[11px]">Chưa gắn Gmail</span>`;
+            identifier = a.email ? `<div class="space-y-1"><div class="text-rose-300 font-mono text-[11px]">${escapeHtml(a.email)}</div>${badges}</div>` : `<span class="text-gray-500 text-[11px]">Chưa gắn Gmail</span>`;
           } else {
-            identifier = a.fb_uid ? `<div class="space-y-1"><div class="text-gray-300 font-mono text-[11px] font-semibold">${a.fb_uid}</div><div class="flex items-center space-x-1">${twofaBadge} ${passBadge}</div></div>` : `<span class="text-gray-500 text-[11px]">Chưa gắn UID</span>`;
+            identifier = a.fb_uid ? `<div class="space-y-1"><div class="text-gray-300 font-mono text-[11px] font-semibold">${escapeHtml(a.fb_uid)}</div>${badges}</div>` : `<div class="space-y-1"><span class="text-gray-500 text-[11px]">Chưa gắn UID</span>${badges}</div>`;
           }
 
-          const hasDola = a.has_dola === true;
-          let statusBadge = '';
-          if (isMuse) {
-            statusBadge = (a.status === 'ready' || a.cookies)
-              ? `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-[#1d1230] text-purple-300 border border-purple-500/40 inline-flex items-center space-x-1 shadow">
-                  <i data-lucide="check-circle" class="w-3.5 h-3.5 text-purple-400"></i>
-                  <span>🟢 Đã kết nối Muse</span>
-                 </span>`
-              : `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-[#291215] text-rose-300 border border-rose-800/50 inline-flex items-center space-x-1 shadow">
-                  <i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-rose-400"></i>
-                  <span>🔴 Chưa login Muse</span>
-                 </span>`;
-          } else {
-            statusBadge = hasDola
-              ? `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-[#0d281a] text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1 shadow">
-                  <i data-lucide="check-circle" class="w-3.5 h-3.5 text-emerald-400"></i>
-                  <span>🟢 Đã kết nối Dola</span>
-                 </span>`
-              : `<span class="px-2 py-0.5 rounded text-[11px] font-bold bg-[#291215] text-rose-300 border border-rose-800/50 inline-flex items-center space-x-1 shadow">
-                  <i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-rose-400"></i>
-                  <span>🔴 Chưa kết nối Dola</span>
-                 </span>`;
-          }
-
-          // Cột hiển thị số lượt Credit / Token
-          let creditBadge = `<span class="px-2 py-0.5 rounded text-[10px] text-gray-500 bg-[#0d131d] border border-[#1b2636]">Chưa check</span>`;
-          if (isMuse) {
-            const tok = a.tokens_balance ? Number(a.tokens_balance).toLocaleString() : '1,000,000,000';
-            creditBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#261536] text-purple-300 border border-purple-600/50 inline-flex items-center space-x-1" title="Số dư token Muse AI">
-              <i data-lucide="sparkles" class="w-3 h-3 text-purple-400"></i>
-              <span>${tok} tokens</span>
-            </span>`;
-          } else if (a.is_resting) {
-            const restTip = (a.rest_reason || 'Đang nghỉ') + (a.rest_until ? ` đến ${a.rest_until.slice(11, 16)}` : '');
-            creditBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#291e0a] text-amber-300 border border-amber-600/50 inline-flex items-center space-x-1 cursor-help" title="${restTip}">
-              <span>⏸️ Nghỉ (0 lượt)</span>
-            </span>`;
-          } else if (a.credits_today !== null && a.credits_today !== undefined) {
-            if (a.credits_today > 0) {
-              creditBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#0d281a] text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1">
-                <i data-lucide="zap" class="w-3 h-3 text-emerald-400"></i>
-                <span>${a.credits_today} credits</span>
-              </span>`;
-            } else {
-              creditBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#291215] text-rose-300 border border-rose-800/50 inline-flex items-center space-x-1">
-                <span>0 credit (Hết lượt)</span>
-              </span>`;
-            }
-          } else if (hasDola) {
-            const cr = (a.credits !== null && a.credits !== undefined) ? a.credits : 4;
-            creditBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-[#0d281a] text-emerald-400 border border-emerald-500/40 inline-flex items-center space-x-1" title="Sẵn sàng (mặc định 4 lượt/ngày)">
-              <i data-lucide="zap" class="w-3 h-3 text-emerald-400"></i>
-              <span>🟢 ${cr} credits</span>
-            </span>`;
-          }
-
-          let loginActions = '';
-          if (isMuse) {
-            loginActions = `
-              <div class="flex items-center justify-center space-x-1.5">
-                <button onclick="autoLoginMuse(${a.id})" class="px-2.5 py-1 bg-gradient-to-r from-purple-600 to-indigo-500 hover:opacity-90 text-white font-bold text-[10px] rounded transition flex items-center space-x-1 shadow" title="Tự động bốc OTP dongvanfb để đăng nhập">
-                  <i data-lucide="zap" class="w-3 h-3 text-amber-300"></i>
-                  <span>⚡ Auto Login</span>
-                </button>
-                <button onclick="checkMuseToken(${a.id})" class="px-2 py-1 bg-[#102422] hover:bg-[#163833] text-emerald-300 border border-emerald-700/50 text-[10px] font-semibold rounded transition flex items-center space-x-1" title="Kiểm tra số dư token">
-                  <i data-lucide="sparkles" class="w-3 h-3 text-emerald-400"></i>
-                  <span>Check Token</span>
-                </button>
-              </div>
-            `;
-          } else if (hasDola) {
-            loginActions = `<div class="flex items-center justify-center space-x-1.5">
-                <button onclick="checkAccountCredits(${a.id})" class="px-2 py-1 bg-[#102422] hover:bg-[#163833] text-emerald-300 border border-emerald-700/50 text-[10px] font-semibold rounded transition flex items-center space-x-1" title="Kiểm tra lượt tạo video hôm nay">
-                  <i data-lucide="sparkles" class="w-3 h-3 text-emerald-400"></i>
-                  <span>Check Credit</span>
-                </button>
-                <button onclick="openPasteCookieModal(${a.id}, '${encodeURIComponent(a.name)}')" class="px-2 py-1 bg-[#1a1727] hover:bg-[#282040] text-purple-300 border border-purple-800/40 text-[10px] rounded transition flex items-center space-x-1" title="Đổi hoặc nạp lại cookie Dola">
-                  <i data-lucide="cookie" class="w-3 h-3 text-purple-400"></i>
-                  <span>Cookie</span>
-                </button>
-                <button onclick="loginAccount(${a.id})" class="px-2 py-1 bg-[#121c28] hover:bg-[#1b2b3d] text-gray-300 border border-[#203146] text-[10px] rounded transition flex items-center space-x-1" title="Mở Chrome thật kiểm tra">
-                  <i data-lucide="external-link" class="w-3 h-3"></i>
-                  <span>Chrome</span>
-                </button>
-               </div>`;
-          } else {
-            loginActions = `<div class="flex items-center justify-center space-x-1.5">
-                <button onclick="autoLoginAccount(${a.id})" class="px-2.5 py-1 bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-400 hover:opacity-90 text-black font-extrabold text-[10px] rounded transition flex items-center space-x-1 shadow-md" title="Tự động đăng nhập FB + Giải 2FA ngầm">
-                  <i data-lucide="sparkles" class="w-3 h-3"></i>
-                  <span>⚡ Auto Login</span>
-                </button>
-                <button onclick="openPasteCookieModal(${a.id}, '${encodeURIComponent(a.name)}')" class="px-2 py-1 bg-[#1a1727] hover:bg-[#282040] text-purple-300 border border-purple-800/40 text-[10px] rounded transition flex items-center space-x-1" title="Dán cookie Dola từ Cookie-Editor">
-                  <i data-lucide="cookie" class="w-3 h-3 text-purple-400"></i>
-                  <span>Dán Cookie</span>
-                </button>
-                <button onclick="loginAccount(${a.id})" class="px-2 py-1 bg-[#121c28] hover:bg-[#1b2b3d] text-gray-400 border border-[#203146] text-[10px] rounded transition flex items-center space-x-1" title="Mở trình duyệt Google Chrome thật">
-                  <i data-lucide="external-link" class="w-3 h-3"></i>
-                  <span>Chrome</span>
-                </button>
-               </div>`;
-          }
+          const proxyCell = `
+            <div class="font-mono text-cyan-400 text-[11px] truncate max-w-[150px]" title="${escapeHtml(a.proxy || '')}">${a.proxy ? escapeHtml(a.proxy) : '<span class="text-gray-500">Không có proxy</span>'}</div>
+            ${a.last_ip ? `<div class="text-[9px] text-gray-500 font-mono" title="IP ra ngoài lần kiểm tra gần nhất">IP: ${escapeHtml(a.last_ip)}</div>` : ''}`;
 
           return `
-            <tr class="hover:bg-[#0c121a] transition select-none">
+            <tr class="hover:bg-[#0c121a] transition select-none ${isMuse ? 'opacity-60' : ''}">
               <td class="p-2.5 text-center font-mono text-gray-400">#${a.id}</td>
               <td class="p-2.5">${typeBadge}</td>
-              <td class="p-2.5 font-semibold text-gray-200">${a.name}</td>
+              <td class="p-2.5 font-semibold text-gray-200">${escapeHtml(a.name)}</td>
               <td class="p-2.5">${identifier}</td>
-              <td class="p-2.5 font-mono text-cyan-400 text-[11px]">${a.proxy || '<span class="text-gray-500">Không có proxy</span>'}</td>
-              <td class="p-2.5 text-center">${statusBadge}</td>
-              <td class="p-2.5 text-center">${creditBadge}</td>
-              <td class="p-2.5 text-center">${loginActions}</td>
+              <td class="p-2.5">${proxyCell}</td>
+              <td class="p-2.5 text-center">${accountStatusCell(a)}</td>
+              <td class="p-2.5 text-center">${isMuse ? '<span class="px-2 py-0.5 rounded text-[10px] text-gray-500 bg-[#1a2333] border border-[#233145]">Chưa rõ</span>' : accountCreditBadge(a)}</td>
+              <td class="p-2.5 text-center">${accountActionsCell(a)}</td>
               <td class="p-2.5 text-center">
-                <button onclick="deleteAccount(${a.id})" class="p-1.5 bg-[#251014] hover:bg-red-900/50 text-red-400 rounded border border-[#3e1b21] transition" title="Xóa Tài Khoản">
+                <button onclick="deleteAccount(${a.id})" class="p-1.5 bg-[#251014] hover:bg-red-900/50 text-red-400 rounded border border-[#3e1b21] transition" title="Xóa tài khoản">
                   <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                 </button>
               </td>
@@ -678,16 +891,21 @@ async function fetchAccounts() {
     }
 
     // Populate dropdowns
+    const optionList = allAccounts.map(a => `<option value="${a.id}">[${a.account_type === 'google' ? 'Google' : (a.account_type === 'muse' ? 'Muse' : 'FB')}] ${escapeHtml(a.name)}</option>`).join('');
     if (filterSelect) {
-      filterSelect.innerHTML = `<option value="">Xem tất cả tài khoản</option>` + data.accounts.map(a => `<option value="${a.id}">[${a.account_type === 'google' ? 'Google' : 'FB'}] ${a.name}</option>`).join('');
+      const keep = filterSelect.value;
+      filterSelect.innerHTML = `<option value="">Xem tất cả tài khoản</option>` + optionList;
+      if (keep) filterSelect.value = keep;
     }
     if (imageAccSelect) {
-      imageAccSelect.innerHTML = `<option value="">Tự động chọn tài khoản rảnh</option>` + data.accounts.map(a => `<option value="${a.id}">[${a.account_type === 'google' ? 'Google' : 'FB'}] ${a.name}</option>`).join('');
+      const keep = imageAccSelect.value;
+      imageAccSelect.innerHTML = `<option value="">Tự động chọn tài khoản rảnh</option>` + optionList;
+      if (keep) imageAccSelect.value = keep;
     }
 
     lucide.createIcons();
   } catch (err) {
-    console.error('Lỗi lấy tài khoản:', err);
+    reportFetchError('Không lấy được danh sách tài khoản', err);
   }
 }
 
@@ -716,7 +934,7 @@ async function submitBatchPrompts() {
       refreshData();
     }
   } catch (err) {
-    alert('Lỗi gửi jobs: ' + err.message);
+    showToast('Lỗi gửi jobs: ' + err.message, 'error');
   }
 }
 
@@ -755,84 +973,94 @@ async function submitAddAccount() {
       refreshData();
     }
   } catch (err) {
-    alert('Lỗi thêm tài khoản: ' + err.message);
-  }
-}
-
-// Action: Batch Import Accounts
-async function submitBatchImport() {
-  const dataText = document.getElementById('importDataInput').value.trim();
-  if (!dataText) {
-    alert('Vui lòng dán danh sách tài khoản & proxy!');
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/accounts/batch-import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: dataText })
-    });
-    const data = await res.json();
-    if (data.success) {
-      closeModal('modalImport');
-      document.getElementById('importDataInput').value = '';
-      alert(`Đã import thành công ${data.imported} tài khoản!`);
-      refreshData();
-    }
-  } catch (err) {
-    alert('Lỗi import: ' + err.message);
+    showToast('Lỗi thêm tài khoản: ' + err.message, 'error');
   }
 }
 
 // Action: Launch Login Session
 async function loginAccount(id) {
   try {
-    fetch(`/api/accounts/${id}/login`, { method: 'POST' });
-    alert('👉 Đang gửi lệnh mở Google Chrome cho Nick #' + id + '!\n\nNếu cửa sổ Chrome chưa hiện lên ngay trước mắt (do Windows bảo vệ chặn ứng dụng nền):\n➡️ Bạn chỉ cần mở thư mục C:\\AI SEEDANE và nhấp đúp vào file:\n   "MO_CHROME_ACC_' + id + '.bat"\n\nCửa sổ Chrome thật sẽ hiện lên ngay lập tức để bạn kéo mảnh ghép hoặc kiểm tra!');
+    showToast(`Đang mở Chrome cho nick #${id}…`, 'info');
+    const data = await apiJson(`/api/accounts/${id}/login`, { method: 'POST' });
+    if (data.success === false) {
+      showToast(`Không mở được Chrome cho nick #${id}: ${data.message || data.detail || 'nick đang bận hoặc Chrome thiếu'}`, 'warning', 8000);
+    } else {
+      showToast(`Đã mở Chrome cho nick #${id}. Đăng nhập hoặc kéo captcha xong thì đóng cửa sổ Chrome lại.`, 'success', 8000);
+    }
+    setTimeout(fetchAccounts, 1500);
   } catch (err) {
-    alert('Lỗi mở trình duyệt: ' + err.message);
+    reportFetchError(`Không mở được Chrome cho nick #${id}`, err);
   }
 }
 
 // Action: Delete Job
 async function deleteJob(id) {
-  if (!confirm('Bạn có chắc muốn xóa job này?')) return;
+  if (!confirm(`Bạn có chắc muốn xóa job #${id}? Job đang chạy không xóa được, hãy chờ xong hoặc Tạm dừng trước.`)) return;
   try {
-    await fetch(`/api/jobs/${id}`, { method: 'DELETE' });
+    const data = await apiJson(`/api/jobs/${id}`, { method: 'DELETE' });
+    if (data && data.success === false) {
+      showToast(`Không xóa được job #${id}: ${data.message || data.detail || 'máy chủ từ chối'}`, 'error', 8000);
+      return;
+    }
+    showToast(`Đã xóa job #${id}`, 'success');
     refreshData();
   } catch (err) {
-    alert('Lỗi xóa job: ' + err.message);
+    reportFetchError(`Không xóa được job #${id}`, err);
   }
 }
 
 // Action: Delete Account
 async function deleteAccount(id) {
-  if (!confirm('Bạn có chắc muốn xóa tài khoản này?')) return;
+  if (!confirm(`Bạn có chắc muốn xóa tài khoản #${id}?`)) return;
   try {
-    await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+    await apiJson(`/api/accounts/${id}`, { method: 'DELETE' });
+    showToast(`Đã xóa tài khoản #${id}`, 'success');
     refreshData();
   } catch (err) {
-    alert('Lỗi xóa tài khoản: ' + err.message);
+    reportFetchError(`Không xóa được tài khoản #${id}`, err);
   }
 }
 
-// Save Settings
+// Settings
+async function loadSettings() {
+  try {
+    const s = await apiJson('/api/settings');
+    const set = (id, v) => { const el = document.getElementById(id); if (el && v !== null && v !== undefined && v !== '') el.value = v; };
+    set('settingMaxJobs', s.max_concurrent_jobs);
+    set('settingDelay', s.delay_between_jobs);
+    set('settingModel', s.default_model);
+    set('settingDuration', s.default_duration);
+    const cp = document.getElementById('settingChromePath');
+    if (cp) cp.value = s.chrome_path || '';
+  } catch (err) {
+    reportFetchError('Không tải được cài đặt', err);
+  }
+}
+
 async function saveSettings() {
   const max_concurrent_jobs = document.getElementById('settingMaxJobs').value;
   const default_model = document.getElementById('settingModel').value;
   const default_duration = document.getElementById('settingDuration').value;
   const delay_between_jobs = document.getElementById('settingDelay').value;
+  const chromeEl = document.getElementById('settingChromePath');
+  const chrome_path = chromeEl ? chromeEl.value.trim() : '';
+
+  const n = Number(max_concurrent_jobs);
+  if (!Number.isInteger(n) || n < 1 || n > 20) {
+    showToast('Số Chrome chạy cùng lúc phải là số nguyên từ 1 đến 20', 'warning');
+    return;
+  }
 
   try {
-    await fetch('/api/settings', {
+    await apiJson('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ max_concurrent_jobs, default_model, default_duration, delay_between_jobs })
+      body: JSON.stringify({ max_concurrent_jobs, default_model, default_duration, delay_between_jobs, chrome_path })
     });
-    alert('Đã lưu cấu hình hệ thống thành công!');
+    showToast('Đã lưu cài đặt hệ thống', 'success');
+    fetchHealth();
   } catch (err) {
-    alert('Lỗi lưu cấu hình: ' + err.message);
+    reportFetchError('Không lưu được cài đặt', err);
   }
 }
 
@@ -1481,7 +1709,7 @@ async function submitAddAccountFlow() {
       alert('Lỗi: ' + (data.message || 'Không thể thêm tài khoản'));
     }
   } catch (err) {
-    alert('Lỗi thêm tài khoản: ' + err.message);
+    showToast('Lỗi thêm tài khoản: ' + err.message, 'error');
   }
 }
 
@@ -1494,7 +1722,7 @@ async function autoLoginAccount(id) {
       refreshData();
     }
   } catch (err) {
-    alert('Lỗi kích hoạt auto login: ' + err.message);
+    showToast('Lỗi kích hoạt auto login: ' + err.message, 'error');
   }
 }
 
@@ -1541,7 +1769,7 @@ async function submitPasteCookie() {
       }
     }
   } catch (err) {
-    alert('Lỗi nạp cookie: ' + err.message);
+    showToast('Lỗi nạp cookie: ' + err.message, 'error');
   }
 }
 
@@ -1550,14 +1778,14 @@ async function checkAccountDola(id) {
     const res = await fetch(`/api/accounts/${id}/check-dola`);
     const data = await res.json();
     if (data.connected) {
-      alert(`✅ XÁC NHẬN KẾT NỐI DOLA THÀNH CÔNG!\n\n${data.message}\n• Phiên làm việc: Hợp lệ (${data.cookies_count || 10} cookies)\n• Trạng thái: Sẵn sàng tạo video Seedance 2.5!`);
+      alert(`✅ XÁC NHẬN KẾT NỐI DOLA THÀNH CÔNG!\n\n${data.message}\n• Phiên làm việc: Hợp lệ (${(data.cookies_count === null || data.cookies_count === undefined) ? 'chưa rõ số' : data.cookies_count} cookies)\n• Trạng thái: Sẵn sàng tạo video Seedance 2.5!`);
     } else {
       if (confirm(`⚠️ CHƯA KẾT NỐI ĐƯỢC VỚI DOLA!\n\n${data.message}\n\nBạn có muốn tự động đăng nhập Dola ngầm (Auto Login) ngay bây giờ không?`)) {
         autoLoginAccount(id);
       }
     }
   } catch (err) {
-    alert('Lỗi kiểm tra Dola: ' + err.message);
+    showToast('Lỗi kiểm tra Dola: ' + err.message, 'error');
   }
 }
 
@@ -1572,7 +1800,7 @@ async function checkAccountCredits(id) {
       alert(`⚠️ CHƯA CHECK ĐƯỢC CREDIT:\n\n${data.message}`);
     }
   } catch (err) {
-    alert('Lỗi kiểm tra credit: ' + err.message);
+    showToast('Lỗi kiểm tra credit: ' + err.message, 'error');
   }
 }
 
@@ -1587,42 +1815,117 @@ async function checkAllAccountsCredit() {
       alert('Không có tài khoản nào hợp lệ để kiểm tra: ' + (data.message || ''));
     }
   } catch (err) {
-    alert('Lỗi kết nối: ' + err.message);
+    showToast('Lỗi kết nối: ' + err.message, 'error');
   }
+}
+
+// Hiện bảng kết quả từng dòng sau khi import nhiều nick
+function showImportResult(data) {
+  const summaryEl = document.getElementById('importResultSummary');
+  const bodyEl = document.getElementById('importResultBody');
+  if (!summaryEl || !bodyEl) return;
+  const imported = Number(data.imported || 0);
+  const errors = Array.isArray(data.errors) ? data.errors : [];
+  const importedRows = Array.isArray(data.accounts) ? data.accounts : (Array.isArray(data.imported_lines) ? data.imported_lines : []);
+
+  summaryEl.innerHTML = `
+    <span class="text-emerald-400 font-bold">✓ Đã thêm ${imported} nick</span>
+    ${data.with_cookies !== undefined ? ` · có cookie sẵn: <b>${escapeHtml(data.with_cookies)}</b>` : ''}
+    ${data.auto_login_queued !== undefined ? ` · tự đăng nhập Dola: <b>${data.auto_login_queued ? 'đang chạy ngầm' : 'tắt'}</b>` : ''}
+    ${errors.length ? ` · <span class="text-red-400 font-bold">${errors.length} dòng lỗi / bỏ qua</span>` : ' · không có dòng lỗi'}
+  `;
+
+  const okRows = importedRows.map(r => {
+    const line = (r && r.line !== undefined) ? r.line : '';
+    const text = (r && (r.text || r.name || r.email || r.fb_uid)) || '';
+    return `<tr><td class="p-2 font-mono text-gray-500">${escapeHtml(line)}</td><td class="p-2"><span class="px-1.5 py-0.5 rounded bg-[#0f2a1d] text-emerald-400 border border-[#1a432e] text-[10px] font-bold">Đã thêm</span></td><td class="p-2 font-mono text-gray-300 truncate max-w-[260px]" title="${escapeHtml(text)}">${escapeHtml(text)}</td><td class="p-2 text-gray-500">${escapeHtml(r && r.id ? `Nick #${r.id}` : '')}</td></tr>`;
+  });
+  const errRows = errors.map(e => {
+    const line = (e && e.line !== undefined) ? e.line : '';
+    const text = (e && e.text) || '';
+    const reason = (e && e.reason) || (typeof e === 'string' ? e : 'Không rõ lý do');
+    return `<tr><td class="p-2 font-mono text-gray-500">${escapeHtml(line)}</td><td class="p-2"><span class="px-1.5 py-0.5 rounded bg-[#2a1215] text-red-400 border border-[#441a1f] text-[10px] font-bold">Lỗi</span></td><td class="p-2 font-mono text-gray-300 truncate max-w-[260px]" title="${escapeHtml(text)}">${escapeHtml(text.length > 60 ? text.slice(0, 60) + '…' : text)}</td><td class="p-2 text-amber-300">${escapeHtml(reason)}</td></tr>`;
+  });
+  const rows = okRows.concat(errRows);
+  bodyEl.innerHTML = rows.length ? rows.join('') : `<tr><td colspan="4" class="p-4 text-center text-gray-500">Máy chủ không trả chi tiết từng dòng (đã thêm ${imported} nick).</td></tr>`;
+  openModal('modalImportResult');
+  lucide.createIcons();
 }
 
 async function submitBatchImportCustom(dataText, globalProxy, autoLogin = true) {
   try {
-    const res = await fetch('/api/accounts/batch-import', {
+    const data = await apiJson('/api/accounts/batch-import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: dataText, auto_login: autoLogin })
+      body: JSON.stringify({ data: dataText, auto_login: autoLogin, proxy: globalProxy || '' })
     });
-    const data = await res.json();
     if (data.success) {
       refreshData();
-      let alertMsg = `✅ ĐÃ IMPORT THÀNH CÔNG ${data.imported} TÀI KHOẢN!\n• Nick có cookie sẵn: ${data.with_cookies}\n• Tự động đăng nhập Dola ngầm: ${data.auto_login_queued ? 'ĐANG CHẠY' : 'Tắt'}`;
-      if (data.errors && data.errors.length) {
-        alertMsg += `\n• Số dòng bỏ qua / lỗi: ${data.errors.length}`;
-      }
-      alert(alertMsg);
-    } else {
-      alert('Lỗi import: ' + (data.message || 'Thất bại'));
+      const errs = Array.isArray(data.errors) ? data.errors.length : 0;
+      showToast(`Đã thêm ${data.imported || 0} nick${errs ? `, ${errs} dòng lỗi` : ''}`, errs ? 'warning' : 'success');
+      showImportResult(data);
+      return true;
     }
+    showToast('Nhập tài khoản thất bại: ' + (data.message || 'máy chủ từ chối'), 'error');
+    return false;
   } catch (err) {
-    alert('Lỗi import: ' + err.message);
+    reportFetchError('Nhập tài khoản thất bại', err);
+    return false;
   }
 }
 
 async function submitBatchImport() {
   const dataText = document.getElementById('importDataInput').value.trim();
   if (!dataText) {
-    alert('Vui lòng dán danh sách tài khoản!');
+    showToast('Vui lòng dán danh sách tài khoản', 'warning');
     return;
   }
   const autoLogin = document.getElementById('chkBatchAutoLogin') ? document.getElementById('chkBatchAutoLogin').checked : true;
-  await submitBatchImportCustom(dataText, '', autoLogin);
-  closeModal('modalImport');
+  const ok = await submitBatchImportCustom(dataText, '', autoLogin);
+  if (ok) {
+    document.getElementById('importDataInput').value = '';
+    closeModal('modalImport');
+  }
+}
+
+// ==================== CHẨN ĐOÁN NICK ====================
+async function diagnoseAccount(id, name) {
+  const title = document.getElementById('diagnoseTitle');
+  const body = document.getElementById('diagnoseBody');
+  const summary = document.getElementById('diagnoseSummary');
+  const displayName = name ? decodeURIComponent(name) : `#${id}`;
+  if (title) title.innerText = `Chẩn đoán nick ${displayName}`;
+  if (body) body.innerHTML = `<div class="text-gray-400 flex items-center space-x-2"><span class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span><span>Đang kiểm tra proxy, Chrome, cookie Facebook, phiên Dola và credit… (có thể mất tới 1 phút)</span></div>`;
+  if (summary) { summary.classList.add('hidden'); summary.innerText = ''; }
+  openModal('modalDiagnose');
+  lucide.createIcons();
+
+  try {
+    const data = await apiJson(`/api/accounts/${id}/diagnose`, { method: 'POST' });
+    const steps = Array.isArray(data.steps) ? data.steps : [];
+    if (body) {
+      body.innerHTML = steps.length ? steps.map(st => {
+        let mark, cls;
+        if (st.ok === true) { mark = '✔'; cls = 'text-emerald-400 border-emerald-800/50 bg-[#0f2a1d]'; }
+        else if (st.ok === false) { mark = '✘'; cls = 'text-red-400 border-red-800/50 bg-[#2a1215]'; }
+        else { mark = '–'; cls = 'text-gray-400 border-[#233145] bg-[#1a2333]'; }
+        return `
+          <div class="flex items-start space-x-2 border border-[#141e2b] rounded-lg p-2 bg-[#0a0f16]">
+            <span class="w-6 h-6 rounded border flex items-center justify-center font-bold shrink-0 ${cls}">${mark}</span>
+            <div class="min-w-0">
+              <div class="font-semibold text-gray-200">${escapeHtml(st.name || st.key || 'Bước')}</div>
+              <div class="text-[11px] text-gray-400 break-words">${escapeHtml(st.detail || (st.ok === null || st.ok === undefined ? 'Bỏ qua (không kiểm được)' : ''))}</div>
+            </div>
+          </div>`;
+      }).join('') : `<div class="text-gray-500">Máy chủ không trả bước chẩn đoán nào.</div>`;
+    }
+    if (summary && data.summary) { summary.innerText = data.summary; summary.classList.remove('hidden'); }
+    if (data.success === false && !steps.length) showToast(data.message || 'Chẩn đoán thất bại', 'error');
+    fetchAccounts();
+  } catch (err) {
+    if (body) body.innerHTML = `<div class="text-red-400">Không chẩn đoán được: ${escapeHtml(err.message || err)}</div>`;
+    reportFetchError(`Chẩn đoán nick ${displayName} thất bại`, err);
+  }
 }
 
 // ==================== TÀI KHOẢN TOOLBAR ACTIONS ====================
@@ -1651,9 +1954,10 @@ function filterAccountStatus(status, btn) {
 }
 
 function exportAccounts() {
-  fetch('/api/accounts')
-    .then(r => r.json())
+  apiJson('/api/accounts')
+    .catch(err => { reportFetchError('Không xuất được danh sách tài khoản', err); return null; })
     .then(data => {
+      if (!data) return;
       if (!data.accounts || data.accounts.length === 0) {
         alert('Chưa có tài khoản nào để xuất!');
         return;
@@ -1683,7 +1987,7 @@ async function batchAssignProxy() {
       fetchAccounts();
     }
   } catch (err) {
-    alert('Lỗi gán proxy: ' + err.message);
+    showToast('Lỗi gán proxy: ' + err.message, 'error');
   }
 }
 
@@ -1707,7 +2011,7 @@ async function autoLoginMuse(accountId) {
     fetchAccounts();
     fetchStats();
   } catch (err) {
-    alert('Lỗi: ' + err.message);
+    showToast('Lỗi: ' + err.message, 'error');
   }
 }
 
@@ -1722,7 +2026,7 @@ async function checkMuseToken(accountId) {
     alert(data.message || (data.success ? 'Đã kiểm tra token!' : 'Lỗi kiểm tra token'));
     fetchAccounts();
   } catch (err) {
-    alert('Lỗi: ' + err.message);
+    showToast('Lỗi: ' + err.message, 'error');
   }
 }
 
@@ -1749,13 +2053,17 @@ async function openImportB3Modal() {
       alert('Lỗi nạp batch: ' + data.message);
     }
   } catch (err) {
-    alert('Lỗi kết nối: ' + err.message);
+    showToast('Lỗi kết nối: ' + err.message, 'error');
   }
 }
 
 // Initial load & Polling
 window.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
+  selectAccountType('facebook');
   refreshData();
+  fetchHealth();
+  loadSettings();
   setInterval(refreshData, 3000);
+  setInterval(fetchHealth, 10000);
 });

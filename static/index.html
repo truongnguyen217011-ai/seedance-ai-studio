@@ -58,9 +58,9 @@
       <span class="text-xs font-semibold tracking-wide text-gray-300">Seedance AI Studio</span>
     </div>
     <div class="flex items-center space-x-3 text-xs">
-      <div class="flex items-center space-x-1.5 bg-[#0e171e] px-2.5 py-1 rounded-full border border-[#16272b] text-emerald-400">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span class="text-[11px] font-medium">Đã kết nối</span>
+      <div id="headerHealth" class="flex items-center space-x-1.5 bg-[#0e171e] px-2.5 py-1 rounded-full border border-[#16272b] text-gray-400" title="Tình trạng hệ thống (làm mới mỗi 10 giây)">
+        <span id="headerHealthDot" class="w-2 h-2 rounded-full bg-gray-500"></span>
+        <span id="headerHealthText" class="text-[11px] font-medium">Đang kiểm tra hệ thống…</span>
       </div>
       <div class="bg-[#101722] border border-[#1b2636] px-2.5 py-1 rounded-full text-cyan-400 text-[11px] font-medium flex items-center space-x-1">
         <span id="headerRunningJobs">0</span> <span>job</span>
@@ -455,14 +455,15 @@
             <thead class="sticky top-0 bg-[#070b10] border-b border-[#141e2b] text-[11px] uppercase font-bold text-gray-400 select-none z-10">
               <tr>
                 <th class="p-2.5 w-10 text-center"><input type="checkbox" class="rounded bg-gray-800 border-gray-700"></th>
-                <th class="p-2.5 w-16">ID</th>
+                <th class="p-2.5 w-20">ID</th>
                 <th class="p-2.5 w-64">Trạng thái</th>
+                <th class="p-2.5 w-16 text-center" title="Số lần đã thử chạy job này">Lần thử</th>
                 <th class="p-2.5 w-24">Thời lượng</th>
                 <th class="p-2.5 w-28">Model</th>
                 <th class="p-2.5 w-36">Tài khoản</th>
                 <th class="p-2.5 w-44">Proxy</th>
                 <th class="p-2.5">Tiêu đề / Prompt</th>
-                <th class="p-2.5 w-16 text-center">Xóa</th>
+                <th class="p-2.5 w-40 text-center">Thao tác</th>
               </tr>
             </thead>
             <tbody id="jobsTableBody" class="divide-y divide-[#101722] text-xs">
@@ -706,7 +707,7 @@
                 <th class="p-2.5 w-40">Proxy Gán Kèm</th>
                 <th class="p-2.5 w-40 text-center">Trạng Thái Dola AI</th>
                 <th class="p-2.5 w-36 text-center">Credit Hôm Nay</th>
-                <th class="p-2.5 w-64 text-center">Thao Tác Kết Nối Dola</th>
+                <th class="p-2.5 w-80 text-center">Thao Tác Kết Nối Dola</th>
                 <th class="p-2.5 w-12 text-center">Xóa</th>
               </tr>
             </thead>
@@ -802,6 +803,31 @@
           </div>
         </div>
 
+        <!-- Bộ lọc nhật ký -->
+        <div class="bg-[#0b1017] border border-[#141e2b] rounded-xl p-2.5 mb-3 flex flex-wrap items-center gap-2.5 text-xs">
+          <span class="text-[10px] text-gray-400 font-bold uppercase">Lọc:</span>
+          <div class="flex items-center space-x-1">
+            <label for="logFilterJob" class="text-[11px] text-gray-400">Job #</label>
+            <input type="number" id="logFilterJob" min="1" placeholder="tất cả" onchange="fetchLogs()" class="w-20 bg-[#070b10] border border-[#1b2a3c] rounded px-2 py-1 text-[11px] text-gray-200 focus:outline-none focus:border-cyan-500">
+          </div>
+          <div class="flex items-center space-x-1">
+            <label for="logFilterAcc" class="text-[11px] text-gray-400">Nick #</label>
+            <input type="number" id="logFilterAcc" min="1" placeholder="tất cả" onchange="fetchLogs()" class="w-20 bg-[#070b10] border border-[#1b2a3c] rounded px-2 py-1 text-[11px] text-gray-200 focus:outline-none focus:border-cyan-500">
+          </div>
+          <div class="flex items-center space-x-1">
+            <label for="logFilterLevel" class="text-[11px] text-gray-400">Mức</label>
+            <select id="logFilterLevel" onchange="fetchLogs()" class="bg-[#070b10] border border-[#1b2a3c] rounded px-2 py-1 text-[11px] text-gray-200 focus:outline-none focus:border-cyan-500">
+              <option value="">Tất cả</option>
+              <option value="INFO">INFO</option>
+              <option value="SUCCESS">SUCCESS</option>
+              <option value="WARNING">WARNING</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+          </div>
+          <button onclick="resetLogFilters()" class="px-2 py-1 bg-[#121c28] hover:bg-[#1a2838] text-[11px] text-gray-400 rounded border border-[#1c2c3e]">Bỏ lọc</button>
+          <span id="logsMeta" class="ml-auto text-[10px] text-gray-500">Tối đa 500 dòng · tự làm mới mỗi 5 giây khi mở tab này</span>
+        </div>
+
         <div class="flex-1 bg-[#06090e] border border-[#131d2a] rounded-lg p-3 overflow-y-auto font-mono text-[11px] space-y-1" id="logsContainer">
           <!-- Rendered dynamically -->
         </div>
@@ -812,9 +838,14 @@
         <h1 class="text-lg font-bold text-gray-100 mb-4">Cài đặt Hệ thống Studio</h1>
         <div class="bg-[#0b1017] border border-[#141e2b] rounded-lg p-5 space-y-4">
           <div>
-            <label class="block text-xs font-semibold text-gray-300 mb-1">Số luồng chạy song song tối đa (Max Concurrent Jobs)</label>
-            <input type="number" id="settingMaxJobs" value="5" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 focus:outline-none focus:border-cyan-500">
-            <p class="text-[11px] text-gray-500 mt-1">Số lượng video được xử lý đồng thời (ví dụ: 5 - 20 luồng tùy cấu hình máy & số proxy)</p>
+            <label for="settingMaxJobs" class="block text-xs font-semibold text-gray-300 mb-1">Số Chrome chạy cùng lúc (máy 32 GB RAM nên để 6)</label>
+            <input type="number" id="settingMaxJobs" value="6" min="1" max="20" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 focus:outline-none focus:border-cyan-500">
+            <p class="text-[11px] text-gray-500 mt-1">Mỗi job mở một cửa sổ Chrome riêng, mỗi Chrome tốn khoảng 400–600 MB RAM. Đặt quá cao máy sẽ chậm và job dễ lỗi.</p>
+          </div>
+          <div>
+            <label for="settingChromePath" class="block text-xs font-semibold text-gray-300 mb-1">Đường dẫn Chrome (để trống = tự tìm)</label>
+            <input type="text" id="settingChromePath" value="" placeholder="C:\Program Files\Google\Chrome\Application\chrome.exe" class="w-full bg-[#101722] border border-[#1d2a3d] rounded p-2 text-xs text-gray-200 font-mono focus:outline-none focus:border-cyan-500">
+            <p class="text-[11px] text-gray-500 mt-1">Để trống, hệ thống tự tìm Chrome trong Program Files hoặc Chromium của Playwright (cài bằng CAI_TRINH_DUYET.bat).</p>
           </div>
           <div>
             <label class="block text-xs font-semibold text-gray-300 mb-1">Delay giữa các job (Giây)</label>
@@ -856,7 +887,7 @@
       <span class="text-emerald-400 font-medium">Hệ Thống Tự Động Hóa Đa Luồng</span>
     </div>
     <div class="flex items-center space-x-2 text-gray-500">
-      <span>Seedance AI v1.0.127</span>
+      <span id="footerVersion">Seedance AI Studio</span>
     </div>
   </footer>
 
@@ -1007,11 +1038,11 @@
 
       <!-- Chọn Nền tảng (Facebook / Google / Muse AI) -->
       <div class="grid grid-cols-3 gap-2 mb-3">
-        <button type="button" id="btnTypeMuse" onclick="selectAccountType('muse')" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-purple-500 bg-purple-950/40 text-purple-300">
-          <i data-lucide="sparkles" class="w-3.5 h-3.5 text-purple-400"></i>
-          <span>Muse AI (Mail)</span>
+        <button type="button" id="btnTypeMuse" disabled title="Muse AI không còn được hỗ trợ từ phiên bản 1.1" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-[#1e2a3c] bg-[#0c131d] text-gray-600 cursor-not-allowed">
+          <i data-lucide="sparkles" class="w-3.5 h-3.5 text-gray-600"></i>
+          <span>Muse: không còn hỗ trợ</span>
         </button>
-        <button type="button" id="btnTypeFb" onclick="selectAccountType('facebook')" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-[#1e2a3c] bg-[#0c131d] text-gray-400 hover:text-gray-200">
+        <button type="button" id="btnTypeFb" onclick="selectAccountType('facebook')" class="py-2 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition border border-cyan-500 bg-cyan-950/40 text-cyan-300">
           <i data-lucide="facebook" class="w-3.5 h-3.5 text-cyan-400"></i>
           <span>Facebook (Dola)</span>
         </button>
@@ -1020,7 +1051,7 @@
           <span>Google (Dola)</span>
         </button>
       </div>
-      <input type="hidden" id="accTypeInput" value="muse">
+      <input type="hidden" id="accTypeInput" value="facebook">
       <input type="hidden" id="accModalModeInput" value="single">
 
       <!-- Tabs chọn cách nhập: Cookie vs UID/Pass/2FA -->
@@ -1177,6 +1208,61 @@
     </div>
   </div>
 
+  <!-- MODAL: KẾT QUẢ IMPORT TỪNG DÒNG -->
+  <div id="modalImportResult" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-2xl rounded-xl p-5 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="font-bold text-gray-100 text-sm flex items-center space-x-2">
+          <i data-lucide="list-checks" class="w-4 h-4 text-emerald-400"></i>
+          <span>Kết quả nhập tài khoản</span>
+        </h3>
+        <button onclick="closeModal('modalImportResult')" class="text-gray-400 hover:text-white"><i data-lucide="x" class="w-4 h-4"></i></button>
+      </div>
+      <div id="importResultSummary" class="text-xs text-gray-300 mb-3"></div>
+      <div class="flex-1 overflow-y-auto bg-[#06090e] border border-[#131d2a] rounded-lg">
+        <table class="w-full text-left border-collapse text-[11px]">
+          <thead class="sticky top-0 bg-[#070b10] border-b border-[#141e2b] text-[10px] uppercase font-bold text-gray-400">
+            <tr>
+              <th class="p-2 w-14">Dòng</th>
+              <th class="p-2 w-24">Kết quả</th>
+              <th class="p-2">Nội dung</th>
+              <th class="p-2 w-64">Lý do</th>
+            </tr>
+          </thead>
+          <tbody id="importResultBody" class="divide-y divide-[#101722]"></tbody>
+        </table>
+      </div>
+      <div class="flex justify-end mt-3 pt-3 border-t border-[#141e2b]">
+        <button onclick="closeModal('modalImportResult')" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-black font-semibold text-xs rounded">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: CHẨN ĐOÁN NICK -->
+  <div id="modalDiagnose" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
+    <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-xl rounded-xl p-5 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="font-bold text-gray-100 text-sm flex items-center space-x-2">
+          <i data-lucide="stethoscope" class="w-4 h-4 text-cyan-400"></i>
+          <span id="diagnoseTitle">Chẩn đoán nick</span>
+        </h3>
+        <button onclick="closeModal('modalDiagnose')" class="text-gray-400 hover:text-white"><i data-lucide="x" class="w-4 h-4"></i></button>
+      </div>
+      <div id="diagnoseBody" class="flex-1 overflow-y-auto space-y-1.5 text-xs"></div>
+      <div id="diagnoseSummary" class="text-[11px] text-gray-300 mt-3 bg-[#101923] border border-[#1b2a3d] rounded-lg p-2.5 hidden"></div>
+      <div class="flex justify-between items-center mt-3 pt-3 border-t border-[#141e2b]">
+        <a href="/api/diagnostics/bundle" download class="px-3 py-1.5 bg-[#142233] hover:bg-[#1c324c] text-cyan-300 border border-cyan-800/40 rounded text-[11px] font-semibold flex items-center space-x-1.5" title="Tải file zip gồm log 24 giờ, ảnh chụp lỗi và cài đặt để gửi cho người hỗ trợ">
+          <i data-lucide="package" class="w-3.5 h-3.5"></i>
+          <span>Tải gói chẩn đoán</span>
+        </a>
+        <button onclick="closeModal('modalDiagnose')" class="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-black font-semibold text-xs rounded">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST (thông báo góc màn hình) -->
+  <div id="toastContainer" class="fixed bottom-10 right-4 z-[200] space-y-2 w-80 pointer-events-none"></div>
+
   <!-- MODAL: NẠP COOKIE DOLA (CHUẨN HALI AI) -->
   <div id="modalPasteCookie" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 z-50">
     <div class="bg-[#0b1017] border border-[#1b2838] w-full max-w-lg rounded-2xl p-5 shadow-2xl">
@@ -1244,8 +1330,8 @@
         </button>
       </div>
       <div class="relative bg-black flex items-center justify-center aspect-[9/16] max-h-[72vh] overflow-hidden">
-        <video id="studioMainPlayer" class="w-full h-full object-contain" controls autoplay loop playsinline preload="auto">
-          <source id="studioPlayerSource" src="/api/download-video/video_8.mp4" type="video/mp4">
+        <video id="studioMainPlayer" class="w-full h-full object-contain" controls loop playsinline preload="none">
+          <source id="studioPlayerSource" type="video/mp4">
           Trình duyệt không hỗ trợ xem video trực tiếp.
         </video>
       </div>
@@ -1253,7 +1339,7 @@
         <div class="text-[11px] text-gray-400">
           <span class="text-emerald-400 font-bold">✓ 30 giây</span> • Seedance 2.5 • Siêu mượt
         </div>
-        <a id="playerDownloadBtn" href="/api/download-video/video_8.mp4" download="video_8.mp4" class="px-3.5 py-1.5 bg-gradient-to-r from-cyan-500 to-emerald-400 text-black font-bold text-xs rounded hover:opacity-90 flex items-center space-x-1.5 cursor-pointer">
+        <a id="playerDownloadBtn" href="#" download class="px-3.5 py-1.5 bg-gradient-to-r from-cyan-500 to-emerald-400 text-black font-bold text-xs rounded hover:opacity-90 flex items-center space-x-1.5 cursor-pointer">
           <i data-lucide="download" class="w-3.5 h-3.5"></i>
           <span>Tải Video MP4</span>
         </a>
@@ -1262,6 +1348,6 @@
   </div>
 
   <!-- APP JAVASCRIPT -->
-  <script src="/static/js/app.js?v=2.5.2"></script>
+  <script src="/static/js/app.js?v=1.1.0"></script>
 </body>
 </html>
