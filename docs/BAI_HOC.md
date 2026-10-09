@@ -374,3 +374,11 @@ Mẫu một mục:
 - Quy tắc: API batch import phải luôn trả mảng `accounts` chi tiết từng dòng cho giao diện; parser tự động nhận diện và trích xuất `c_user` (Facebook) hoặc `sessionid` (Dola) từ JSON; gán proxy mặc định của batch cho các nick không có proxy riêng; xóa tài khoản phải kiểm tra AccountPool không bận, xóa CSDL và dọn sạch thư mục profile trên ổ đĩa; cập nhật `session_expires` chuẩn datetime khi nick kết nối có phiên; tuân thủ nghiêm ngặt BH-03 không gọi `kill_orphan_chrome` ngoài các module được phép.
 - Kiểm: `tests/test_account_phase2.py` (toàn bộ A1–A6, K1–K3), `tests/test_bai_hoc.py`.
 
+## BH-52 · Xác thực file video tải về chống lưu nhầm HTML lỗi và truyền cookie phiên
+- Ngày: 2026-10-09 · Giai đoạn: 3 · Mã: T1–T5
+- Triệu chứng: Job báo "Đã tạo video thành công" nhưng khi người dùng mở video thì màn hình đen/báo lỗi định dạng; hoặc file mp4 tải về chỉ là trang HTML lỗi 403 Forbidden của CDN; khi tải thất bại, các file rác hỏng không được dọn dẹp.
+- Nguyên nhân gốc: `_download_video` dùng `urllib.request` chay không kèm header Cookie của phiên nick nên CDN có thể chặn; hàm kiểm tra video chỉ kiểm tra kích thước `> 50KB` mà không kiểm tra nội dung file dẫn đến file HTML lỗi > 50KB bị lưu thành video .mp4; không có cơ chế dọn dẹp file hỏng khi quá trình tải gặp sự cố.
+- Quy tắc: Luôn xác thực nội dung file video (`_is_valid_video_file` từ chối `<!DOCTYPE html`, `<html`, `{"error"`); truyền Header Cookie từ phiên Playwright khi tải; tự động xóa sạch file tạm nếu tải thất bại hoặc nội dung không hợp lệ; đính kèm ảnh tham chiếu `reference_image` qua `input[type="file"]` trước khi gửi prompt nếu file tồn tại trên đĩa.
+- Kiểm: `tests/test_video_phase3.py` (T1–T5), `tests/test_bai_hoc.py`.
+
+

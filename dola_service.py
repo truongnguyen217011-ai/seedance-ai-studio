@@ -1552,17 +1552,72 @@ def _conv_after_captcha_solved(job: dict, acc: dict, page, initial_conv_ids: set
     return _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_SECONDS, job_id), False
 
 
-def _download_video(url: str, dest_file: str, job_id: int) -> bool:
-    req_dl = urllib.request.Request(url, headers={
+def _is_valid_video_file(file_path: str) -> bool:
+    """Kiểm tra file video tồn tại, > 50KB và không phải phản hồi HTML/JSON lỗi."""
+    if not os.path.exists(file_path):
+        return False
+    if os.path.getsize(file_path) <= 50000:
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(64)
+        header_lower = header.lower()
+        if b"<!doctype" in header_lower or b"<html" in header_lower or b'{"error"' in header_lower:
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _attach_reference_image(page, image_path: str, job_id: int) -> bool:
+    """Đính kèm ảnh mẫu tham chiếu nhân vật/phong cách nếu có file trên đĩa."""
+    if not image_path or not os.path.isfile(image_path):
+        return False
+    try:
+        file_input = page.locator('input[type="file"]')
+        if file_input.count() > 0:
+            file_input.first.set_input_files(image_path)
+            time.sleep(2)
+            log_event(f"Job #{job_id}: đã đính kèm ảnh tham chiếu '{os.path.basename(image_path)}'", "INFO", "Prompt", job_id=job_id)
+            return True
+        log.debug("Không tìm thấy ô input file trên trang Dola để đính kèm ảnh", extra={"job_id": job_id})
+    except Exception as e:
+        log.warning("Đính kèm ảnh tham chiếu thất bại: %s", str(e)[:120], extra={"job_id": job_id})
+    return False
+
+
+def _download_video(url: str, dest_file: str, job_id: int, cookies_list: Optional[list] = None) -> bool:
+    headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': config.DOLA_BASE_URL + '/',
-    })
-    with urllib.request.urlopen(req_dl, timeout=120) as resp_v, open(dest_file, 'wb') as out_v:
-        shutil.copyfileobj(resp_v, out_v)
-    if os.path.exists(dest_file) and os.path.getsize(dest_file) > 50000:
+    }
+    if cookies_list and isinstance(cookies_list, list):
+        c_parts = [f"{c['name']}={c['value']}" for c in cookies_list if isinstance(c, dict) and c.get("name") and c.get("value")]
+        if c_parts:
+            headers['Cookie'] = "; ".join(c_parts)
+
+    req_dl = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req_dl, timeout=120) as resp_v, open(dest_file, 'wb') as out_v:
+            shutil.copyfileobj(resp_v, out_v)
+    except Exception as e:
+        if os.path.exists(dest_file):
+            try:
+                os.remove(dest_file)
+            except OSError:
+                pass
+        raise e
+
+    if _is_valid_video_file(dest_file):
         return True
-    log.warning("File video tải về quá nhỏ (%s byte), bỏ qua", os.path.getsize(dest_file) if os.path.exists(dest_file) else 0,
-                extra={"job_id": job_id})
+
+    actual_sz = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
+    if os.path.exists(dest_file):
+        try:
+            os.remove(dest_file)
+        except OSError:
+            pass
+    log.warning("File video tải về không hợp lệ hoặc quá nhỏ (%s byte), đã hủy", actual_sz, extra={"job_id": job_id})
     return False
 
 
@@ -1616,7 +1671,11 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         initial_conv_ids.add(m_curr.group(1))
     initial_conv_ids.update(_fetch_recent_conv_ids(page, 10, 1, job_id))
 
-    # 2. Gửi prompt
+    # 2. Gửi prompt (kèm ảnh tham chiếu nếu có)
+    ref_img = (job.get("reference_image") or "").strip()
+    if ref_img and os.path.isfile(ref_img):
+        _attach_reference_image(page, ref_img, job_id)
+
     full_prompt = build_full_prompt(job)
     if (job.get("prompt_final") or "").strip() != full_prompt:
         _set_job_fields(job_id, prompt_final=full_prompt)
@@ -1730,11 +1789,13 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
             log_event(f"Job #{job_id}: tìm thấy video thành phẩm, đang tải về máy", "SUCCESS", "Download", job_id=job_id, account_id=account_id)
             update_job_status(job_id, JobStatus.DANG_CHAY, "Đang tải video từ Dola về máy", 92)
             try:
-                downloaded = _download_video(target_video_url, dest_file, job_id)
+                downloaded = _download_video(target_video_url, dest_file, job_id, cookies_list=curr_c)
                 if downloaded:
                     sz_mb = round(os.path.getsize(dest_file) / (1024 * 1024), 2)
                     log_event(f"Job #{job_id}: đã lưu video ({sz_mb} MB) vào {dest_file}", "SUCCESS", "Download", job_id=job_id, account_id=account_id)
                     break
+                else:
+                    download_error = "File tải về không phải video hợp lệ hoặc quá nhỏ (< 50KB)"
             except Exception as dl_err:  # noqa: BLE001
                 download_error = str(dl_err)[:100]
                 log_event(f"Job #{job_id}: tải video lỗi: {download_error}", "WARNING", "Download", job_id=job_id, account_id=account_id)
@@ -1772,8 +1833,8 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
                                     "generating" in chain_lower or "đang tạo" in chain_lower):
                 # N-1: từ chối/giải thích → dừng sau 60 s; văn bản khác → 120 s; đang generating → chờ tiếp
                 _fail_job(job_id, account_id, JobStatus.THAT_BAI,
-                          Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)), page, "dola_replied_text",
-                          module="Render")
+                              Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)), page, "dola_replied_text",
+                              module="Render")
                 return
 
         time.sleep(5)
@@ -1782,7 +1843,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
     credits_post = extract_dola_credits(page)
     _record_credits(account_id, credits_post, touch_last_used=True)
 
-    if downloaded and os.path.exists(dest_file) and os.path.getsize(dest_file) > 50000:
+    if downloaded and _is_valid_video_file(dest_file):
         update_job_status(job_id, JobStatus.HOAN_THANH, "Đã tạo video thành công, sẵn sàng xem hoặc tải về", 100,
                           local_video_path=f"/outputs/video_{job_id}.mp4",
                           finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
