@@ -510,11 +510,12 @@ def _click_if_visible(page, selectors, timeout_ms, what: str, account_id=None) -
         return False
 
 
-def _detect_captcha(page) -> bool:
-    """Có khung/chữ yêu cầu kéo mảnh ghép (slide captcha) đang HIỂN THỊ trên trang không.
+def _captcha_evidence(page) -> str:
+    """Trả về dấu hiệu captcha đang HIỂN THỊ (chuỗi mô tả) hoặc "" nếu không có.
 
-    BH-36: chỉ tính khung captcha đang hiện hoặc câu chữ đặc trưng của captcha; icon lỗi ẩn
-    trong DOM hay chữ "verify" nằm trong từ khác (verified) KHÔNG phải captcha.
+    BH-36: chỉ tính khung captcha đang hiện và có kích thước, hoặc câu chữ nguyên văn của
+    captcha; icon lỗi ẩn hay chữ "verify" nằm trong từ khác (verified) KHÔNG phải captcha.
+    BH-38: luôn ghi rõ dấu hiệu nào kích hoạt để người dùng và lập trình viên đối chiếu ảnh.
     """
     try:
         frames = page.locator(CAPTCHA_SELECTOR)
@@ -524,13 +525,20 @@ def _detect_captcha(page) -> bool:
                 continue
             box = el.bounding_box()
             if box and box["width"] >= 40 and box["height"] >= 40:
-                return True
+                desc = el.evaluate("e => (e.tagName + ' ' + (e.id ? '#' + e.id : '') + ' .' + String(e.className).slice(0, 80))")
+                return f"khung {desc.strip()} ({int(box['width'])}x{int(box['height'])}px)"
         body_t = _safe_body_text(page).lower()
-        if any(kw in body_t for kw in CAPTCHA_KEYWORDS):
-            return True
+        for kw in CAPTCHA_KEYWORDS:
+            if kw in body_t:
+                return f'chữ "{kw}"'
     except Exception as e:  # noqa: BLE001
         log.debug("Kiểm tra captcha lỗi: %s", str(e)[:80])
-    return False
+    return ""
+
+
+def _detect_captcha(page) -> bool:
+    """Có khung/chữ yêu cầu kéo mảnh ghép (slide captcha) đang HIỂN THỊ trên trang không."""
+    return bool(_captcha_evidence(page))
 
 
 def _busy_message(acc_name: str, account_id: int) -> str:
@@ -1092,8 +1100,11 @@ def _handle_no_credit(job_id: int, acc: dict) -> None:
 
 
 def _handle_captcha(job_id: int, acc: dict, page) -> None:
-    _set_account_fields(acc["id"], needs_manual=NeedsManual.CAPTCHA, last_error="Dola yêu cầu kéo captcha")
-    _fail_job(job_id, acc["id"], JobStatus.TAM_DUNG, Reason.CAPTCHA.format(name=acc["name"]), page, "captcha", module="Captcha")
+    evidence = _captcha_evidence(page) or "không rõ"
+    _set_account_fields(acc["id"], needs_manual=NeedsManual.CAPTCHA, last_error=f"Dola yêu cầu kéo captcha (dấu hiệu: {evidence})")
+    _fail_job(job_id, acc["id"], JobStatus.TAM_DUNG,
+              Reason.CAPTCHA.format(name=acc["name"]) + f" (dấu hiệu: {evidence})",
+              page, "captcha", module="Captcha")
 
 
 def _download_video(url: str, dest_file: str, job_id: int) -> bool:

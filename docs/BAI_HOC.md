@@ -274,3 +274,10 @@ Mẫu một mục:
 - Nguyên nhân gốc: CAP_NHAT.bat không có tham số thì checkout `main`; người dùng không biết khái niệm nhánh.
 - Quy tắc: script cập nhật mặc định giữ nguyên nhánh đang dùng và in rõ tên nhánh sẽ cập nhật; chỉ đổi nhánh khi người dùng gõ tên nhánh. Phiên bản ở góc giao diện là cách kiểm nhanh.
 - Kiểm: `tests/test_bat_syntax.py::test_bh37_cap_nhat_keeps_current_branch`; thử tay: đang ở nhánh test, chạy CAP_NHAT.bat không tham số, vẫn ở nhánh test.
+
+## BH-38 · Thông báo tạm dừng không nói dấu hiệu nào đã kích hoạt
+- Ngày: 2026-10-09 · Giai đoạn: 1 · Mã: Q4, D2
+- Triệu chứng: job báo "bị yêu cầu kéo captcha" nhưng không ai biết tool dựa vào đâu; phải đoán giữa nhiều quy tắc phát hiện.
+- Nguyên nhân gốc: hàm phát hiện chỉ trả True/False, vứt bỏ thông tin phần tử hoặc câu chữ đã khớp.
+- Quy tắc: mọi kết luận tự động làm job dừng (captcha, hết credit, từ chối chính sách) phải ghi kèm dấu hiệu cụ thể đã khớp (selector, kích thước, câu chữ) vào lý do và last_error.
+- Kiểm: `tests/test_captcha_detect.py::test_bh38_evidence_names_the_trigger`.

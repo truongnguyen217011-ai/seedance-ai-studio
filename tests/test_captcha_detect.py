@@ -35,3 +35,20 @@ def test_bh36_no_loose_verify_keyword_in_source():
     src = open(dola_service.__file__, encoding="utf-8").read()
     assert '["verify", "xác minh", "puzzle", "kéo mảnh"]' not in src
     assert "ERROR_ICON_SELECTOR" not in src
+
+
+def test_bh38_evidence_names_the_trigger():
+    with sync_playwright() as p:
+        kw = {"headless": True, "args": ["--no-sandbox"]}
+        if CHROME:
+            kw["executable_path"] = CHROME
+        browser = p.chromium.launch(**kw)
+        page = browser.new_page()
+        page.set_content("<div id='cap' class='captcha_verify_container' style='width:300px;height:200px'>x</div>")
+        ev = dola_service._captcha_evidence(page)
+        assert "captcha_verify_container" in ev and "300x200" in ev
+        page.set_content("<p>Verify to continue</p>")
+        assert 'chữ "verify to continue"' == dola_service._captcha_evidence(page)
+        page.set_content("<p>ok</p>")
+        assert dola_service._captcha_evidence(page) == ""
+        browser.close()
