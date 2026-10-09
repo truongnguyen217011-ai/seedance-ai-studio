@@ -78,3 +78,12 @@ def test_bh30_detector_catches_known_bad_pattern(tmp_path):
     ok.write_text("@echo off\nif %errorlevel% neq 0 (\n    echo [LOI] loi ^(ma loi 1^). Thu lai\n    exit /b 1\n)\necho (ngoai khoi thi duoc)\n", encoding="utf-8")
     hits, depth = _walk(ok)
     assert not hits and depth == 0
+
+
+def test_bh37_cap_nhat_keeps_current_branch():
+    """BH-37: không có tham số thì CAP_NHAT.bat dùng nhánh hiện tại, không ép về main."""
+    src = (ROOT / "CAP_NHAT.bat").read_text(encoding="utf-8")
+    assert "git rev-parse --abbrev-ref HEAD" in src
+    assert 'if "%BRANCH%"=="" set BRANCH=main\r\n' in src or 'if "%BRANCH%"=="" set BRANCH=main\n' in src
+    # dòng ép main chỉ còn là dự phòng SAU khi đã thử đọc nhánh hiện tại
+    assert src.index("git rev-parse --abbrev-ref HEAD") < src.index('if "%BRANCH%"=="" set BRANCH=main')

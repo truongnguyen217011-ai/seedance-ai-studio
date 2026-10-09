@@ -10,7 +10,12 @@ echo Luu y: cap nhat KHONG xoa studio.db, profiles, outputs, logs cua ban.
 echo.
 
 set BRANCH=%~1
+if "%BRANCH%"=="" (
+    for /f "delims=" %%b in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set BRANCH=%%b
+)
 if "%BRANCH%"=="" set BRANCH=main
+if "%BRANCH%"=="HEAD" set BRANCH=main
+echo Nhanh se cap nhat: %BRANCH%  - muon nhanh khac: CAP_NHAT.bat ten_nhanh
 
 git --version >nul 2>&1
 if %errorlevel% neq 0 (

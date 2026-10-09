@@ -267,3 +267,10 @@ Mẫu một mục:
 - Nguyên nhân gốc: bộ phát hiện coi "có bất kỳ icon lỗi nào trong DOM, kể cả ẩn" là captcha; nhánh khác chỉ cần chữ "verify" (khớp cả "verified") là báo captcha. Dấu hiệu quá rộng nên dương tính giả.
 - Quy tắc: một dấu hiệu chỉ được dùng để tạm dừng job khi nó là đặc trưng riêng của tình huống đó (khung captcha đang hiển thị và có kích thước, hoặc câu chữ nguyên văn của captcha). Mọi lần tạm dừng phải kèm ảnh chụp để người dùng đối chiếu.
 - Kiểm: `tests/test_captcha_detect.py`; thử tay: trang Dola thường không được báo captcha.
+
+## BH-37 · Script cập nhật mặc định về nhánh main làm người dùng quay lại bản cũ
+- Ngày: 2026-10-09 · Giai đoạn: 1 · Mã: C2, mục "Cách nhận bản mới"
+- Triệu chứng: người dùng đang test bản mới, chạy CAP_NHAT.bat (không gõ tên nhánh) rồi khởi động, giao diện lại hiện chữ của bản cũ ("Đang chờ", "Đang ghép acc"), tưởng lỗi chưa sửa.
+- Nguyên nhân gốc: CAP_NHAT.bat không có tham số thì checkout `main`; người dùng không biết khái niệm nhánh.
+- Quy tắc: script cập nhật mặc định giữ nguyên nhánh đang dùng và in rõ tên nhánh sẽ cập nhật; chỉ đổi nhánh khi người dùng gõ tên nhánh. Phiên bản ở góc giao diện là cách kiểm nhanh.
+- Kiểm: `tests/test_bat_syntax.py::test_bh37_cap_nhat_keeps_current_branch`; thử tay: đang ở nhánh test, chạy CAP_NHAT.bat không tham số, vẫn ở nhánh test.
