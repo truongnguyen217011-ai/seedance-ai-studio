@@ -38,7 +38,53 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
     if not text:
         raise ValueError("Dòng trống")
 
-    # 1. Trường hợp chỉ có 1 chuỗi Cookie nguyên bản (không có phân cách | hoặc tab)
+    # 1. Trường hợp là JSON (Cookie-Editor, J2TEAM, Playwright storage_state)
+    if (text.startswith('[') and text.endswith(']')) or (text.startswith('{') and text.endswith('}')):
+        try:
+            import json
+            jdata = json.loads(text)
+            c_list = jdata if isinstance(jdata, list) else (jdata.get("cookies", []) if isinstance(jdata, dict) else [])
+            if c_list and isinstance(c_list, list):
+                # Tìm c_user hoặc sessionid
+                c_user_val = None
+                session_val = None
+                for c in c_list:
+                    if not isinstance(c, dict):
+                        continue
+                    cname = c.get("name", "")
+                    if cname == "c_user" and c.get("value"):
+                        c_user_val = str(c["value"]).strip()
+                    elif cname in ("sessionid", "sessionid_ss") and c.get("value"):
+                        session_val = str(c["value"]).strip()
+
+                if c_user_val:
+                    return {
+                        "uid": c_user_val,
+                        "pass": "cookie_login",
+                        "twofa": None,
+                        "proxy": None,
+                        "cookie": text,
+                        "email": None,
+                        "account_type": "facebook",
+                        "name": f"FB {c_user_val[-6:]}" if len(c_user_val) >= 6 else f"FB {c_user_val}"
+                    }
+                if session_val:
+                    uid = f"Dola_{abs(hash(session_val)) % 1000000}"
+                    return {
+                        "uid": uid,
+                        "pass": "cookie_login",
+                        "twofa": None,
+                        "proxy": None,
+                        "cookie": text,
+                        "email": None,
+                        "account_type": "facebook",
+                        "name": f"Dola {uid[-6:]}"
+                    }
+                raise ValueError("Cookie JSON không chứa c_user (Facebook) hoặc sessionid (Dola)")
+        except json.JSONDecodeError:
+            pass
+
+    # 2. Trường hợp chỉ có 1 chuỗi Cookie nguyên bản (không có phân cách | hoặc tab)
     if '|' not in text and '\t' not in text and (RE_COOKIE.search(text) or RE_DOLA_COOKIE.search(text)):
         # Thử trích xuất c_user làm UID
         c_match = re.search(r'(?:^|;\s*)c_user=(\d+)', text)
@@ -184,6 +230,16 @@ def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
     seen_uids = set()
 
     clean_text = str(text or '').replace('\ufeff', '')
+    stripped = clean_text.strip()
+    if (stripped.startswith('[') and stripped.endswith(']')) or (stripped.startswith('{') and stripped.endswith('}')):
+        try:
+            parsed = parse_single_account_line(stripped)
+            parsed["line"] = 1
+            return [parsed], []
+        except Exception:
+            # Nếu không phải một khối cookie đơn lẻ, fallback về duyệt từng dòng
+            pass
+
     lines = clean_text.splitlines()
 
     for idx, raw_line in enumerate(lines, 1):

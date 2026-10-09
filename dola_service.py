@@ -231,6 +231,8 @@ def parse_cookie_string(cookie_str: str, domain: str = ".facebook.com"):
     """Chuyển chuỗi cookie / JSON thành danh sách cookie Playwright theo domain yêu cầu."""
     if "dola" in (domain or "") or _cookie_domain_matches(domain, config.DOLA_DOMAIN):
         return parse_dola_cookies(cookie_str)
+    if cookie_str and ("sessionid=" in cookie_str or "sessionid_ss=" in cookie_str) and "c_user=" not in cookie_str:
+        return parse_dola_cookies(cookie_str)
     return _parse_raw_cookie_for_domain(cookie_str, domain)
 
 
@@ -238,9 +240,22 @@ def _parse_raw_cookie_for_domain(cookie_str: str, domain: str):
     if not cookie_str or not cookie_str.strip():
         return []
     cookie_str = cookie_str.strip()
-    if cookie_str.startswith("[") and cookie_str.endswith("]"):
+    if (cookie_str.startswith("[") and cookie_str.endswith("]")) or (cookie_str.startswith("{") and cookie_str.endswith("}")):
         try:
-            return json.loads(cookie_str)
+            data = json.loads(cookie_str)
+            raw_list = data if isinstance(data, list) else (data.get("cookies", []) if isinstance(data, dict) else [])
+            if raw_list and isinstance(raw_list, list):
+                result = []
+                for c in raw_list:
+                    if isinstance(c, dict) and c.get("name") and c.get("value"):
+                        c_dict = dict(c)
+                        if not c_dict.get("domain"):
+                            c_dict["domain"] = domain
+                        if not c_dict.get("path"):
+                            c_dict["path"] = "/"
+                        result.append(c_dict)
+                if result:
+                    return result
         except json.JSONDecodeError as e:
             log.debug("Cookie dạng JSON không hợp lệ, thử dạng chuỗi: %s", e)
 
@@ -451,14 +466,26 @@ def _inject_cookies(context, acc: dict, only_facebook: bool = False) -> int:
 
 
 def _mark_account_connected(account_id: int, cookies):
-    """Nick vào được trang Dola có phiên: cookie mới nhất, ready, và đếm lại lỗi kết nối liên tiếp từ 0."""
-    _set_account_fields(
-        account_id,
-        cookies=json.dumps(cookies),
-        status=AccountStatus.READY,
-        last_check=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        consecutive_errors=0,
-    )
+    """Nick vào được trang Dola có phiên: cookie mới nhất, ready, đếm lại lỗi kết nối liên tiếp từ 0, lưu hạn phiên."""
+    fields = {
+        "cookies": json.dumps(cookies),
+        "status": AccountStatus.READY,
+        "last_check": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "consecutive_errors": 0,
+    }
+    if isinstance(cookies, list):
+        for c in cookies:
+            if isinstance(c, dict) and c.get("name") in ("sessionid", "sessionid_ss") and c.get("value"):
+                exp = c.get("expires", c.get("expirationDate"))
+                if exp is not None:
+                    try:
+                        exp_f = float(exp)
+                        if exp_f > 0:
+                            fields["session_expires"] = datetime.fromtimestamp(exp_f).strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                    except (ValueError, OSError, OverflowError):
+                        pass
+    _set_account_fields(account_id, **fields)
 
 
 def _mark_no_credit(account_id: int) -> None:
@@ -847,6 +874,12 @@ def _check_account_credits_sync(account_id: int, pool_held: bool = False) -> dic
                 if has_dola_session(curr_c):
                     save_account_storage_state(account_id, curr_c)
                     _mark_account_connected(account_id, curr_c)
+                else:
+                    arts = save_failure_artifacts(page, "no_session", account_id=account_id)
+                    msg = f"Trang Dola không nhận phiên đăng nhập của nick '{acc['name']}' (sessionid mất hiệu lực), cần đăng nhập lại" + artifact_suffix(arts)
+                    _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error=msg)
+                    log_event(msg, "WARNING", "Auth", account_id=account_id)
+                    return {"success": False, "is_known": False, "message": msg}
 
                 if _detect_captcha(page):
                     arts = save_failure_artifacts(page, "captcha", account_id=account_id)

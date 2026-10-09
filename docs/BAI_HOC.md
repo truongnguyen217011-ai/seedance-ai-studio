@@ -366,3 +366,11 @@ Mẫu một mục:
 - Nguyên nhân gốc: `conftest.py` chỉ định cứng `DEFAULT_CHROME` theo Linux; `no_chrome_hint` chỉ xóa env/setting mà không mock `_windows_candidates` khiến test không đi đến bước dò Playwright trên Windows; client urllib trong test dùng keep-alive dễ bị Windows hủy socket khi uvicorn đóng kết nối trước.
 - Quy tắc: Cấu hình test trình duyệt phải tự thích ứng nền tảng (`sys.platform == "win32"` dò Chrome Windows chuẩn trước); request HTTP trong fake Dola test dùng `Connection: close` và retry backoff ngắn khi gặp lỗi kết nối hệ thống; fixture dọn gợi ý Chrome phải dọn cả ứng viên Windows.
 - Kiểm: `python -m pytest tests/test_browser_unit.py -q`; `tests/test_worker_fake_dola.py`.
+
+## BH-51 · Trả thiếu chi tiết dòng import tài khoản và phân giải cookie JSON đa định dạng
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A1–A6, K1–K3
+- Triệu chứng: Giao diện web sau khi import nhiều nick hiện bảng trống kèm thông báo "Máy chủ không trả chi tiết từng dòng"; người dùng dán JSON từ tiện ích Cookie-Editor/J2Team/storageState bị parser từ chối; xóa nick để lại thư mục rác profile trên ổ cứng; phiên hết hạn không ghi nhận timestamp `session_expires`.
+- Nguyên nhân gốc: Endpoint `/api/accounts/batch-import` chỉ trả số lượng tổng `imported` mà không trả mảng `accounts` chi tiết (`id, name, uid, line, text`) mà UI mong đợi; parser chỉ nhận dạng định dạng pipe `UID|Pass` mà không bóc mảng cookie JSON; hàm xóa tài khoản chỉ xóa bản ghi SQLite mà quên dọn thư mục `profiles/acc_{id}`; kết nối Dola không trích xuất timestamp `expires` từ cookie `sessionid`.
+- Quy tắc: API batch import phải luôn trả mảng `accounts` chi tiết từng dòng cho giao diện; parser tự động nhận diện và trích xuất `c_user` (Facebook) hoặc `sessionid` (Dola) từ JSON; gán proxy mặc định của batch cho các nick không có proxy riêng; xóa tài khoản phải kiểm tra AccountPool không bận, xóa CSDL và dọn sạch thư mục profile trên ổ đĩa; cập nhật `session_expires` chuẩn datetime khi nick kết nối có phiên; tuân thủ nghiêm ngặt BH-03 không gọi `kill_orphan_chrome` ngoài các module được phép.
+- Kiểm: `tests/test_account_phase2.py` (toàn bộ A1–A6, K1–K3), `tests/test_bai_hoc.py`.
+

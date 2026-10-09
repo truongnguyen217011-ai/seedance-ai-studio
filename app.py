@@ -26,6 +26,7 @@ from database import get_connection, init_db, log_event
 from diagnostics import build_bundle, diagnose_account
 from dola_service import (
     account_has_dola_session,
+    account_profile_dir,
     auto_login_facebook_dola,
     check_account_credits,
     has_dola_session,
@@ -74,6 +75,7 @@ class AddAccountRequest(BaseModel):
 class BatchImportRequest(BaseModel):
     data: str
     auto_login: Optional[bool] = False
+    proxy: Optional[str] = None
 
 
 class PasteCookieRequest(BaseModel):
@@ -354,6 +356,9 @@ async def batch_import_accounts(req: BatchImportRequest, background_tasks: Backg
         count = 0
         cookie_count = 0
         added = []
+        accounts_added = []
+
+        batch_proxy = (req.proxy or "").strip() or None
 
         for item in ok_list:
             uid = item["uid"]
@@ -369,13 +374,22 @@ async def batch_import_accounts(req: BatchImportRequest, background_tasks: Backg
             if parsed_cookies:
                 cookie_count += 1
 
+            proxy = item.get("proxy") or batch_proxy
+
             cursor.execute("""
                 INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
             """, (item["name"], item["account_type"], item.get("email"), item["uid"], item["pass"], item.get("twofa"),
-                  item.get("proxy"), cookies_json, "facebook" if item["account_type"] == "facebook" else "google"))
+                  proxy, cookies_json, "facebook" if item["account_type"] == "facebook" else "google"))
             new_id = cursor.lastrowid
             added.append((new_id, parsed_cookies))
+            accounts_added.append({
+                "id": new_id,
+                "name": item["name"],
+                "uid": uid,
+                "line": item.get("line", 0),
+                "text": uid or item["name"]
+            })
             existing_uids.add(uid)
             if email:
                 existing_emails.add(email)
@@ -394,8 +408,8 @@ async def batch_import_accounts(req: BatchImportRequest, background_tasks: Backg
         for new_id, _ in added:
             background_tasks.add_task(auto_login_facebook_dola, new_id, True)
 
-    return {"success": True, "imported": count, "with_cookies": cookie_count, "errors": err_list,
-            "auto_login_queued": bool(req.auto_login)}
+    return {"success": True, "imported": count, "with_cookies": cookie_count, "accounts": accounts_added,
+            "errors": err_list, "auto_login_queued": bool(req.auto_login)}
 
 
 @app.post("/api/accounts/{account_id}/auto-login")
@@ -468,11 +482,13 @@ async def check_account_dola(account_id: int):
 
 
 @app.post("/api/accounts/{account_id}/check-credits")
+@app.post("/api/accounts/{account_id}/check")
 async def api_check_account_credits(account_id: int):
     return await check_account_credits(account_id)
 
 
 @app.post("/api/accounts/check-all-credits")
+@app.post("/api/accounts/check-all")
 async def api_check_all_credits(background_tasks: BackgroundTasks):
     conn = get_connection()
     try:
@@ -510,6 +526,15 @@ async def delete_account(account_id: int):
         conn.commit()
     finally:
         conn.close()
+
+    p_dir = account_profile_dir(account_id)
+    if os.path.isdir(p_dir):
+        try:
+            import shutil
+            shutil.rmtree(p_dir, ignore_errors=True)
+        except Exception as e:
+            log.warning("Không thể xóa thư mục profile %s: %s", p_dir, e)
+
     log_event(f"Đã xóa tài khoản #{account_id}", "WARNING", "Account", account_id=account_id)
     return {"success": True}
 
