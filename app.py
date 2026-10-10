@@ -104,6 +104,7 @@ class BatchJobsRequest(BaseModel):
     ratio: Optional[str] = None
     style_code: Optional[str] = ""      # "" = tự nhận diện; mã trong director.ARCHETYPE_BY_CODE để ép trường phái
     director: Optional[bool] = None     # None = theo setting director_enabled
+    batch_name: Optional[str] = None
 
 
 class DirectorPreviewRequest(BaseModel):
@@ -627,6 +628,12 @@ async def director_preview(req: DirectorPreviewRequest):
             "duration": ctx["duration"], "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
 
 
+@app.get("/api/director/styles")
+async def get_director_styles():
+    """Danh sách 14 trường phái điện ảnh chuẩn của Đạo diễn AI."""
+    return {"success": True, "styles": director.style_choices()}
+
+
 @app.post("/api/jobs")
 async def create_job(req: CreateJobRequest):
     title = req.title if req.title else req.prompt[:40] + "..."
@@ -669,6 +676,7 @@ async def create_batch_jobs(req: BatchJobsRequest):
     except ValueError as e:
         return {"success": False, "message": str(e), "created": 0, "jobs": []}
 
+    batch_name = (req.batch_name or "").strip() or None
     created = []
     conn = get_connection()
     try:
@@ -676,12 +684,13 @@ async def create_batch_jobs(req: BatchJobsRequest):
         for seq, p, composed in prepared:
             cursor.execute("""
                 INSERT INTO jobs (title, prompt, prompt_final, archetype_code, model, duration, ratio, status,
-                                  status_message, progress, seq, reference_image, attempts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+                                  status_message, progress, seq, batch_name, reference_image, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0)
             """, (p[:40] + "...", p, composed["prompt_final"], composed["archetype_code"], ctx["model"], ctx["duration"],
-                  ctx["ratio"], JobStatus.CHO, "Chờ worker nhặt", seq, composed["reference_image"] or ""))
+                  ctx["ratio"], JobStatus.CHO, "Chờ worker nhặt", seq, batch_name, composed["reference_image"] or ""))
             created.append({"id": cursor.lastrowid, "prompt": p, "prompt_final": composed["prompt_final"],
-                            "archetype": composed["archetype_code"], "characters": composed["characters"]})
+                            "archetype": composed["archetype_code"], "characters": composed["characters"],
+                            "batch_name": batch_name})
         conn.commit()
     finally:
         conn.close()
@@ -690,8 +699,8 @@ async def create_batch_jobs(req: BatchJobsRequest):
               + (", ".join(codes) if codes else "tắt"), "SUCCESS", "Queue")
     for w in ctx["warnings"]:
         log_event(f"Nạp lô prompt: {w}", "WARNING", "Queue")
-    return {"success": True, "created": len(created), "jobs": created, "duration": ctx["duration"],
-            "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
+    return {"success": True, "created": len(created), "jobs": created, "batch_name": batch_name,
+            "duration": ctx["duration"], "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
 
 
 @app.put("/api/jobs/{job_id}/prompt_final")

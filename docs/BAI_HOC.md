@@ -381,4 +381,12 @@ Mẫu một mục:
 - Quy tắc: Luôn xác thực nội dung file video (`_is_valid_video_file` từ chối `<!DOCTYPE html`, `<html`, `{"error"`); truyền Header Cookie từ phiên Playwright khi tải; tự động xóa sạch file tạm nếu tải thất bại hoặc nội dung không hợp lệ; đính kèm ảnh tham chiếu `reference_image` qua `input[type="file"]` trước khi gửi prompt nếu file tồn tại trên đĩa.
 - Kiểm: `tests/test_video_phase3.py` (T1–T5), `tests/test_bai_hoc.py`.
 
+## BH-53 · Đạo diễn AI đa trường phái và quản lý đặt tên lô phim (batch_name)
+- Ngày: 2026-10-10 · Giai đoạn: 4 · Mã: P1–P7
+- Triệu chứng: Hàng đợi job không hiển thị rõ lô phim khiến người dùng khó quản lý các đợt tạo video hàng loạt; thiếu endpoint chuẩn để giao diện hoặc công cụ lấy danh sách 14 trường phái điện ảnh động; sửa prompt khi job đang chạy gây xung đột dữ liệu.
+- Nguyên nhân gốc: `BatchJobsRequest` chưa nhận trường `batch_name` để gán vào CSDL; chưa có route `GET /api/director/styles`; `PUT /api/jobs/{id}/prompt_final` cần chặn tuyệt đối khi job `Đang chạy`.
+- Quy tắc: Hỗ trợ `batch_name` khi tạo lô job và hiển thị nhãn lô trực quan trên giao diện; cung cấp endpoint `GET /api/director/styles` chuẩn hóa 14 trường phái; chỉ cho phép sửa `prompt_final` khi job chưa chạy (`Chờ`, `Tạm dừng`, `Thất bại`) và từ chối rõ ràng bằng tiếng Việt khi job đang chạy.
+- Kiểm: `tests/test_director_phase4.py` (4 tests), `tests/test_director.py`, `tests/test_director_docs.py`.
+
+
 
