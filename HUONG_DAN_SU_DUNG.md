@@ -63,7 +63,17 @@ Hệ thống tích hợp bộ phân tích thông minh chuẩn Notebook ChatGPT &
 * Hỗ trợ tạo đơn lẻ hoặc tạo hàng loạt hàng chục video cùng lúc.
 * Tự động gán tài khoản rảnh và xoay vòng IP proxy.
 * Nếu 1 tài khoản hết token hoặc bị rate limit, hệ thống tự động xoay sang nick khác để tiếp tục render.
-* Thời gian render chuẩn cho video Seedance 2.5 (30s) là **3 - 5 phút**.
+* Thời lượng video Dola hỗ trợ: **4 đến 15 giây (mặc định 15)**; tool chỉ cho chọn 5 / 10 / 15 giây. Tỷ lệ khung hình: **16:9 (ngang, mặc định)** hoặc 9:16 (dọc). Hai tham số này được ghi rõ trong câu mở đầu của prompt gửi Dola để Dola không hỏi lại; job cũ còn "30 giây" trong hàng đợi sẽ tự được ép về 15 giây (có dòng nhật ký).
+* Thời gian render chuẩn cho một video Seedance 2.5 (4 đến 15 giây, mặc định 15) là **3 - 5 phút**.
+* Nếu Dola vẫn hỏi lại (ví dụ hỏi tỷ lệ), tool tự trả lời **một lần** bằng đúng thời lượng và tỷ lệ của job rồi chờ render tiếp (nhật ký có dòng "Dola hỏi lại ... đã tự trả lời"). Nếu Dola trả lời bằng chữ mà không tạo video (hỏi lần hai, từ chối), job **Thất bại ngay** với nguyên văn câu Dola nói (xem trong nút **Prompt** của job, mục "Dola trả lời:"), không chờ hết 8 phút và không tự chạy lại.
+
+---
+
+## 4.1. Các cửa sổ Chrome ẩn khi tool đang chạy
+* Khi tool chạy job, bạn sẽ thấy **nhiều biểu tượng Chrome trên taskbar** nhưng không thấy cửa sổ nào: đó là Chrome của từng nick, tool đặt cửa sổ **nằm ngoài màn hình** (Dola chặn Chrome ẩn hoàn toàn nên phải dùng Chrome thật).
+* **KHÔNG đóng các cửa sổ đó** (không bấm X, không "Close window" trên taskbar): đóng là job của nick đó **thất bại** ngay.
+* Khi Dola bắt kéo mảnh ghép (captcha), tool tự đưa cửa sổ của nick đó ra màn hình với tiêu đề `Nick <tên> — kéo mảnh ghép`; kéo xong cửa sổ tự ẩn lại và job chạy tiếp. Nếu tool báo "không đưa được cửa sổ ra màn hình", bấm nút **Chrome** trên dòng nick để mở cửa sổ và kéo tay, rồi bấm **Tiếp tục** trên job.
+* Hàng đợi báo "Đang chờ chỗ mở Chrome (x/N đang dùng)" nghĩa là đã mở đủ số Chrome cho phép (Cài đặt → Số Chrome tối đa); job sẽ tự chạy khi có chỗ.
 
 ---
 
