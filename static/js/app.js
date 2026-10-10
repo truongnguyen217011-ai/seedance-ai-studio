@@ -2253,33 +2253,6 @@ async function checkMuseToken(accountId) {
   }
 }
 
-async function openImportB3Modal() {
-  const filePath = prompt(
-    "Nhập đường dẫn đầy đủ đến file '_ALL_CLIP_PROMPTS.txt' hoặc thư mục bài sản xuất của TOOL AI:\n(Ví dụ: D:\\TOOL_AI\\Ten_Bai\\_ALL_CLIP_PROMPTS.txt)",
-    "D:\\TOOL_AI\\"
-  );
-  if (!filePath || !filePath.trim()) return;
-
-  try {
-    const res = await fetch('/api/batch/import_b3', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath.trim() })
-    });
-    const data = await res.json();
-    if (data.success) {
-      alert(`🎉 ${data.message}\n\n• Tổng số clip: ${data.total_clips}\n• Đã chia đều cho: ${data.accounts_assigned} tài khoản Muse AI sẵn có\n\nHệ thống sẽ bắt đầu tự động render song song!`);
-      switchTab('video');
-      fetchJobs();
-      fetchStats();
-    } else {
-      alert('Lỗi nạp batch: ' + data.message);
-    }
-  } catch (err) {
-    showToast('Lỗi kết nối: ' + err.message, 'error');
-  }
-}
-
 // Initial load & Polling
 window.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();

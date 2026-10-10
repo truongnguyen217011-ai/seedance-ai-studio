@@ -388,5 +388,12 @@ Mẫu một mục:
 - Quy tắc: Hỗ trợ `batch_name` khi tạo lô job và hiển thị nhãn lô trực quan trên giao diện; cung cấp endpoint `GET /api/director/styles` chuẩn hóa 14 trường phái; chỉ cho phép sửa `prompt_final` khi job chưa chạy (`Chờ`, `Tạm dừng`, `Thất bại`) và từ chối rõ ràng bằng tiếng Việt khi job đang chạy.
 - Kiểm: `tests/test_director_phase4.py` (4 tests), `tests/test_director.py`, `tests/test_director_docs.py`.
 
+## BH-54 · Gỡ bỏ hoàn toàn mã nguồn cũ Muse AI, OTP mail và làm sạch codebase (Giai đoạn 5)
+- Ngày: 2026-10-10 · Giai đoạn: 5 · Mã: G1, G2
+- Triệu chứng: Dự án tồn tại mã nguồn cũ không còn dùng (Muse AI, OTP dịch vụ mail Dongvanfb, batch B3) gây vi phạm quy tắc kiến trúc (sqlite3.connect tự do, kill_orphan_chrome ngoài module cho phép, chuỗi trạng thái tự tạo, nuốt lỗi); các nút bấm batch cũ trên web không còn ý nghĩa.
+- Nguyên nhân gốc: Mã thử nghiệm cũ từ các phiên bản trước chưa được dọn dẹp triệt để; cần loại bỏ để tập trung 100% vào luồng Dola AI và Đạo diễn AI chuẩn.
+- Quy tắc: Xóa bỏ hoàn toàn 4 file legacy (`muse_service.py`, `otp_service.py`, `batch_dispatcher.py`, `seed_sample_data.py`); loại bỏ danh sách ngoại lệ `LEGACY_PHASE5` trong `tests/test_bai_hoc.py`; chuyển các endpoint legacy (`/api/accounts/login_muse`, `/api/accounts/check_muse_token`, `/api/batch/import_b3`, `/api/batch/progress/{id}`) sang phản hồi thông báo từ chối rõ ràng bằng tiếng Việt có dấu; gỡ bỏ nút bấm nạp clip B3 cũ trên giao diện web để người dùng chỉ dùng tính năng "Thêm Prompt Hàng Loạt" với Đạo diễn AI; đảm bảo toàn bộ test suite đạt 100% PASSED (không còn xfail).
+- Kiểm: `python -m pytest tests/test_bai_hoc.py -q` (9/9 passed, 0 xfail); `python -m pytest tests -q` (373 passed, 0 xfail).
+
 
 

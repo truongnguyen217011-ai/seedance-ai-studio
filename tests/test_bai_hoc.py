@@ -17,21 +17,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
 BAI_HOC = ROOT / "docs" / "BAI_HOC.md"
 
-# File mã cũ (Muse AI, OTP mail, batch B3, seed mẫu) sẽ GỠ ở giai đoạn 5 (BH-12). Chúng vi phạm nhiều
-# bài học (chuỗi trạng thái tay, kill_orphan_chrome, sqlite3.connect, except/pass, giá trị giả) nhưng
-# không được sửa ở giai đoạn 1 để tránh đụng mã sắp xóa. Danh sách này là nơi DUY NHẤT liệt kê chúng;
-# test_legacy_files_still_present_until_phase5 sẽ XPASS (và đỏ vì strict) khi gỡ xong → xóa danh sách này.
-LEGACY_PHASE5 = {"muse_service.py", "otp_service.py", "batch_dispatcher.py", "seed_sample_data.py"}
-
-
 def root_py_files() -> List[pathlib.Path]:
     """*.py ở thư mục gốc dự án (không gồm tests/)."""
     return sorted(p for p in ROOT.glob("*.py") if p.is_file())
 
 
 def phase1_py_files() -> List[pathlib.Path]:
-    """*.py ở gốc trừ các file sẽ gỡ ở giai đoạn 5."""
-    return [p for p in root_py_files() if p.name not in LEGACY_PHASE5]
+    """*.py ở gốc dự án sau khi đã gỡ hoàn toàn các file legacy ở giai đoạn 5."""
+    return root_py_files()
 
 
 def read(p: pathlib.Path) -> str:
@@ -159,15 +152,6 @@ def test_bh10_chrome_exe_and_startfile_only_in_browser_py():
     # check_env.py tuyệt đối không được mở Chrome (chỉ dò đường dẫn)
     bad = _lines_matching(ROOT / "check_env.py", re.compile(r"os\.startfile|startfile\(|subprocess\.Popen\(.*chrome", re.IGNORECASE))
     assert not bad, "BH-10: check_env.py chỉ được dò đường dẫn, không được mở Chrome:\n" + "\n".join(bad)
-
-
-# ---------------------------------------------------------------- giai đoạn 5: nhắc gỡ danh sách LEGACY_PHASE5
-@pytest.mark.xfail(strict=True, reason="gỡ ở giai đoạn 5: muse_service/otp_service/batch_dispatcher/seed_sample_data còn tồn tại")
-def test_legacy_files_still_present_until_phase5():
-    """Đỏ (xfail) chừng nào còn file cũ. Khi gỡ xong test XPASS → strict làm nó đỏ để nhắc xóa LEGACY_PHASE5
-    và các chỗ loại trừ trong file này."""
-    present = sorted(name for name in LEGACY_PHASE5 if (ROOT / name).exists())
-    assert not present, f"file giai đoạn 5 vẫn còn: {present}"
 
 
 # ---------------------------------------------------------------- BH-23

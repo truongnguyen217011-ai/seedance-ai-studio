@@ -19,7 +19,6 @@ import browser
 import config
 import director
 from account_pool import AccountPool
-from batch_dispatcher import get_batch_progress, import_b3_batch
 from constants import (DEFAULT_DURATION, DEFAULT_RATIO, JobStatus, Reason, duration_label, normalize_duration,
                        normalize_ratio)
 from database import get_connection, init_db, log_event
@@ -1034,16 +1033,12 @@ async def check_muse_token_account(req: dict):
 
 @app.post("/api/batch/import_b3")
 async def import_b3_prompts(req: ImportBatchRequest):
-    try:
-        return import_b3_batch(req.file_path, req.title)
-    except Exception as e:  # noqa: BLE001 - trả lỗi về giao diện
-        log.warning("Import B3 lỗi: %s", e)
-        return {"success": False, "message": str(e)}
+    return {"success": False, "message": "Batch B3 Muse AI không còn được hỗ trợ. Vui lòng dùng tính năng 'Thêm Prompt Hàng Loạt' với Đạo diễn AI."}
 
 
 @app.get("/api/batch/progress/{batch_id}")
 async def get_batch_status(batch_id: str):
-    return get_batch_progress(batch_id)
+    return {"batch_id": batch_id, "total": 0, "completed": 0, "failed": 0, "processing": 0, "percent": 100, "status": "deprecated", "message": "Batch B3 Muse AI không còn được hỗ trợ"}
 
 
 if __name__ == "__main__":
