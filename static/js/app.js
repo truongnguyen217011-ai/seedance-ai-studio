@@ -925,13 +925,15 @@ function _batchPromptLines() {
 function _directorRequestBody(prompts) {
   const styleEl = document.getElementById('batchStyleSelect');
   const dirEl = document.getElementById('batchDirectorEnabled');
+  const nameEl = document.getElementById('batchNameInput');
   return {
     prompts,
     model: document.getElementById('batchModelSelect').value,
     duration: document.getElementById('batchDurationSelect').value,
     ratio: document.getElementById('batchRatioSelect').value,
     style_code: styleEl ? styleEl.value : '',
-    director: dirEl ? !!dirEl.checked : null
+    director: dirEl ? !!dirEl.checked : null,
+    batch_name: nameEl && nameEl.value.trim() ? nameEl.value.trim() : null
   };
 }
 
@@ -1011,6 +1013,8 @@ async function submitBatchPrompts() {
     }
     closeModal('modalBatchPrompts');
     document.getElementById('batchPromptsInput').value = '';
+    const nameEl = document.getElementById('batchNameInput');
+    if (nameEl) nameEl.value = '';
     const box = document.getElementById('directorPreviewBox');
     if (box) { box.innerHTML = ''; box.classList.add('hidden'); }
     const codes = Array.from(new Set((data.jobs || []).map(j => j.archetype).filter(Boolean)));
