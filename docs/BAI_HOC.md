@@ -90,8 +90,8 @@ Mẫu một mục:
 - Triệu chứng: dán cookie Dola ở form thêm nick thì báo "Chưa kết nối Dola".
 - Nguyên nhân gốc: form gắn domain `.facebook.com` theo loại nick, không nhìn nội dung cookie.
 - Quy tắc: nhận diện domain từ nội dung cookie (`sessionid` → Dola, `c_user` → Facebook), không từ loại nick.
-- Trạng thái: chưa áp dụng, làm ở giai đoạn 2 (K3).
-- Kiểm: test parser cookie; K3.
+- Trạng thái: **đã áp dụng ở giai đoạn 2 (K3)**: `parser.detect_cookie_kind` + `dola_service.parse_cookies_by_content` dùng ở cả ba ô (form thêm nick, nhập nhiều dòng, modal Dán Cookie); JSON/Netscape có domain riêng thì giữ nguyên.
+- Kiểm: `tests/test_phase2_unit.py::test_k3_parse_cookies_by_content`, `::test_k3_detect_cookie_kind`; `tests/test_phase2_api.py::test_k3_dola_cookie_pasted_in_add_account_form_gives_has_dola` (dán "sessionid=...; sessionid_ss=..." vào form thêm nick → `has_dola = 1`), `::test_k3_paste_cookie_modal_detects_domain_from_content`; `grep -n "parse_cookie_string\|parse_dola_cookies" app.py` phải rỗng.
 
 ## BH-12 · Tính năng giả trả dữ liệu mẫu như thật
 - Ngày: 2026-10-09 · Giai đoạn: 5 · Mã: G2
@@ -359,3 +359,46 @@ Mẫu một mục:
 - Nguyên nhân gốc: `fix_header` viết lại header **vô điều kiện** hễ nhận ra được header, coi cột CSDL là nguồn sự thật duy nhất; nhưng header trong `prompt_final` là thứ người dùng được phép sửa (BH-42) và là thứ thật sự gửi Dola. Hai nguồn (cột và header) lệch nhau thì bản gửi đi phải thắng, không phải cột.
 - Quy tắc: lớp tự động chỉ được **sửa khi thiếu/sai** (giây ngoài 4-15 hoặc thiếu tỷ lệ), không ghi đè giá trị hợp lệ người dùng đã viết; `director.parse_header` đọc ngược header hợp lệ và `build_full_prompt` ghi `jobs.duration`/`ratio` theo nó để cột khớp với thứ đã gửi. Tổng quát: khi một giá trị vừa có trong CSDL vừa có trong văn bản người dùng sửa được, văn bản thắng và CSDL được đồng bộ ngược.
 - Kiểm: `tests/test_director.py::test_bh46_fix_header_rewrites_old_header_only` (header 10 giây 9:16 không đổi khi truyền 15 giây 16:9), `::test_bh49_parse_header_reads_back_user_edited_values`; `tests/test_dola_reply_unit.py::test_bh49_build_full_prompt_keeps_user_edited_valid_header_and_updates_job` (8 giây 9:16 → prompt giữ nguyên, `jobs.duration` thành "8 giây"); `grep -n "parse_header" dola_service.py` phải có trong `build_full_prompt`.
+
+## BH-50 · Proxy hỏng thì lặng lẽ chuyển sang kết nối trực tiếp
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A4, A5
+- Triệu chứng: nick có proxy chết vẫn "Auto Login thành công" / mở Chrome bình thường; Facebook và Dola thấy nick đăng nhập từ IP thật của máy (nhiều nick cùng một IP → checkpoint, khóa hàng loạt); người dùng không hề biết proxy đã hỏng vì nhật ký chỉ có một dòng WARNING "thử kết nối trực tiếp".
+- Nguyên nhân gốc: `_open_with_proxy_fallback` coi "Chrome mở được" quan trọng hơn "đi đúng đường ra"; giả định sai: "không proxy vẫn tốt hơn không chạy". Với nick farm, chạy sai IP tệ hơn không chạy.
+- Quy tắc: mọi thao tác trên nick (job, auto login, check credit, chẩn đoán, mở Chrome tay) chỉ mở Chrome với **đúng** proxy của nick (`_open_account_session`, `parse_proxy(acc["proxy"])`); lỗi proxy (`net::ERR_PROXY_CONNECTION_FAILED`, `ERR_TUNNEL_CONNECTION_FAILED`, `ERR_SOCKS_...`, `dola_service.PROXY_ERROR_MARKERS`) → `needs_manual='proxy'` + `last_error` (proxy đã che mật khẩu), job về Chờ **không tính lượt** với `Reason.PROXY_DEAD`, worker chọn nick khác; không bao giờ truyền `proxy=None` cho nick có proxy. Tải video cũng qua proxy của nick (httpx `trust_env=False`), không qua proxy môi trường. Gỡ cờ khi người dùng đổi proxy (`batch-assign-proxy`) hoặc Chẩn đoán lại thấy proxy đạt.
+- Kiểm: `tests/test_phase2_unit.py::test_bh50_no_silent_proxy_fallback_in_source` (không còn `_open_with_proxy_fallback`, "thử kết nối trực tiếp", `proxy=None`), `::test_a5_proxy_dead_marks_account_and_requeues_job_without_counting_attempt`; `tests/test_phase2_fake_dola.py::test_a5_dead_proxy_flags_account_job_waits_then_other_account_runs` (proxy trỏ cổng đóng: nick `needs_manual='proxy'`, job Chờ, fake Dola **không** nhận request nào, nick khác chạy job), `::test_a4_job_check_credit_and_diagnose_go_through_account_proxy` (fake proxy đếm request trang, chain, tải video, IP).
+
+## BH-51 · Dùng `hash()` của Python làm UID thay thế cho cookie Dola
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A2, A3
+- Triệu chứng: dán lại đúng cookie Dola (dòng chỉ có `sessionid=...`) ở lần mở app sau thì được thêm thành nick mới thay vì báo "đã có"; danh sách nick trùng dần theo số lần nhập.
+- Nguyên nhân gốc: `parser` đặt `uid = f"Dola_{abs(hash(text)) % 1000000}"`; `hash()` của chuỗi trong Python được **ngẫu nhiên hóa mỗi tiến trình** (PYTHONHASHSEED), nên cùng một cookie cho UID khác nhau sau khi khởi động lại. Giả định sai: "hash() là hàm băm ổn định".
+- Quy tắc: mọi định danh suy ra từ dữ liệu để **so trùng qua nhiều phiên** phải dùng băm ổn định (`hashlib.sha1`), băm trên **giá trị đặc trưng** (sessionid) chứ không trên cả chuỗi (thứ tự cookie có thể đổi): `parser.stable_dola_uid`. Không dùng `hash()` cho bất cứ thứ gì ghi vào CSDL.
+- Kiểm: `tests/test_phase2_api.py::test_a3_parse_preview_shows_each_line_before_saving` (dán lại cookie Dola → "đã có"); `grep -n "hash(" parser.py app.py` chỉ được ra `hashlib`.
+
+## BH-52 · Xóa nick thất bại vì khóa ngoại của bảng jobs/images
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A6
+- Triệu chứng: bấm Xóa trên nick đã từng chạy job → giao diện báo lỗi HTTP 500 (`FOREIGN KEY constraint failed`), nick không xóa được; nick chưa chạy job gì thì xóa được nên tưởng lỗi ngẫu nhiên.
+- Nguyên nhân gốc: `get_connection()` bật `PRAGMA foreign_keys=ON` (đúng), `jobs.account_id`/`images.account_id` tham chiếu `accounts.id` không có `ON DELETE`, mà `DELETE FROM accounts` không gỡ tham chiếu trước. Giả định sai: "xóa một dòng là xóa một dòng".
+- Quy tắc: xóa thực thể cha phải xử lý mọi tham chiếu con trong **cùng một transaction**: job đang Chờ/Đang chạy/Tạm dừng → `Chờ` + `Reason.ACCOUNT_DELETED` + `account_id = NULL`; job đã xong/thất bại và ảnh → `account_id = NULL` (giữ lịch sử); rồi mới `DELETE`; sau đó xóa thư mục `profiles/acc_{id}`. Không xóa khi pool còn giữ nick. Thêm bảng con mới tham chiếu `accounts` thì phải cập nhật `delete_account`.
+- Kiểm: `tests/test_phase2_api.py::test_a6_delete_account_removes_profile_and_requeues_jobs` (nick có job Hoàn thành + ảnh vẫn xóa được, job Chờ/Tạm dừng về Chờ với lý do, thư mục profile mất), `::test_a6_delete_busy_account_refused`.
+
+## BH-53 · Lọc SQL bằng `NOT (... OR ...)` trên cột có thể NULL
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A7
+- Triệu chứng: bộ lọc "Sẵn sàng" trả 0 nick dù 148 nick có phiên Dola; chỉ nick đã từng check credit mới hiện.
+- Nguyên nhân gốc: mệnh đề nghỉ `(rest_until > ?) OR (credits_date = ? AND credits = 0)` cho **NULL** (không phải FALSE) khi `credits`/`credits_date` còn NULL (chưa check credit), và `NOT NULL` vẫn là NULL nên WHERE loại dòng. Giả định sai: "so sánh với NULL cho FALSE".
+- Quy tắc: điều kiện phủ định (`NOT`, `!=`) trên cột có thể NULL phải bọc `COALESCE(cột, giá_trị_mặc_định)` hoặc `cột IS NOT NULL AND ...`; viết test lọc với dữ liệu **chưa đầy đủ** (NULL) chứ không chỉ dữ liệu đẹp. Bộ lọc của `GET /api/accounts` nằm ở một chỗ (`_accounts_where`).
+- Kiểm: `tests/test_phase2_api.py::test_a7_two_hundred_accounts_paginated_fast` (nick `credits = NULL` vẫn thuộc "ready"); `grep -n "COALESCE(credits" app.py`.
+
+## BH-54 · Kiểm "đi qua proxy" bằng thư viện tự bỏ qua proxy cho loopback
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A4 (hạ tầng test)
+- Triệu chứng: test A4 đếm fake proxy: trang và chain đi qua proxy nhưng bước tải video đếm 0, dù mã "có truyền proxy". Thử `context.request` của Playwright rồi `urllib` + `ProxyHandler` đều 0.
+- Nguyên nhân gốc: Playwright APIRequestContext **không bao giờ** proxy host loopback (bất kể `bypass`), còn `urllib` đọc biến môi trường `NO_PROXY` (máy có `127.0.0.1` trong đó) rồi tự bỏ proxy. Giả định sai: "đã truyền proxy thì request đi qua proxy".
+- Quy tắc: đường tải/hỏi IP của nick dùng `httpx` với `trust_env=False` và `proxy=` tường minh (không đọc env, không bỏ qua loopback); proxy socks5 (httpx không có socksio) mới dùng `context.request`. Mọi tính năng "qua proxy" phải có test đếm trên fake proxy (`tests/fake_proxy.py`), gồm cả bước tải video, không chỉ bước mở trang.
+- Kiểm: `tests/test_phase2_fake_dola.py::test_a4_job_check_credit_and_diagnose_go_through_account_proxy` (đếm `/video/tos/` và `/__ip` trên fake proxy); `grep -n "import urllib" dola_service.py` phải rỗng.
+
+
+## BH-55 · Đọc kích thước hàng đợi dùng chung SAU khi đã khởi động luồng làm việc
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: K9 (hạ tầng test)
+- Triệu chứng: `POST /api/accounts/scan-all` trả `total: 6` trong khi nhật ký ghi "Bắt đầu quét tất cả 8 nick"; test K9 đỏ, đợt quét vẫn chạy nền sang test sau và giữ nick trong pool → các test sau báo "1 nick đang bận" dù không liên quan.
+- Nguyên nhân gốc: `start_scan_all` khởi động các luồng `pop(0)` từ `queue` rồi mới `return {"total": len(queue)}`; hai luồng đã lấy 2 nick trước khi câu `return` đọc độ dài. Giả định sai: "giá trị vừa dùng để log vẫn còn nguyên sau một dòng lệnh".
+- Quy tắc: giá trị đưa ra ngoài (API, log) của một cấu trúc dùng chung giữa các luồng phải được **chụp vào biến cục bộ trước khi** khởi động luồng; test tích hợp nào khởi động việc nền phải có fixture chờ việc đó kết thúc ở teardown (`scan_finished`) để một test đỏ không kéo test sau đỏ theo; test đơn vị đụng singleton (`AccountPool`, `worker._running_jobs`) dọn trước và sau (`_clean_pool` autouse).
+- Kiểm: `tests/test_phase2_fake_dola.py::test_k9_scan_all_respects_chrome_limit_and_finishes` (`total == 8` ngay sau khi gọi); `grep -n "total = len(queue)" diagnostics.py`.

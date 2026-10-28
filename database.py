@@ -149,6 +149,10 @@ def init_db():
         ("chrome_ok", "INTEGER"),
         # Số lần lỗi kết nối Dola liên tiếp (chưa vào được trang); về 0 khi nick vào được trang (KIEN_TRUC.md mục 4)
         ("consecutive_errors", "INTEGER DEFAULT 0"),
+        # Giai đoạn 2 (A7): 1/0 = nick có/không có phiên Dola (sessionid còn hạn) — cập nhật mỗi khi cookie/phiên
+        # được ghi và một lần lúc khởi động (dola_service.refresh_has_dola_flags); NULL = chưa quét.
+        # GET /api/accounts đọc cột này thay vì mở storage_state.json của từng nick mỗi 3 giây.
+        ("has_dola", "INTEGER"),
     ]
     for col, decl in account_columns:
         _add_column_if_missing(cursor, "accounts", col, decl)

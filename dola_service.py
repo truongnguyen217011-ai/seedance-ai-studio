@@ -6,13 +6,14 @@ AccountPool giữ trước khi đụng profile; không giết Chrome; trạng th
 import json
 import os
 import re
-import shutil
 import sys
+import threading
 import time
 import asyncio
-import urllib.request
 from datetime import datetime, timedelta
 from typing import Optional
+
+import httpx
 
 if sys.platform == "win32":
     try:
@@ -31,6 +32,7 @@ from constants import (DEFAULT_DURATION, DEFAULT_RATIO, AccountStatus, JobStatus
 from database import get_connection
 from diagnostics import mask_proxy
 from logger import artifact_suffix, get_logger, log_event, save_failure_artifacts
+from parser import COOKIE_KIND_DOLA, COOKIE_KIND_FACEBOOK, DOLA_COOKIE_NAMES, FACEBOOK_COOKIE_NAMES, detect_cookie_kind
 from twofa import get_totp_candidates
 
 log = get_logger("Dola")
@@ -116,8 +118,18 @@ RE_DAILY_LIMIT = re.compile(r'reached the daily limit for video generation|đã 
 RE_NO_CREDIT_FAIL = re.compile(r'did\s?n[\'’]?t\s+use\s+any\s+credits?', re.IGNORECASE)
 RE_CREDITS_VI = re.compile(r'còn\s+(\d+)\s+(?:điểm|lượt|credit)', re.IGNORECASE)
 RE_CREDITS_VI_2 = re.compile(r'(\d+)\s+lượt\s+tạo\s+video', re.IGNORECASE)
+# K4: biến thể trong văn bản chain sau khi render ("you have 2 credits remaining", "2 video credits remaining today")
+RE_CREDITS_REMAINING = re.compile(r'(\d+)\s+(?:video\s+)?credits?\s+(?:remaining|left)', re.IGNORECASE)
 
 CREDIT_UNREADABLE = "Không đọc được số credit trên trang"
+
+# Dấu hiệu lỗi proxy trong thông điệp Chromium/Playwright (A5). Chỉ những mã đặc trưng của proxy, không phải lỗi mạng chung.
+PROXY_ERROR_MARKERS = (
+    "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_SOCKS_CONNECTION_HOST_UNREACHABLE", "ERR_PROXY_AUTH_UNSUPPORTED", "ERR_PROXY_AUTH_REQUESTED",
+    "ERR_PROXY_CERTIFICATE_INVALID", "ERR_NO_SUPPORTED_PROXIES", "ERR_MANDATORY_PROXY_CONFIGURATION_FAILED",
+    "ERR_PROXY_CONNECTION_REFUSED",
+)
 
 
 def get_today_str() -> str:
@@ -145,31 +157,42 @@ def _safe_body_text(page) -> str:
         return ""
 
 
-def extract_dola_credits(page) -> Optional[int]:
-    """Bóc tách số credit còn lại từ DOM Dola AI. Trả về None nếu không đọc được (không bịa số)."""
-    body_text = _safe_body_text(page)
-    if not body_text:
+_CREDIT_PATTERNS = [
+    (RE_CREDITS_LEFT, 1),       # 'have X video credits left'
+    (RE_CREDITS_MATCH_EN, 2),   # 'will use X ... only have Y left today'
+    (RE_CREDITS_MATCH_VI, 2),
+    (RE_CREDITS_REMAINING, 1),  # 'X credits remaining'
+    (RE_CREDITS_VI, 1),
+    (RE_CREDITS_VI_2, 1),
+]
+
+
+def extract_credits_from_text(text: str) -> Optional[int]:
+    """Số credit còn lại đọc từ một đoạn văn bản (trang hoặc JSON chain của Dola, K4). None = không có câu nào nói về
+    credit (không bịa số)."""
+    if not text:
         return None
-
-    # 1. Daily limit = 0 credit
-    if RE_DAILY_LIMIT.search(body_text):
+    if RE_DAILY_LIMIT.search(text):
         return 0
-
-    patterns = [
-        (RE_CREDITS_LEFT, 1),       # 'have X video credits left'
-        (RE_CREDITS_MATCH_EN, 2),   # 'will use X ... only have Y left today'
-        (RE_CREDITS_MATCH_VI, 2),
-        (RE_CREDITS_VI, 1),
-        (RE_CREDITS_VI_2, 1),
-    ]
-    for regex, group in patterns:
-        m = regex.search(body_text)
+    for regex, group in _CREDIT_PATTERNS:
+        m = regex.search(text)
         if m:
             try:
                 return int(m.group(group))
             except (TypeError, ValueError) as e:
                 log.debug("Chuỗi credit '%s' không phải số: %s", m.group(group), e)
     return None
+
+
+def _is_credit_info_text(text: str) -> bool:
+    """Câu Dola chỉ nói về credit ("This will use 1 video credits, you only have 3 left today") không phải trả lời
+    nội dung: không lưu vào dola_reply, không tính là 'Dola trả lời bằng chữ' (K4)."""
+    return extract_credits_from_text(text or "") is not None and "?" not in (text or "")
+
+
+def extract_dola_credits(page) -> Optional[int]:
+    """Bóc tách số credit còn lại từ DOM Dola AI. Trả về None nếu không đọc được (không bịa số)."""
+    return extract_credits_from_text(_safe_body_text(page))
 
 
 # ==================== COOKIE, PHIÊN DOLA ====================
@@ -218,13 +241,40 @@ def parse_proxy(proxy_str):
         return None
     proxy_str = proxy_str.strip()
     if proxy_str.startswith(("http://", "https://", "socks5://")):
-        return {"server": proxy_str}
-    parts = proxy_str.split(":")
-    if len(parts) == 2:
-        return {"server": f"http://{parts[0]}:{parts[1]}"}
-    if len(parts) == 4:
-        return {"server": f"http://{parts[0]}:{parts[1]}", "username": parts[2], "password": parts[3]}
-    return {"server": f"http://{proxy_str}"}
+        cfg = {"server": proxy_str}
+    else:
+        parts = proxy_str.split(":")
+        if len(parts) == 2:
+            cfg = {"server": f"http://{parts[0]}:{parts[1]}"}
+        elif len(parts) == 4:
+            cfg = {"server": f"http://{parts[0]}:{parts[1]}", "username": parts[2], "password": parts[3]}
+        else:
+            cfg = {"server": f"http://{proxy_str}"}
+    if config.PROXY_BYPASS_LIST:
+        cfg["bypass"] = config.PROXY_BYPASS_LIST
+    return cfg
+
+
+def proxy_url(proxy_cfg: Optional[dict]) -> Optional[str]:
+    """URL proxy dạng scheme://user:pass@host:port cho thư viện HTTP (urllib/httpx) từ cấu hình parse_proxy."""
+    if not proxy_cfg:
+        return None
+    server = proxy_cfg.get("server", "")
+    user = proxy_cfg.get("username")
+    pwd = proxy_cfg.get("password")
+    if user and "@" not in server:
+        scheme, _, host = server.partition("://")
+        return f"{scheme}://{user}:{pwd or ''}@{host}"
+    return server
+
+
+def proxy_error_text(error) -> Optional[str]:
+    """Mã lỗi proxy (ERR_PROXY_CONNECTION_FAILED...) nếu thông điệp lỗi Chromium/Playwright là lỗi proxy (A5), ngược lại None."""
+    text = str(error or "")
+    for marker in PROXY_ERROR_MARKERS:
+        if marker in text:
+            return marker
+    return None
 
 
 def parse_cookie_string(cookie_str: str, domain: str = ".facebook.com"):
@@ -232,6 +282,59 @@ def parse_cookie_string(cookie_str: str, domain: str = ".facebook.com"):
     if "dola" in (domain or "") or _cookie_domain_matches(domain, config.DOLA_DOMAIN):
         return parse_dola_cookies(cookie_str)
     return _parse_raw_cookie_for_domain(cookie_str, domain)
+
+
+def parse_cookies_by_content(cookie_str: str, fallback_domain: str = ".facebook.com") -> list:
+    """Cookie dán vào BẤT KỲ ô nào (form thêm nick, import hàng loạt, modal Dán Cookie) được gắn domain theo
+    NỘI DUNG, không theo loại nick (K3, BH-11):
+
+    - JSON/Netscape đã có trường domain → giữ nguyên domain của từng cookie;
+    - chuỗi header có sessionid/sessionid_ss → domain Dola (`default_dola_cookie_domain()`), riêng cookie tên
+      Facebook (c_user, xs...) trong cùng chuỗi vẫn về .facebook.com;
+    - chuỗi header có c_user/xs → .facebook.com, riêng cookie tên Dola về domain Dola;
+    - không nhận ra cookie nào → `fallback_domain` (loại nick) cho mọi cookie.
+    """
+    text = str(cookie_str or "").strip()
+    if not text:
+        return []
+    kind = detect_cookie_kind(text)
+    if text[:1] in "[{" or "\t" in text:
+        # JSON (Cookie-Editor/J2TEAM/storageState) hoặc Netscape: parse_dola_cookies giữ domain từng cookie,
+        # chỉ gán domain Dola cho cookie thiếu domain (hiếm) — khi chuỗi là JSON Facebook thiếu domain thì gán .facebook.com
+        cookies = parse_dola_cookies(text)
+        if kind == COOKIE_KIND_FACEBOOK:
+            dola_default = default_dola_cookie_domain()
+            for c in cookies:
+                if c.get("domain") == dola_default and c.get("name") not in DOLA_COOKIE_NAMES:
+                    c["domain"] = ".facebook.com"
+        return cookies
+    dola_domain = default_dola_cookie_domain()
+    if kind == COOKIE_KIND_DOLA:
+        main_domain = dola_domain
+    elif kind == COOKIE_KIND_FACEBOOK:
+        main_domain = ".facebook.com"
+    else:
+        main_domain = fallback_domain or ".facebook.com"
+    cookies = []
+    for part in text.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        if k in DOLA_COOKIE_NAMES:
+            domain = dola_domain
+        elif k in FACEBOOK_COOKIE_NAMES:
+            domain = ".facebook.com"
+        else:
+            domain = main_domain
+        item = {"name": k, "value": v, "domain": domain, "path": "/", "secure": True}
+        item["sameSite"] = "None" if domain.endswith("facebook.com") else "Lax"
+        cookies.append(item)
+    return cookies
 
 
 def _parse_raw_cookie_for_domain(cookie_str: str, domain: str):
@@ -368,6 +471,34 @@ def save_account_storage_state(account_id: int, cookies_list):
     if dola_only:
         with open(dola_backup, "w", encoding="utf-8") as f:
             json.dump(dola_only, f, ensure_ascii=False, indent=2)
+    _set_has_dola(account_id, has_dola_session(cookies_list))
+
+
+def _set_has_dola(account_id: int, value: bool) -> None:
+    """Cột accounts.has_dola (A7): ghi mỗi khi cookie/phiên được ghi, để GET /api/accounts không phải đọc file."""
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE accounts SET has_dola = ? WHERE id = ?", (1 if value else 0, account_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def refresh_has_dola_flags() -> int:
+    """Quét một lần lúc khởi động (A7): tính has_dola cho mọi nick từ cột cookies + storage_state.json.
+    Trả về số nick có phiên Dola."""
+    conn = get_connection()
+    try:
+        rows = [dict(r) for r in conn.execute("SELECT id, cookies, has_dola FROM accounts").fetchall()]
+    finally:
+        conn.close()
+    with_session = 0
+    for acc in rows:
+        has = account_has_dola_session(acc)
+        with_session += 1 if has else 0
+        if acc.get("has_dola") != (1 if has else 0):
+            _set_has_dola(acc["id"], has)
+    return with_session
 
 
 def _load_cookies_json(raw, account_id=None) -> list:
@@ -394,7 +525,8 @@ def _load_storage_state_cookies(account_id: int) -> list:
 
 
 def account_has_dola_session(acc) -> bool:
-    """Nick có phiên Dola (trên cột cookies hoặc storage_state.json) không."""
+    """Nick có phiên Dola (trên cột cookies hoặc storage_state.json) không. Đọc file: chỉ dùng khi cần chắc chắn
+    (chọn nick cho job, quét lúc khởi động); giao diện dùng cột accounts.has_dola (A7)."""
     acc = dict(acc)
     acc_id = acc.get("id")
     if has_dola_session(_load_cookies_json(acc.get("cookies"), acc_id)):
@@ -451,14 +583,47 @@ def _inject_cookies(context, acc: dict, only_facebook: bool = False) -> int:
 
 
 def _mark_account_connected(account_id: int, cookies):
-    """Nick vào được trang Dola có phiên: cookie mới nhất, ready, và đếm lại lỗi kết nối liên tiếp từ 0."""
+    """Nick vào được trang Dola có phiên: cookie mới nhất, ready, has_dola, và đếm lại lỗi kết nối liên tiếp từ 0."""
     _set_account_fields(
         account_id,
         cookies=json.dumps(cookies),
         status=AccountStatus.READY,
         last_check=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         consecutive_errors=0,
+        has_dola=1 if has_dola_session(cookies) else 0,
     )
+
+
+def _now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _mark_login_blocked(acc: dict, reason: str, page=None, tag: str = "login_blocked", level: str = "ERROR") -> str:
+    """K2: Facebook báo sai mật khẩu / checkpoint → nick needs_manual='login' + last_error kèm ảnh, không được chọn cho
+    job (account_pool loại nick needs_manual). Trả về thông điệp đã ghi."""
+    arts = save_failure_artifacts(page, tag, account_id=acc["id"]) if page is not None else {}
+    msg = reason + artifact_suffix(arts)
+    _set_account_fields(acc["id"], needs_manual=NeedsManual.LOGIN, last_error=msg, last_check=_now_str())
+    log_event(f"Nick #{acc['id']} ({acc['name']}): {msg}", level, "Auth", account_id=acc["id"])
+    return msg
+
+
+def _mark_session_lost(acc: dict, page=None, job_id=None) -> str:
+    """Trang Dola không nhận phiên: needs_manual='login', has_dola=0, last_error kèm ảnh. Trả về hậu tố ' [ảnh: ...]'."""
+    arts = save_failure_artifacts(page, "no_session", job_id=job_id, account_id=acc["id"]) if page is not None else {}
+    suffix = artifact_suffix(arts)
+    _set_account_fields(acc["id"], needs_manual=NeedsManual.LOGIN, last_error="Phiên Dola mất hiệu lực, cần đăng nhập lại" + suffix,
+                        has_dola=0, last_check=_now_str())
+    return suffix
+
+
+def _mark_proxy_dead(acc: dict, error_code: str, where: str) -> str:
+    """A5: proxy của nick không phản hồi → needs_manual='proxy' + last_error (proxy đã che mật khẩu, BH-33); nick không
+    được chọn cho job cho tới khi người dùng đổi proxy và Chẩn đoán lại (diagnostics._persist gỡ cờ khi proxy đạt)."""
+    msg = f"Proxy '{mask_proxy(acc.get('proxy'))}' không phản hồi ({error_code}) khi {where}"
+    _set_account_fields(acc["id"], needs_manual=NeedsManual.PROXY, last_error=msg, last_check=_now_str())
+    log_event(f"Nick #{acc['id']} ({acc['name']}): {msg}", "ERROR", "Proxy", account_id=acc["id"])
+    return msg
 
 
 def _mark_no_credit(account_id: int) -> None:
@@ -582,29 +747,41 @@ def _auto_login_facebook_dola_sync(account_id: int, headless: bool = True):
         pool.release(account_id)
 
 
-def _open_with_proxy_fallback(stack, p, acc: dict, headless: bool):
-    """Mở browser_session; nếu proxy làm Chrome không mở được thì thử lại không proxy."""
-    profile_path = account_profile_dir(acc["id"])
-    proxy_config = parse_proxy(acc.get("proxy"))
-    try:
-        return stack.enter_context(browser_session(p, profile_path, proxy=proxy_config, headless=headless, account_id=acc["id"]))
-    except ChromeNotFoundError:
-        raise
-    except Exception as launch_err:  # noqa: BLE001 - Playwright ném Error chung
-        if not proxy_config:
-            raise
-        log_event(f"Proxy '{mask_proxy(acc.get('proxy'))}' làm Chrome không mở được ({str(launch_err)[:60]}), thử kết nối trực tiếp",
-                  "WARNING", "Proxy", account_id=acc["id"])
-        return stack.enter_context(browser_session(p, profile_path, proxy=None, headless=headless, account_id=acc["id"]))
-
-
 def _auto_login_locked(acc: dict, headless: bool):
+    """Auto login khi nick ĐÃ được pool giữ (bởi hàm gọi). Lỗi Chrome/proxy được ghi rõ lên nick (A5), không nuốt."""
+    account_id = acc["id"]
+    try:
+        return _auto_login_steps(acc, headless)
+    except ChromeNotFoundError as e:
+        _set_account_fields(account_id, chrome_ok=0, last_error=str(e), last_check=_now_str())
+        log_event(str(e), "ERROR", "Auth", account_id=account_id)
+        return {"success": False, "message": str(e)}
+    except Exception as e:  # noqa: BLE001 - Playwright ném Error chung
+        code = proxy_error_text(e)
+        if code and parse_proxy(acc.get("proxy")):
+            msg = _mark_proxy_dead(acc, code, "tự động đăng nhập")
+        else:
+            msg = f"Tự động đăng nhập lỗi: {str(e).strip().splitlines()[0][:150] if str(e).strip() else e.__class__.__name__}"
+            _set_account_fields(account_id, last_error=msg, last_check=_now_str())
+            log_event(f"Nick #{account_id} ({acc['name']}): {msg}", "ERROR", "Auth", account_id=account_id)
+        return {"success": False, "message": msg}
+
+
+def _open_account_session(stack, p, acc: dict, headless: bool):
+    """Mở browser_session với ĐÚNG proxy của nick (A4). Không bao giờ lặng lẽ chuyển sang kết nối trực tiếp khi proxy
+    hỏng (BH-50): lỗi proxy phải nổi lên thành needs_manual='proxy' để người dùng biết, không để nick lộ IP thật."""
+    profile_path = account_profile_dir(acc["id"])
+    return stack.enter_context(browser_session(p, profile_path, proxy=parse_proxy(acc.get("proxy")), headless=headless,
+                                               account_id=acc["id"]))
+
+
+def _auto_login_steps(acc: dict, headless: bool):
     from contextlib import ExitStack
     account_id = acc["id"]
     log_event(f"Bắt đầu tự động đăng nhập Dola cho nick #{account_id} ({acc['name']})", "INFO", "Auth", account_id=account_id)
 
     with sync_playwright() as p, ExitStack() as stack:
-        context = _open_with_proxy_fallback(stack, p, acc, headless)
+        context = _open_account_session(stack, p, acc, headless)
 
         injected = _inject_cookies(context, acc, only_facebook=True)
         if injected:
@@ -688,14 +865,13 @@ def _auto_login_locked(acc: dict, headless: bool):
             body_text = _safe_body_text(fb_page)
 
             if RE_WRONG_PASS.search(body_text):
-                log_event(f"Nick #{account_id} báo SAI MẬT KHẨU trên Facebook", "ERROR", "Auth", account_id=account_id)
-                _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error="Sai mật khẩu Facebook")
-                return {"success": False, "message": "Sai mật khẩu Facebook"}
+                # K2: sai mật khẩu → needs_manual='login' + last_error + ảnh; nick không được chọn cho job
+                msg = _mark_login_blocked(acc, "Sai mật khẩu Facebook", fb_page, "wrong_password", level="ERROR")
+                return {"success": False, "message": msg}
 
             if RE_CHECKPOINT.search(body_text) or RE_CHECKPOINT.search(fb_page.url):
-                log_event(f"Nick #{account_id} bị Facebook CHECKPOINT (xác minh danh tính)", "WARNING", "Auth", account_id=account_id)
-                _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error="Tài khoản bị Facebook checkpoint")
-                return {"success": False, "message": "Tài khoản bị Facebook checkpoint"}
+                msg = _mark_login_blocked(acc, "Facebook checkpoint (xác minh danh tính)", fb_page, "checkpoint", level="WARNING")
+                return {"success": False, "message": msg}
 
             code_input = find_first_visible(fb_page, SELECTORS["code"], timeout_ms=2000)
             if code_input and acc.get("fb_2fa") and twofa_tried < 3:
@@ -733,7 +909,7 @@ def _auto_login_locked(acc: dict, headless: bool):
         arts = save_failure_artifacts(fb_page if not fb_page.is_closed() else page, "login_timeout", account_id=account_id)
         msg = f"Hết thời gian chờ đăng nhập Dola ({config.LOGIN_TIMEOUT_SECONDS}s) cho nick #{account_id}" + artifact_suffix(arts)
         log_event(msg, "WARNING", "Auth", account_id=account_id)
-        _set_account_fields(account_id, last_error=msg)
+        _set_account_fields(account_id, last_error=msg, last_check=_now_str())  # K1: last_check cả khi thất bại
         return {"success": False, "message": "Hết thời gian chờ đăng nhập (Timeout)"}
 
 
@@ -763,7 +939,7 @@ def _launch_login_session_sync(account_id: int):
     try:
         log_event(f"Mở Chrome cho nick #{account_id} ({acc['name']})", "INFO", "Auth", account_id=account_id)
         with sync_playwright() as p, ExitStack() as stack:
-            context = _open_with_proxy_fallback(stack, p, acc, headless=False)
+            context = _open_account_session(stack, p, acc, headless=False)
             _inject_cookies(context, acc)
 
             page = context.pages[0] if context.pages else context.new_page()
@@ -774,7 +950,8 @@ def _launch_login_session_sync(account_id: int):
                 log.debug("Mở trang Dola trong Chrome tay lỗi: %s", str(e)[:80], extra={"account_id": account_id})
 
             saved_dola = False
-            while len(context.pages) > 0 and not page.is_closed():
+            # K8: chờ tới khi người dùng đóng CẢ cửa sổ (context không còn tab nào), không thoát khi chỉ tab đầu đóng
+            while _context_has_open_page(context):
                 if not saved_dola:
                     try:
                         curr_c = context.cookies()
@@ -806,10 +983,22 @@ def _launch_login_session_sync(account_id: int):
         log_event(str(e), "ERROR", "Auth", account_id=account_id)
         return {"success": False, "message": str(e)}
     except Exception as e:  # noqa: BLE001
+        code = proxy_error_text(e)
+        if code and parse_proxy(acc.get("proxy")):
+            return {"success": False, "message": _mark_proxy_dead(acc, code, "mở Chrome đăng nhập")}
         log_event(f"Mở Chrome cho nick #{account_id} thất bại: {str(e)[:120]}", "ERROR", "Auth", account_id=account_id)
         return {"success": False, "message": f"Mở Chrome thất bại: {str(e)[:120]}"}
     finally:
         pool.release(account_id)
+
+
+def _context_has_open_page(context) -> bool:
+    """Còn tab nào đang mở trong cửa sổ Chrome không (K8). Lỗi đọc (Chrome đã tắt) = không còn."""
+    try:
+        return any(not pg.is_closed() for pg in context.pages)
+    except Exception as e:  # noqa: BLE001 - context đã đóng
+        log.debug("Không đọc được danh sách tab (Chrome đã đóng?): %s", str(e)[:80])
+        return False
 
 
 async def launch_login_session(account_id: int):
@@ -876,8 +1065,11 @@ def _check_account_credits_sync(account_id: int, pool_held: bool = False) -> dic
         log_event(str(e), "ERROR", "Credit", account_id=account_id)
         return {"success": False, "is_known": False, "message": str(e)}
     except Exception as e:  # noqa: BLE001
+        code = proxy_error_text(e)
+        if code and parse_proxy(acc.get("proxy")):
+            return {"success": False, "is_known": False, "message": _mark_proxy_dead(acc, code, "kiểm tra credit")}
         err = str(e)[:120]
-        _set_account_fields(account_id, last_error=f"Kiểm tra credit lỗi: {err}")
+        _set_account_fields(account_id, last_error=f"Kiểm tra credit lỗi: {err}", last_check=_now_str())
         log_event(f"Lỗi kiểm tra credit nick #{account_id}: {err}", "ERROR", "Credit", account_id=account_id)
         return {"success": False, "is_known": False, "message": f"Lỗi kiểm tra credit: {err}"}
     finally:
@@ -935,7 +1127,7 @@ def diagnose_account_dola(account_id: int, pool_held: bool = False) -> dict:
                     arts = save_failure_artifacts(page, "no_session", account_id=account_id)
                     result["screenshot"] = arts.get("png_name")
                     result["detail"] = "Trang Dola không nhận phiên đăng nhập (sessionid mất hiệu lực), cần đăng nhập lại" + artifact_suffix(arts)
-                    _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error=result["detail"])
+                    _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error=result["detail"], has_dola=0)
                     return result
 
                 credits = extract_dola_credits(page)
@@ -955,6 +1147,11 @@ def diagnose_account_dola(account_id: int, pool_held: bool = False) -> dict:
         result["detail"] = str(e)
         return result
     except Exception as e:  # noqa: BLE001
+        code = proxy_error_text(e)
+        if code and parse_proxy(acc.get("proxy")):
+            result["proxy_dead"] = True
+            result["detail"] = _mark_proxy_dead(acc, code, "chẩn đoán")
+            return result
         result["detail"] = f"Mở trang Dola lỗi: {str(e)[:150]}"
         _set_account_fields(account_id, last_error=result["detail"])
         log_event(f"Chẩn đoán Dola nick #{account_id} lỗi: {str(e)[:120]}", "WARNING", "Diagnose", account_id=account_id)
@@ -1519,13 +1716,37 @@ def _conv_after_captcha_solved(job: dict, acc: dict, page, initial_conv_ids: set
     return _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_SECONDS, job_id), False
 
 
-def _download_video(url: str, dest_file: str, job_id: int) -> bool:
-    req_dl = urllib.request.Request(url, headers={
+def _download_video(url: str, dest_file: str, job_id: int, proxy_cfg: Optional[dict] = None, context=None) -> bool:
+    """Tải video về máy qua ĐÚNG proxy của nick (A4), không bao giờ qua proxy môi trường (HTTP_PROXY/NO_PROXY):
+
+    - proxy http(s) (`ip:port`, `ip:port:user:pass`, `http://...`) hoặc không proxy: httpx với `trust_env=False`
+      (urllib tự bỏ qua proxy theo biến NO_PROXY, Playwright `context.request` tự bỏ qua proxy với host loopback —
+      cả hai đều không kiểm được bằng fake proxy, BH-54);
+    - proxy socks5: httpx không có socksio → tải qua `context.request` (phiên Chrome của nick, Playwright tự nối socks).
+    """
+    headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': config.DOLA_BASE_URL + '/',
-    })
-    with urllib.request.urlopen(req_dl, timeout=120) as resp_v, open(dest_file, 'wb') as out_v:
-        shutil.copyfileobj(resp_v, out_v)
+    }
+    purl = proxy_url(proxy_cfg)
+    if purl and purl.startswith("socks") and context is not None:
+        resp = context.request.get(url, headers=headers, timeout=120000)
+        try:
+            if not resp.ok:
+                raise RuntimeError(f"HTTP {resp.status} khi tải video")
+            with open(dest_file, 'wb') as out_v:
+                out_v.write(resp.body())
+        finally:
+            resp.dispose()
+    else:
+        kwargs = {"timeout": 120, "trust_env": False, "follow_redirects": True}
+        if purl:
+            kwargs["proxy"] = purl
+        with httpx.Client(**kwargs) as client, client.stream("GET", url, headers=headers) as resp_v:
+            resp_v.raise_for_status()
+            with open(dest_file, 'wb') as out_v:
+                for chunk in resp_v.iter_bytes():
+                    out_v.write(chunk)
     if os.path.exists(dest_file) and os.path.getsize(dest_file) > 50000:
         return True
     log.warning("File video tải về quá nhỏ (%s byte), bỏ qua", os.path.getsize(dest_file) if os.path.exists(dest_file) else 0,
@@ -1554,12 +1775,14 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         save_account_storage_state(account_id, curr_c)
         _mark_account_connected(account_id, curr_c)
     else:
-        arts = save_failure_artifacts(page, "no_session", job_id=job_id, account_id=account_id)
-        _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error="Phiên Dola mất hiệu lực, cần đăng nhập lại")
+        # K7: mất phiên giữa chừng → nick cần đăng nhập lại, job về Chờ (không tính lượt), và nếu nick có mật khẩu
+        # thì execute_video_job tự Auto Login đúng một lần SAU khi Chrome của job đã đóng (state["relogin"]).
+        suffix = _mark_session_lost(acc, page, job_id)
         _set_job_fields(job_id, attempts=max(0, int(job.get("attempts") or 0) - 1))
-        msg = f"Nick '{acc['name']}' mất phiên Dola, cần đăng nhập lại; job chờ nick khác" + artifact_suffix(arts)
+        msg = Reason.SESSION_LOST.format(name=acc["name"]) + suffix
         update_job_status(job_id, JobStatus.CHO, msg, 0)
         log_event(f"Job #{job_id}: {msg}", "WARNING", "Auth", job_id=job_id, account_id=account_id)
+        state["relogin"] = True
         return
 
     if _detect_captcha(page) and not _wait_user_solve_captcha(job_id, acc, context, page):
@@ -1637,6 +1860,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
     render_deadline = start_poll + max_wait_seconds
     hard_deadline = start_poll + max_wait_seconds + REPLY_EXTRA_RENDER_SECONDS
     duration_seconds, ratio, _ = job_video_params(job)
+    last_chain_text = ""             # K4: văn bản chain gần nhất, để đọc credit còn lại sau render
     seen_replies: list = []          # mọi câu trả lời bằng chữ đã thấy (theo thứ tự)
     pending_reply: Optional[str] = None   # câu trả lời mới nhất chưa được xử lý
     pending_since = 0.0
@@ -1668,7 +1892,8 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
 
         # Câu trả lời bằng chữ mới của trợ lý (bỏ "Generating video..." và prompt của chính mình)
         new_replies = [t for t in _assistant_texts(chain_res, full_prompt, own_texts)
-                       if t not in seen_replies and not _is_generating_text(t)]
+                       if t not in seen_replies and not _is_generating_text(t) and not _is_credit_info_text(t)]
+        last_chain_text = chain_str
         if new_replies:
             seen_replies.extend(new_replies)
             pending_reply = new_replies[-1]
@@ -1697,7 +1922,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
             log_event(f"Job #{job_id}: tìm thấy video thành phẩm, đang tải về máy", "SUCCESS", "Download", job_id=job_id, account_id=account_id)
             update_job_status(job_id, JobStatus.DANG_CHAY, "Đang tải video từ Dola về máy", 92)
             try:
-                downloaded = _download_video(target_video_url, dest_file, job_id)
+                downloaded = _download_video(target_video_url, dest_file, job_id, parse_proxy(acc.get("proxy")), context)
                 if downloaded:
                     sz_mb = round(os.path.getsize(dest_file) / (1024 * 1024), 2)
                     log_event(f"Job #{job_id}: đã lưu video ({sz_mb} MB) vào {dest_file}", "SUCCESS", "Download", job_id=job_id, account_id=account_id)
@@ -1745,8 +1970,13 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
 
         time.sleep(5)
 
-    # 5. Credit còn lại sau render
+    # 5. Credit còn lại sau render: đọc trên trang; không có thì đọc từ văn bản chain ("will use 1 video credits ...
+    # only have N left today" và biến thể, K4). Không đọc được ở đâu → NULL + last_error, không bịa (BH-09).
     credits_post = extract_dola_credits(page)
+    if credits_post is None:
+        credits_post = extract_credits_from_text(last_chain_text)
+        if credits_post is not None:
+            log.info("Đọc credit còn lại từ văn bản chain: %s", credits_post, extra={"job_id": job_id, "account_id": account_id})
     _record_credits(account_id, credits_post, touch_last_used=True)
 
     if downloaded and os.path.exists(dest_file) and os.path.getsize(dest_file) > 50000:
@@ -1810,6 +2040,46 @@ def execute_video_job(job_id: int, account_id: int) -> None:
         else:
             _apply_technical_failure(job_id, acc, e, None, state["page_reached"])
 
+    if state.get("relogin"):
+        # Chrome của job đã đóng; nick vẫn do worker giữ trong pool cho job này → được phép mở Chrome trên profile
+        _relogin_after_session_lost(job_id, acc)
+
+
+_RELOGIN_LAST_AT: dict = {}   # account_id -> time.monotonic() của lần tự đăng nhập lại gần nhất (K7, đúng một lần)
+_RELOGIN_LOCK = threading.Lock()
+
+
+def _relogin_after_session_lost(job_id: int, acc: dict) -> None:
+    """K7: nick mất phiên Dola giữa job → nếu có mật khẩu Facebook thì tự Auto Login đúng MỘT lần (trên luồng job,
+    nick đang được pool giữ). Thành công → xóa cờ needs_manual, job (đang Chờ) sẽ được worker nhặt lại; thất bại → cờ
+    'login' giữ nguyên, không lặp (lần kế cho cùng nick chỉ sau config.RELOGIN_MIN_INTERVAL_SECONDS)."""
+    account_id = acc["id"]
+    pwd = acc.get("fb_pass") or ""
+    if not acc.get("fb_uid") or not pwd or pwd == "cookie_login":
+        log_event(f"Nick #{account_id} ({acc['name']}) mất phiên Dola nhưng không có mật khẩu Facebook, không tự đăng nhập lại được; "
+                  f"hãy dán cookie Dola mới hoặc bấm Auto Login/Chrome", "WARNING", "Auth", job_id=job_id, account_id=account_id)
+        return
+    now = time.monotonic()
+    with _RELOGIN_LOCK:
+        last = _RELOGIN_LAST_AT.get(account_id)
+        if last is not None and now - last < config.RELOGIN_MIN_INTERVAL_SECONDS:
+            log_event(f"Nick #{account_id} ({acc['name']}) mất phiên Dola lần nữa trong vòng "
+                      f"{config.RELOGIN_MIN_INTERVAL_SECONDS // 60} phút; đã tự đăng nhập lại một lần, không lặp — cần đăng nhập tay",
+                      "WARNING", "Auth", job_id=job_id, account_id=account_id)
+            return
+        _RELOGIN_LAST_AT[account_id] = now
+    log_event(f"Nick #{account_id} ({acc['name']}) mất phiên Dola → tự đăng nhập lại một lần bằng mật khẩu Facebook",
+              "WARNING", "Auth", job_id=job_id, account_id=account_id)
+    fresh = _load_account(account_id) or acc
+    result = _auto_login_locked(fresh, True)
+    if result.get("success"):
+        _set_account_fields(account_id, needs_manual=None)
+        log_event(f"Nick #{account_id} ({acc['name']}): tự đăng nhập lại thành công, job #{job_id} sẽ được chạy lại",
+                  "SUCCESS", "Auth", job_id=job_id, account_id=account_id)
+    else:
+        log_event(f"Nick #{account_id} ({acc['name']}): tự đăng nhập lại thất bại ({result.get('message', '')[:120]}); "
+                  f"nick giữ cờ 'cần đăng nhập lại', không thử tiếp", "WARNING", "Auth", job_id=job_id, account_id=account_id)
+
 
 def _job_already_finalized(job_id: int) -> bool:
     job = _load_job(job_id)
@@ -1829,6 +2099,15 @@ def _apply_technical_failure(job_id: int, acc: dict, error: Exception, page, pag
     """
     account_id = acc["id"]
     err_text = str(error).strip().splitlines()[0][:160] if str(error).strip() else error.__class__.__name__
+    proxy_code = proxy_error_text(error)
+    if proxy_code and parse_proxy(acc.get("proxy")):
+        # A5: proxy chết là lỗi của NICK, không phải của job: nick needs_manual='proxy', job về Chờ không tính lượt
+        # để worker chọn nick khác. Không bao giờ lặng lẽ chạy lại không proxy (BH-50).
+        _mark_proxy_dead(acc, proxy_code, "chạy job")
+        _set_job_fields(job_id, attempts=max(0, int((_load_job(job_id) or {}).get("attempts") or 0) - 1))
+        _fail_job(job_id, account_id, JobStatus.CHO, Reason.PROXY_DEAD.format(name=acc["name"], error=proxy_code),
+                  page, "proxy_dead", level="WARNING", module="Proxy")
+        return
     reason = Reason.BROWSER_ERROR.format(error=err_text)
     now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     fields = {"last_error": err_text if page_reached else f"Không vào được trang Dola: {err_text}"}

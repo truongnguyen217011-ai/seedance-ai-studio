@@ -23,7 +23,7 @@ import config
 from account_pool import AccountPool, select_account_for_job
 from constants import AccountStatus, JobStatus, Reason
 from database import get_connection, get_int_setting, reset_orphans_on_startup
-from dola_service import execute_video_job, update_job_status
+from dola_service import execute_video_job, refresh_has_dola_flags, update_job_status
 from logger import get_logger, log_event
 
 log = get_logger("Worker")
@@ -266,9 +266,16 @@ def _startup() -> None:
     reset_count = reset_orphans_on_startup()
     AccountPool.get().clear()
     cleaned = browser.cleanup_profiles_on_startup()
+    # A7: quét cột has_dola một lần (đọc cookies + storage_state.json của từng nick); sau đó chỉ cập nhật khi ghi phiên
+    try:
+        with_session = refresh_has_dola_flags()
+    except Exception as e:  # noqa: BLE001 - không được chặn worker
+        log.error("Quét cờ has_dola lúc khởi động lỗi: %s", e)
+        with_session = None
     log_event(
         f"Worker khởi động: reset {reset_count} job mồ côi về '{JobStatus.CHO}', dọn {cleaned} Chrome mồ côi, "
-        f"giới hạn {get_int_setting('max_concurrent_jobs', config.DEFAULT_MAX_BROWSERS)} Chrome",
+        f"giới hạn {get_int_setting('max_concurrent_jobs', config.DEFAULT_MAX_BROWSERS)} Chrome"
+        + (f", {with_session} nick có phiên Dola" if with_session is not None else ""),
         "INFO", "Worker",
     )
 

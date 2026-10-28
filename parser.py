@@ -10,8 +10,10 @@ Hỗ trợ mọi định dạng shop Facebook & Google:
 - Email|Pass|2FA|Proxy (Google/Dola)
 - Định dạng copy từ Excel (tab-separated)
 """
+import hashlib
+import json
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Các biểu thức chính quy nhận diện thành phần
 RE_COOKIE = re.compile(r'(?:^|;|\b)(?:c_user|xs|datr|fr|sb)=', re.IGNORECASE)
@@ -22,6 +24,57 @@ RE_2FA = re.compile(r'^[A-Z2-7]{16,32}$', re.IGNORECASE)
 RE_PROXY = re.compile(r'^(?:https?:\/\/|socks[45]:\/\/)?(?:[a-zA-Z0-9_.-]+(?::[^@]+)?@)?[0-9a-zA-Z.-]+:\d+(?::[a-zA-Z0-9_.-]+:[^|\s]+)?$')
 RE_DATE = re.compile(r'^\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}(\s|$)|^\d{4}-\d{2}-\d{2}')
 RE_TITLE_IGNORE = re.compile(r'^(uid|id|stt|tài khoản|tai khoan|account|user)\b', re.IGNORECASE)
+# Chuỗi trông như người dùng ĐỊNH đưa mã 2FA nhưng không phải Base32 (A-Z, 2-7): chữ+số 10-40 ký tự, không phải
+# toàn số (UID), không có ':' (proxy) hay '.' (email/IP). Dùng để báo "2FA sai định dạng" thay vì lặng lẽ bỏ qua.
+RE_2FA_LOOKALIKE = re.compile(r'^[A-Za-z0-9]{10,40}$')
+
+# Tên cookie đặc trưng của từng dịch vụ (K3, BH-11): quyết định domain theo NỘI DUNG, không theo loại nick
+DOLA_COOKIE_NAMES = frozenset({"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt", "uid_tt_ss", "ttwid",
+                               "sid_ucp_v1", "ssid_ucp_v1", "passport_csrf_token", "msToken"})
+FACEBOOK_COOKIE_NAMES = frozenset({"c_user", "xs", "datr", "fr", "sb", "wd", "presence", "dpr", "locale"})
+COOKIE_KIND_DOLA = "dola"
+COOKIE_KIND_FACEBOOK = "facebook"
+COOKIE_KIND_JSON = "json"
+
+
+def detect_cookie_kind(raw) -> Optional[str]:
+    """Nhận diện cookie dán vào thuộc dịch vụ nào, chỉ dựa vào NỘI DUNG (K3, BH-11).
+
+    Trả về "dola" (có sessionid/sessionid_ss), "facebook" (có c_user/xs...), "json" (JSON đã có trường domain
+    riêng từng cookie, giữ nguyên) hoặc None (không nhận ra cookie nào).
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text[:1] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            data = data.get("cookies", [])
+        if isinstance(data, list):
+            names = {str(c.get("name", "")) for c in data if isinstance(c, dict)}
+            if names & DOLA_COOKIE_NAMES:
+                return COOKIE_KIND_DOLA
+            if names & FACEBOOK_COOKIE_NAMES:
+                return COOKIE_KIND_FACEBOOK
+            if any(isinstance(c, dict) and c.get("domain") for c in data):
+                return COOKIE_KIND_JSON
+            return None
+    if RE_DOLA_COOKIE.search(text):
+        return COOKIE_KIND_DOLA
+    if RE_COOKIE.search(text):
+        return COOKIE_KIND_FACEBOOK
+    return None
+
+
+def stable_dola_uid(cookie_text: str) -> str:
+    """UID thay thế cho dòng chỉ có cookie Dola (không c_user): băm ỔN ĐỊNH theo giá trị sessionid để dán lại
+    cùng cookie ở phiên sau vẫn nhận ra là trùng (BH-51: `hash()` của Python đổi mỗi lần chạy)."""
+    m = re.search(r'(?:^|;\s*)sessionid(?:_ss)?=([^;\s]+)', cookie_text)
+    key = m.group(1) if m else cookie_text.strip()
+    return "Dola_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
 
 def clean_line_text(line: str) -> str:
     """Loại bỏ ký tự BOM, khoảng trắng, gạch đầu dòng, dấu ngoặc kép"""
@@ -46,7 +99,7 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         
         # Nếu là Dola cookie mà không có c_user
         if not uid and RE_DOLA_COOKIE.search(text):
-            uid = f"Dola_{abs(hash(text)) % 1000000}"
+            uid = stable_dola_uid(text)
             
         if not uid:
             raise ValueError("Cookie Facebook thiếu c_user")
@@ -59,7 +112,10 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
             "cookie": text,
             "email": None,
             "account_type": "facebook",
-            "name": f"FB {uid[-6:]}"
+            "name": f"FB {uid[-6:]}",
+            "cookie_kind": detect_cookie_kind(text),
+            "twofa_invalid": None,
+            "unassigned": [],
         }
 
     # 2. Trường hợp chuỗi có phân cách (| hoặc Tab)
@@ -156,7 +212,15 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         raise ValueError("Thiếu mật khẩu hoặc Cookie đăng nhập")
 
     uid = str(uid).replace(" ", "")
-    
+
+    # Chuỗi thừa trông như mã 2FA nhưng không phải Base32 → báo cho người dùng (không lặng lẽ bỏ)
+    twofa_invalid = None
+    if not twofa:
+        for item in unassigned:
+            if RE_2FA_LOOKALIKE.match(item) and not item.isdigit():
+                twofa_invalid = item
+                break
+
     # Đặt tên gợi nhớ
     if account_type == "google" and email:
         name = email.split('@')[0]
@@ -171,13 +235,25 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         "cookie": cookie,
         "email": email,
         "account_type": account_type,
-        "name": name
+        "name": name,
+        "cookie_kind": detect_cookie_kind(cookie) if cookie else None,
+        "twofa_invalid": twofa_invalid,
+        "unassigned": unassigned,
     }
 
-def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
+
+def twofa_invalid_reason(token: str) -> str:
+    return (f"Mã 2FA '{token}' sai định dạng: phải là Base32 (chữ A-Z và số 2-7, 16-32 ký tự, có thể có khoảng trắng); "
+            f"bỏ qua dòng này để không tạo nick thiếu 2FA")
+
+
+def parse_multiple_account_lines(text: str, strict_2fa: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """
     Phân tích toàn bộ khối văn bản nhiều dòng (từ file hoặc copy-paste).
     Trả về: (danh_sach_hop_le, danh_sach_loi)
+
+    strict_2fa=True (A1): dòng có chuỗi trông như mã 2FA nhưng không phải Base32 bị đưa vào danh sách lỗi với lý do
+    rõ, thay vì tạo nick không có 2FA rồi Auto Login thất bại về sau.
     """
     ok_list = []
     errors = []
@@ -196,6 +272,9 @@ def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
 
         try:
             parsed = parse_single_account_line(line)
+            if strict_2fa and parsed.get("twofa_invalid"):
+                errors.append({"line": idx, "text": line, "reason": twofa_invalid_reason(parsed["twofa_invalid"])})
+                continue
             uid = parsed["uid"]
             if uid in seen_uids:
                 errors.append({

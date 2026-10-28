@@ -186,3 +186,16 @@ def test_bh23_lesson_numbers_unique_and_consecutive():
     assert nums == sorted(nums), f"BH-23: số bài học không tăng dần theo thứ tự trong file: {nums}"
     expected = list(range(1, max(nums) + 1))
     assert nums == expected, f"BH-23: số bài học phải liên tục 1..{max(nums)}, thiếu {sorted(set(expected) - set(nums))}"
+
+
+# ---------------------------------------------------------------- BH-51
+def test_bh51_no_python_hash_for_persisted_ids():
+    pat = re.compile(r"(?<![\w`])hash\(")
+    hits = [h for name in ("parser.py", "app.py") for h in _lines_matching(ROOT / name, pat)]
+    assert not hits, "BH-51: không dùng hash() của Python cho định danh ghi vào CSDL (dùng hashlib):\n" + "\n".join(hits)
+
+
+# ---------------------------------------------------------------- BH-54
+def test_bh54_no_urllib_download_in_dola_service():
+    hits = _lines_matching(ROOT / "dola_service.py", re.compile(r"^\s*import urllib|^\s*from urllib"))
+    assert not hits, "BH-54: dola_service tải/hỏi IP bằng httpx trust_env=False, không urllib (tự bỏ proxy theo NO_PROXY):\n" + "\n".join(hits)

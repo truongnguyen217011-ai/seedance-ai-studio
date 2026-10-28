@@ -2,11 +2,14 @@
 
 - diagnose_account(account_id): các bước proxy, chrome, fb_cookie, dola_session, credits.
 - build_bundle(): zip log 24h, ảnh chụp, settings (bỏ key nhạy cảm), danh sách nick đã che mật.
+- start_scan_all() / scan_status(): quét tất cả nick nền (K9), mỗi nick một lần diagnose_account qua pool,
+  số Chrome đồng thời do browser.BrowserSlots quyết định.
 """
 import glob
 import json
 import os
 import platform
+import threading
 import time
 import zipfile
 from datetime import datetime
@@ -24,7 +27,7 @@ from logger import get_logger, log_event
 
 log = get_logger("Diagnose")
 
-IP_CHECK_URL = "https://api.ipify.org?format=json"
+IP_CHECK_URL = config.IP_CHECK_URL   # env SEEDANCE_IP_CHECK_URL; test trỏ về fake Dola /__ip
 IP_TIMEOUT = 15
 SENSITIVE_SETTING_WORDS = ("key", "pass")
 
@@ -68,10 +71,11 @@ def _proxy_url(proxy_cfg: Optional[dict]) -> Optional[str]:
 
 
 def _fetch_ip(proxy_url: Optional[str]) -> str:
-    kwargs = {"timeout": IP_TIMEOUT}
+    """IP ra ngoài qua proxy của nick (hoặc IP máy khi không có proxy). trust_env=False cả hai nhánh: không bao giờ
+    đi qua proxy của môi trường (HTTP_PROXY) — "IP máy" phải là IP thật, "IP qua proxy" phải là proxy của nick (A4)."""
+    kwargs = {"timeout": IP_TIMEOUT, "trust_env": False}
     if proxy_url:
         kwargs["proxy"] = proxy_url
-        kwargs["trust_env"] = False
     with httpx.Client(**kwargs) as client:
         resp = client.get(IP_CHECK_URL)
         resp.raise_for_status()
@@ -170,6 +174,8 @@ def _check_dola_session(acc: dict) -> dict:
 def _check_credits(account_id: int) -> dict:
     from dola_service import diagnose_account_dola
     res = diagnose_account_dola(account_id, pool_held=True)
+    if res.get("proxy_dead"):
+        return _step("credits", "Credit Dola", False, res.get("detail") or "Proxy của nick không phản hồi")
     if res.get("captcha"):
         return _step("credits", "Credit Dola", False, res.get("detail") or "Dola yêu cầu kéo captcha")
     if not res.get("session_ok"):
@@ -241,6 +247,153 @@ def diagnose_account(account_id: int) -> dict:
         return {"success": not failed, "steps": steps, "summary": summary}
     finally:
         pool.release(account_id)
+
+
+# ==================== QUÉT TẤT CẢ NICK (K9) ====================
+SCAN_CATEGORIES = ("ready", "no_credit", "need_login", "proxy_dead", "captcha", "error", "unknown")
+
+
+def classify_diagnosis(result: dict) -> str:
+    """Xếp kết quả diagnose_account vào một nhóm của tổng kết quét: ready / no_credit / need_login / proxy_dead /
+    captcha / error / unknown (bước credit bị bỏ qua vì không có Chrome...). Không đoán: thiếu bước → unknown."""
+    steps = {s["key"]: s for s in (result or {}).get("steps") or []}
+    if not steps:
+        return "error"
+    proxy = steps.get("proxy")
+    if proxy and proxy["ok"] is False:
+        return "proxy_dead"
+    session = steps.get("dola_session")
+    if session and session["ok"] is False:
+        return "need_login"
+    credits = steps.get("credits")
+    if credits is None:
+        return "unknown"
+    detail = (credits.get("detail") or "").lower()
+    if credits["ok"] is True:
+        return "ready"
+    if credits["ok"] is False:
+        if "captcha" in detail:
+            return "captcha"
+        if "không phản hồi" in detail and "proxy" in detail:
+            return "proxy_dead"
+        if "hết credit" in detail or "hết lượt" in detail:
+            return "no_credit"
+        if "đăng nhập" in detail or "phiên" in detail:
+            return "need_login"
+        return "error"
+    return "unknown"
+
+
+class _ScanState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.done = 0
+        self.total = 0
+        self.summary = {k: 0 for k in SCAN_CATEGORIES}
+        self.current: list = []
+        self.started_at = None
+        self.finished_at = None
+        self.results: dict = {}   # account_id -> {"category", "summary"}
+        self.workers = 0
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "running": self.running,
+                "done": self.done,
+                "total": self.total,
+                "summary": dict(self.summary),
+                "current": list(self.current),
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "workers": self.workers,
+                "results": {str(k): dict(v) for k, v in self.results.items()},
+            }
+
+
+_SCAN = _ScanState()
+
+
+def scan_status() -> dict:
+    return _SCAN.snapshot()
+
+
+def _scan_worker(queue: list, pool_lock: threading.Lock) -> None:
+    while True:
+        with pool_lock:
+            if not queue:
+                return
+            account_id, name = queue.pop(0)
+        with _SCAN.lock:
+            _SCAN.current.append(account_id)
+        try:
+            result = diagnose_account(account_id)
+            category = classify_diagnosis(result)
+            summary = result.get("summary", "")
+        except Exception as e:  # noqa: BLE001 - một nick lỗi không được dừng cả đợt quét
+            category, summary = "error", f"Chẩn đoán lỗi: {str(e)[:120]}"
+            log.error("Quét nick #%s (%s) lỗi: %s", account_id, name, e, extra={"account_id": account_id})
+        with _SCAN.lock:
+            _SCAN.done += 1
+            _SCAN.summary[category] = _SCAN.summary.get(category, 0) + 1
+            _SCAN.results[account_id] = {"category": category, "summary": summary, "name": name}
+            if account_id in _SCAN.current:
+                _SCAN.current.remove(account_id)
+
+
+def _scan_runner(queue: list, workers: int) -> None:
+    from worker import JOB_EXECUTOR  # import muộn: worker import dola_service → diagnostics
+    pool_lock = threading.Lock()
+    futures = [JOB_EXECUTOR.submit(_scan_worker, queue, pool_lock) for _ in range(workers)]
+    for f in futures:
+        try:
+            f.result()
+        except Exception as e:  # noqa: BLE001
+            log.error("Luồng quét nick văng lỗi: %s", e)
+    with _SCAN.lock:
+        _SCAN.running = False
+        _SCAN.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        summary = dict(_SCAN.summary)
+        total = _SCAN.total
+    log_event(f"Quét tất cả nick xong: {total} nick — sẵn sàng {summary['ready']}, hết credit {summary['no_credit']}, "
+              f"cần đăng nhập {summary['need_login']}, proxy chết {summary['proxy_dead']}, captcha {summary['captcha']}, "
+              f"lỗi khác {summary['error']}, chưa rõ {summary['unknown']}", "INFO", "Diagnose")
+
+
+def start_scan_all(account_ids: Optional[list] = None) -> dict:
+    """Bắt đầu quét nền mọi nick facebook/google (hoặc danh sách account_ids). Mỗi nick đi qua diagnose_account
+    (pool giữ nick, Chrome qua browser_session → không vượt BrowserSlots). Số luồng = giới hạn Chrome hiện tại.
+    Đang quét thì trả {success:False, message} (không chạy chồng)."""
+    conn = get_connection()
+    try:
+        if account_ids:
+            marks = ",".join("?" for _ in account_ids)
+            rows = conn.execute(f"SELECT id, name FROM accounts WHERE id IN ({marks}) ORDER BY id", tuple(account_ids)).fetchall()
+        else:
+            rows = conn.execute("SELECT id, name FROM accounts WHERE account_type IN ('facebook', 'google') ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    queue = [(r["id"], r["name"]) for r in rows]
+    with _SCAN.lock:
+        if _SCAN.running:
+            return {"success": False, "message": f"Đang quét dở {_SCAN.done}/{_SCAN.total} nick, chờ xong rồi quét lại"}
+        if not queue:
+            return {"success": False, "message": "Chưa có nick nào để quét"}
+        workers = max(1, min(browser.capacity(), len(queue)))
+        _SCAN.running = True
+        _SCAN.done = 0
+        _SCAN.total = len(queue)
+        _SCAN.summary = {k: 0 for k in SCAN_CATEGORIES}
+        _SCAN.current = []
+        _SCAN.results = {}
+        _SCAN.workers = workers
+        _SCAN.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _SCAN.finished_at = None
+    total = len(queue)  # đọc TRƯỚC khi khởi động luồng: các luồng pop khỏi queue ngay, len(queue) đổi tức thì
+    log_event(f"Bắt đầu quét tất cả {total} nick ({workers} luồng, tối đa {browser.capacity()} Chrome)", "INFO", "Diagnose")
+    threading.Thread(target=_scan_runner, args=(queue, workers), name="scan-all", daemon=True).start()
+    return {"success": True, "total": total, "workers": workers}
 
 
 def _persist(account_id: int, steps: list) -> None:

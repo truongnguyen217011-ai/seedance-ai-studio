@@ -653,13 +653,19 @@
               </button>
             </div>
 
-            <!-- Thẻ lọc trạng thái -->
-            <button type="button" onclick="filterAccountStatus('ready', this)" class="status-filter-btn px-2.5 py-1 bg-[#10231d] hover:bg-[#16382e] text-emerald-300 border border-emerald-800/50 rounded text-[11px] font-semibold flex items-center space-x-1 transition">
-              <span>✓ Dola đã log</span>
-            </button>
-            <button type="button" onclick="filterAccountStatus('no-proxy', this)" class="status-filter-btn px-2.5 py-1 bg-[#231a10] hover:bg-[#382816] text-amber-300 border border-amber-800/50 rounded text-[11px] font-semibold flex items-center space-x-1 transition">
-              <span>⚠ Chưa có proxy</span>
-            </button>
+            <!-- Tìm + lọc trạng thái (A7: lọc phía máy chủ, phân trang 50/trang) -->
+            <input type="search" id="accSearchInput" oninput="searchAccounts(this.value)" placeholder="Tìm tên / UID / email…"
+                   class="w-44 bg-[#070b10] border border-[#1b2a3c] rounded px-2 py-1 text-[11px] text-gray-200 focus:border-cyan-500 focus:outline-none">
+            <select id="accStatusFilter" onchange="setAccountStatusFilter(this.value)" class="bg-[#070b10] border border-[#1b2a3c] rounded px-2 py-1 text-[11px] text-gray-200" title="Lọc theo trạng thái nick">
+              <option value="">Mọi trạng thái</option>
+              <option value="ready">Sẵn sàng (có phiên Dola)</option>
+              <option value="needs_manual">Cần can thiệp (captcha / đăng nhập / proxy)</option>
+              <option value="resting">Đang nghỉ (hết credit)</option>
+              <option value="busy">Đang bận</option>
+              <option value="no_dola">Chưa kết nối Dola</option>
+              <option value="no_proxy">Chưa có proxy</option>
+            </select>
+            <span id="accTotalLabel" class="text-[11px] text-gray-400" title="Tổng số nick khớp bộ lọc">Tổng: …</span>
           </div>
 
           <!-- Các nút công cụ bên phải (Gán proxy, Xóa proxy, Luồng, Đổi IP) -->
@@ -679,6 +685,10 @@
               <i data-lucide="sparkles" class="w-3 h-3 text-emerald-400"></i>
               <span>Check Toàn Bộ Credit</span>
             </button>
+            <button id="btnScanAll" onclick="startScanAll()" class="px-2.5 py-1 bg-[#101c2c] hover:bg-[#162a40] text-cyan-300 border border-cyan-800/40 rounded text-[11px] font-semibold flex items-center space-x-1" title="Chẩn đoán lần lượt mọi nick (proxy, Chrome, cookie, phiên Dola, credit) trong nền, không mở quá giới hạn Chrome">
+              <i data-lucide="radar" class="w-3 h-3 text-cyan-400"></i>
+              <span>Quét tất cả</span>
+            </button>
             <button onclick="batchAssignProxy()" class="px-2.5 py-1 bg-[#1f1629] hover:bg-[#2f1f40] text-purple-300 border border-purple-800/40 rounded text-[11px] font-semibold flex items-center space-x-1">
               <i data-lucide="network" class="w-3 h-3"></i>
               <span>Gán proxy</span>
@@ -692,6 +702,16 @@
               <span>Đổi IP</span>
             </button>
           </div>
+        </div>
+
+        <!-- K9: tiến độ quét tất cả nick -->
+        <div id="scanAllBox" class="hidden bg-[#0b1017] border border-cyan-900/40 rounded-xl p-2.5 mb-3 text-[11px] text-gray-300">
+          <div class="flex items-center justify-between mb-1.5">
+            <div id="scanAllTitle" class="font-semibold text-cyan-300">Đang quét tất cả nick…</div>
+            <div id="scanAllCount" class="font-mono text-gray-400">0/0</div>
+          </div>
+          <div class="w-full h-2 bg-[#101722] rounded overflow-hidden"><div id="scanAllBar" class="h-2 bg-cyan-500 transition-all" style="width:0%"></div></div>
+          <div id="scanAllSummary" class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1"></div>
         </div>
 
         <div class="flex-1 bg-[#0a0f16] border border-[#141e2b] rounded-lg overflow-y-auto">
@@ -713,6 +733,14 @@
               <!-- Rendered dynamically -->
             </tbody>
           </table>
+        </div>
+        <!-- A7: phân trang 50 nick/trang -->
+        <div id="accPagination" class="flex items-center justify-between mt-2 text-[11px] text-gray-400">
+          <div id="accPageInfo">Trang 1/1</div>
+          <div class="flex items-center space-x-1">
+            <button type="button" id="accPrevBtn" onclick="accountsPrevPage()" class="px-2.5 py-1 rounded bg-[#121c28] hover:bg-[#1b2b3d] border border-[#203146] text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed">‹ Trước</button>
+            <button type="button" id="accNextBtn" onclick="accountsNextPage()" class="px-2.5 py-1 rounded bg-[#121c28] hover:bg-[#1b2b3d] border border-[#203146] text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed">Sau ›</button>
+          </div>
         </div>
       </section>
 
@@ -1192,8 +1220,16 @@
         <!-- Chế độ Nhiều nick (Textarea hàng loạt) -->
         <div id="containerMultiNick" class="hidden space-y-2">
           <label class="block text-[11px] text-gray-400 mb-1">Dán danh sách nhiều nick (Mỗi dòng một nick):</label>
-          <textarea id="accMultiDataInput" rows="5" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-2.5 text-xs text-gray-200 font-mono focus:border-cyan-500" placeholder="uid_1|pass_1|2fa_1|c_user=...; xs=...&#10;uid_2|pass_2|2fa_2|c_user=...; xs=..."></textarea>
-          
+          <textarea id="accMultiDataInput" rows="5" class="w-full bg-[#070b10] border border-[#172333] rounded-lg p-2.5 text-xs text-gray-200 font-mono focus:border-cyan-500" placeholder="UID|Pass|2FA&#10;UID|Pass|2FA|Proxy&#10;UID|Pass|Cookie&#10;UID|Pass|2FA|Cookie|Proxy&#10;sessionid=...; sessionid_ss=...   (cookie Dola thô)&#10;c_user=...; xs=...   (cookie Facebook thô)"></textarea>
+          <div class="text-[10px] text-gray-500">Hỗ trợ: UID|Pass|2FA, UID|Pass|2FA|Proxy, UID|Pass|Cookie, UID|Pass|2FA|Cookie|Proxy, dán từ Excel (tab), cookie thô. Cookie được nhận diện theo nội dung (sessionid → Dola, c_user → Facebook).</div>
+          <div class="flex items-center justify-between">
+            <button type="button" onclick="previewAccountLines()" class="px-3 py-1 bg-[#101c2c] hover:bg-[#162a40] text-cyan-300 border border-cyan-800/40 rounded text-[11px] font-semibold flex items-center space-x-1" title="Tách từng dòng để kiểm tra UID, mật khẩu, 2FA, cookie, proxy và dòng trùng trước khi lưu">
+              <i data-lucide="search" class="w-3 h-3"></i><span>Xem trước</span>
+            </button>
+            <span id="accPreviewSummary" class="text-[11px] text-gray-400"></span>
+          </div>
+          <div id="accPreviewBox" class="hidden max-h-56 overflow-auto bg-[#06090e] border border-[#131d2a] rounded-lg"></div>
+
           <div class="flex items-center space-x-2 text-[11px]">
             <span class="text-gray-400">Số luồng đăng nhập đồng thời:</span>
             <div class="inline-flex space-x-1">
@@ -1299,10 +1335,14 @@
         <table class="w-full text-left border-collapse text-[11px]">
           <thead class="sticky top-0 bg-[#070b10] border-b border-[#141e2b] text-[10px] uppercase font-bold text-gray-400">
             <tr>
-              <th class="p-2 w-14">Dòng</th>
-              <th class="p-2 w-24">Kết quả</th>
-              <th class="p-2">Nội dung</th>
-              <th class="p-2 w-64">Lý do</th>
+              <th class="p-2 w-12">Dòng</th>
+              <th class="p-2 w-20">Kết quả</th>
+              <th class="p-2 w-28">Nick</th>
+              <th class="p-2 w-36">UID / Email</th>
+              <th class="p-2 w-10 text-center">2FA</th>
+              <th class="p-2 w-20 text-center">Cookie</th>
+              <th class="p-2 w-32">Proxy</th>
+              <th class="p-2">Lý do / ghi chú</th>
             </tr>
           </thead>
           <tbody id="importResultBody" class="divide-y divide-[#101722]"></tbody>

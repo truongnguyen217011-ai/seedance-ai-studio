@@ -816,25 +816,61 @@ function accountActionsCell(a) {
      </div>`;
 }
 
+// A7: bảng nick lấy theo trang từ máy chủ (limit/offset/q/status/account_type), không tải cả 200 nick mỗi 3 giây
+const ACC_PAGE_SIZE = 50;
+let accPage = 0;
+let accQuery = '';
+let accTotal = 0;
+
+function accountsQueryString() {
+  const params = new URLSearchParams();
+  params.set('limit', String(ACC_PAGE_SIZE));
+  params.set('offset', String(accPage * ACC_PAGE_SIZE));
+  if (accQuery) params.set('q', accQuery);
+  if (typeof currentFilterStatus !== 'undefined' && currentFilterStatus && currentFilterStatus !== 'all') params.set('status', currentFilterStatus);
+  if (typeof currentFilterType !== 'undefined' && currentFilterType && currentFilterType !== 'all') params.set('account_type', currentFilterType);
+  return params.toString();
+}
+
+function renderAccountsPagination(total) {
+  accTotal = Number(total) || 0;
+  const pages = Math.max(1, Math.ceil(accTotal / ACC_PAGE_SIZE));
+  if (accPage > pages - 1) accPage = pages - 1;
+  const info = document.getElementById('accPageInfo');
+  const totalLabel = document.getElementById('accTotalLabel');
+  const prev = document.getElementById('accPrevBtn');
+  const next = document.getElementById('accNextBtn');
+  const from = accTotal ? accPage * ACC_PAGE_SIZE + 1 : 0;
+  const to = Math.min(accTotal, (accPage + 1) * ACC_PAGE_SIZE);
+  if (info) info.innerText = `Trang ${accPage + 1}/${pages} · hiện ${from}–${to} trong ${accTotal} nick`;
+  if (totalLabel) totalLabel.innerText = `Tổng: ${accTotal} nick`;
+  if (prev) prev.disabled = accPage <= 0;
+  if (next) next.disabled = accPage >= pages - 1;
+}
+
+function accountsPrevPage() { if (accPage > 0) { accPage -= 1; fetchAccounts(); } }
+function accountsNextPage() { if ((accPage + 1) * ACC_PAGE_SIZE < accTotal) { accPage += 1; fetchAccounts(); } }
+
+let _accSearchTimer = null;
+function searchAccounts(value) {
+  clearTimeout(_accSearchTimer);
+  _accSearchTimer = setTimeout(() => {
+    accQuery = String(value || '').trim();
+    accPage = 0;
+    fetchAccounts();
+  }, 300);
+}
+
 async function fetchAccounts() {
   try {
-    const data = await apiJson('/api/accounts');
+    const data = await apiJson('/api/accounts?' + accountsQueryString());
     const tbody = document.getElementById('accountsTableBody');
     const filterSelect = document.getElementById('filterNickMediaSelect');
     const imageAccSelect = document.getElementById('imageAccountSelect');
 
     const allAccounts = Array.isArray(data.accounts) ? data.accounts : [];
-    let accounts = allAccounts;
-    if (typeof currentFilterType !== 'undefined' && currentFilterType !== 'all') {
-      accounts = accounts.filter(a => a.account_type === currentFilterType);
-    }
-    if (typeof currentFilterStatus !== 'undefined') {
-      if (currentFilterStatus === 'ready') {
-        accounts = accounts.filter(a => a.has_dola === true);
-      } else if (currentFilterStatus === 'no-proxy') {
-        accounts = accounts.filter(a => !a.proxy || a.proxy.trim() === '');
-      }
-    }
+    const accounts = allAccounts;
+    renderAccountsPagination(data.total !== undefined ? data.total : allAccounts.length);
 
     if (tbody) {
       if (accounts.length === 0) {
@@ -1156,8 +1192,13 @@ async function deleteJob(id) {
 async function deleteAccount(id) {
   if (!confirm(`Bạn có chắc muốn xóa tài khoản #${id}?`)) return;
   try {
-    await apiJson(`/api/accounts/${id}`, { method: 'DELETE' });
-    showToast(`Đã xóa tài khoản #${id}`, 'success');
+    const data = await apiJson(`/api/accounts/${id}`, { method: 'DELETE' });
+    if (data && data.success === false) {
+      showToast(`Không xóa được nick #${id}: ${data.message || data.detail || 'máy chủ từ chối'}`, 'error', 8000);
+      return;
+    }
+    const n = Number(data && data.requeued_jobs) || 0;
+    showToast(`Đã xóa tài khoản #${id}${n ? `; ${n} job đang gán nick này về Chờ để chọn nick khác` : ''}`, 'success', 6000);
     refreshData();
   } catch (err) {
     reportFetchError(`Không xóa được tài khoản #${id}`, err);
@@ -1741,7 +1782,7 @@ function switchAccountModalMode(mode) {
     if (btnSingle) btnSingle.className = 'px-2.5 py-1 rounded text-[11px] font-medium text-gray-400 hover:text-white';
     if (boxSingle) boxSingle.classList.add('hidden');
     if (boxMulti) boxMulti.classList.remove('hidden');
-    if (submitText) submitText.innerText = 'Đăng nhập hàng loạt';
+    if (submitText) submitText.innerText = 'Lưu tất cả nick';
   } else {
     if (btnSingle) btnSingle.className = 'px-2.5 py-1 rounded text-[11px] font-bold bg-cyan-600 text-black shadow';
     if (btnMulti) btnMulti.className = 'px-2.5 py-1 rounded text-[11px] font-medium text-gray-400 hover:text-white';
@@ -1869,8 +1910,15 @@ async function submitAddAccountFlow() {
       return;
     }
     const autoLogin = document.getElementById('chkAutoLoginDola') ? document.getElementById('chkAutoLoginDola').checked : true;
-    await submitBatchImportCustom(rawData, proxy, autoLogin);
-    closeModal('modalAddAccount');
+    const ok = await submitBatchImportCustom(rawData, proxy, autoLogin);
+    if (ok) {
+      closeModal('modalAddAccount');
+      document.getElementById('accMultiDataInput').value = '';
+      const box = document.getElementById('accPreviewBox');
+      if (box) { box.classList.add('hidden'); box.innerHTML = ''; }
+      const sm = document.getElementById('accPreviewSummary');
+      if (sm) sm.innerText = '';
+    }
     return;
   }
 
@@ -2056,19 +2104,161 @@ function showImportResult(data) {
 
   const okRows = importedRows.map(r => {
     const line = (r && r.line !== undefined) ? r.line : '';
-    const text = (r && (r.text || r.name || r.email || r.fb_uid)) || '';
-    return `<tr><td class="p-2 font-mono text-gray-500">${escapeHtml(line)}</td><td class="p-2"><span class="px-1.5 py-0.5 rounded bg-[#0f2a1d] text-emerald-400 border border-[#1a432e] text-[10px] font-bold">Đã thêm</span></td><td class="p-2 font-mono text-gray-300 truncate max-w-[260px]" title="${escapeHtml(text)}">${escapeHtml(text)}</td><td class="p-2 text-gray-500">${escapeHtml(r && r.id ? `Nick #${r.id}` : '')}</td></tr>`;
+    const uid = (r && (r.uid || r.email || r.fb_uid)) || '';
+    const nick = r && r.id ? `#${r.id} ${r.name || ''}` : (r && r.name) || '';
+    const note = r && r.has_dola ? 'Có phiên Dola, sẵn sàng' : (r && r.has_cookie ? 'Có cookie nhưng chưa thấy sessionid Dola' : 'Chưa có phiên Dola (cần Auto Login hoặc dán cookie)');
+    return `<tr>
+      <td class="p-2 font-mono text-gray-500">${escapeHtml(line)}</td>
+      <td class="p-2"><span class="px-1.5 py-0.5 rounded bg-[#0f2a1d] text-emerald-400 border border-[#1a432e] text-[10px] font-bold">Đã thêm</span></td>
+      <td class="p-2 text-gray-200 truncate max-w-[120px]" title="${escapeHtml(nick)}">${escapeHtml(nick)}</td>
+      <td class="p-2 font-mono text-gray-300 truncate max-w-[150px]" title="${escapeHtml(uid)}">${escapeHtml(uid)}</td>
+      <td class="p-2 text-center">${r && r.has_2fa ? '<span class="text-amber-300 font-bold">✓</span>' : '<span class="text-gray-600">–</span>'}</td>
+      <td class="p-2 text-center">${cookieKindBadge(r && r.has_cookie ? (r.cookie_kind || 'json') : null)}</td>
+      <td class="p-2 font-mono text-cyan-400 truncate max-w-[130px]" title="${escapeHtml(r && r.proxy || '')}">${r && r.proxy ? escapeHtml(r.proxy) : '<span class="text-gray-600">không</span>'}</td>
+      <td class="p-2 text-gray-400">${escapeHtml(note)}</td></tr>`;
   });
   const errRows = errors.map(e => {
     const line = (e && e.line !== undefined) ? e.line : '';
     const text = (e && e.text) || '';
     const reason = (e && e.reason) || (typeof e === 'string' ? e : 'Không rõ lý do');
-    return `<tr><td class="p-2 font-mono text-gray-500">${escapeHtml(line)}</td><td class="p-2"><span class="px-1.5 py-0.5 rounded bg-[#2a1215] text-red-400 border border-[#441a1f] text-[10px] font-bold">Lỗi</span></td><td class="p-2 font-mono text-gray-300 truncate max-w-[260px]" title="${escapeHtml(text)}">${escapeHtml(text.length > 60 ? text.slice(0, 60) + '…' : text)}</td><td class="p-2 text-amber-300">${escapeHtml(reason)}</td></tr>`;
+    const isDup = /đã có|trùng/i.test(reason);
+    const badge = isDup
+      ? '<span class="px-1.5 py-0.5 rounded bg-[#2a2210] text-amber-300 border border-amber-700/60 text-[10px] font-bold">Đã có</span>'
+      : '<span class="px-1.5 py-0.5 rounded bg-[#2a1215] text-red-400 border border-[#441a1f] text-[10px] font-bold">Bỏ qua</span>';
+    return `<tr>
+      <td class="p-2 font-mono text-gray-500">${escapeHtml(line)}</td>
+      <td class="p-2">${badge}</td>
+      <td class="p-2 text-gray-500">${e && e.existing_id ? `nick #${escapeHtml(e.existing_id)}` : ''}</td>
+      <td class="p-2 font-mono text-gray-300 truncate max-w-[150px]" title="${escapeHtml(text)}">${escapeHtml(text.length > 40 ? text.slice(0, 40) + '…' : text)}</td>
+      <td class="p-2 text-center text-gray-600">–</td><td class="p-2 text-center text-gray-600">–</td><td class="p-2 text-gray-600">–</td>
+      <td class="p-2 text-amber-300">${escapeHtml(reason)}</td></tr>`;
   });
   const rows = okRows.concat(errRows);
-  bodyEl.innerHTML = rows.length ? rows.join('') : `<tr><td colspan="4" class="p-4 text-center text-gray-500">Máy chủ không trả chi tiết từng dòng (đã thêm ${imported} nick).</td></tr>`;
+  bodyEl.innerHTML = rows.length ? rows.join('') : `<tr><td colspan="8" class="p-4 text-center text-gray-500">Máy chủ không trả chi tiết từng dòng (đã thêm ${imported} nick).</td></tr>`;
   openModal('modalImportResult');
   lucide.createIcons();
+}
+
+function cookieKindBadge(kind) {
+  if (!kind) return '<span class="text-gray-600">–</span>';
+  const map = {
+    dola: ['Dola', 'bg-[#0f2a1d] text-emerald-400 border-[#1a432e]'],
+    facebook: ['Facebook', 'bg-[#0d1e30] text-cyan-400 border-[#163352]'],
+    json: ['JSON', 'bg-[#1a1727] text-purple-300 border-purple-800/40'],
+  };
+  const [label, cls] = map[kind] || [String(kind), 'bg-[#1a2333] text-gray-400 border-[#233145]'];
+  return `<span class="px-1.5 py-0.5 rounded border text-[10px] font-bold ${cls}">${escapeHtml(label)}</span>`;
+}
+
+// A3: tách từng dòng để người dùng xác nhận TRƯỚC khi lưu (POST /api/accounts/parse-preview, không ghi CSDL)
+async function previewAccountLines() {
+  const rawData = document.getElementById('accMultiDataInput') ? document.getElementById('accMultiDataInput').value.trim() : '';
+  const box = document.getElementById('accPreviewBox');
+  const summaryEl = document.getElementById('accPreviewSummary');
+  if (!rawData) { showToast('Dán danh sách nick rồi mới xem trước được', 'warning'); return; }
+  const proxyMode = document.getElementById('accProxyMode') ? document.getElementById('accProxyMode').value : 'rotate';
+  let proxy = document.getElementById('accProxyInput') ? document.getElementById('accProxyInput').value.trim() : '';
+  if (proxyMode === 'direct') proxy = '';
+  try {
+    const data = await apiJson('/api/accounts/parse-preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: rawData, proxy })
+    });
+    const items = Array.isArray(data.items) ? data.items : [];
+    const sm = data.summary || {};
+    if (summaryEl) summaryEl.innerHTML = `Sẽ lưu <b class="text-emerald-400">${sm.ok || 0}</b> nick · đã có: <b class="text-amber-300">${sm.duplicates || 0}</b> · lỗi: <b class="text-red-400">${sm.errors || 0}</b>`;
+    if (box) {
+      box.innerHTML = `<table class="w-full text-[10px]">
+        <thead class="sticky top-0 bg-[#070b10] text-gray-400 uppercase"><tr>
+          <th class="p-1.5 text-left w-8">Dòng</th><th class="p-1.5 text-left w-16">Kết quả</th><th class="p-1.5 text-left">UID / Email</th>
+          <th class="p-1.5 text-center w-8">Pass</th><th class="p-1.5 text-center w-8">2FA</th><th class="p-1.5 text-center w-16">Cookie</th>
+          <th class="p-1.5 text-left w-28">Proxy</th><th class="p-1.5 text-left">Ghi chú</th></tr></thead>
+        <tbody class="divide-y divide-[#101722]">${items.map(it => {
+          const badge = it.ok ? '<span class="text-emerald-400 font-bold">Sẽ lưu</span>'
+            : (it.exists ? '<span class="text-amber-300 font-bold">Đã có</span>' : '<span class="text-red-400 font-bold">Lỗi</span>');
+          const ident = it.uid || it.email || it.text || '';
+          return `<tr>
+            <td class="p-1.5 font-mono text-gray-500">${escapeHtml(it.line)}</td>
+            <td class="p-1.5">${badge}</td>
+            <td class="p-1.5 font-mono text-gray-300 truncate max-w-[150px]" title="${escapeHtml(ident)}">${escapeHtml(ident)}</td>
+            <td class="p-1.5 text-center">${it.has_pass ? '<span class="text-gray-200">✓</span>' : '<span class="text-gray-600">–</span>'}</td>
+            <td class="p-1.5 text-center">${it.has_2fa ? '<span class="text-amber-300">✓</span>' : '<span class="text-gray-600">–</span>'}</td>
+            <td class="p-1.5 text-center">${cookieKindBadge(it.has_cookie ? (it.cookie_kind || 'json') : null)}</td>
+            <td class="p-1.5 font-mono text-cyan-400 truncate max-w-[110px]" title="${escapeHtml(it.proxy || '')}">${it.proxy ? escapeHtml(it.proxy) : '<span class="text-gray-600">không</span>'}</td>
+            <td class="p-1.5 text-amber-200/90">${escapeHtml(it.reason || (it.account_type === 'google' ? 'Nick Google' : ''))}</td></tr>`;
+        }).join('')}</tbody></table>`;
+      box.classList.remove('hidden');
+    }
+    const submitText = document.getElementById('btnSubmitLoginText');
+    if (submitText) submitText.innerText = `Lưu ${sm.ok || 0} nick`;
+  } catch (err) {
+    reportFetchError('Không xem trước được danh sách nick', err);
+  }
+}
+
+// ==================== K9: QUÉT TẤT CẢ NICK ====================
+let _scanPollTimer = null;
+const SCAN_LABELS = {
+  ready: ['Sẵn sàng', 'text-emerald-400'], no_credit: ['Hết credit', 'text-amber-300'], need_login: ['Cần đăng nhập', 'text-rose-300'],
+  proxy_dead: ['Proxy chết', 'text-rose-400'], captcha: ['Cần kéo captcha', 'text-amber-300'], error: ['Lỗi khác', 'text-red-400'],
+  unknown: ['Chưa rõ', 'text-gray-400']
+};
+
+function renderScanStatus(st) {
+  const box = document.getElementById('scanAllBox');
+  if (!box || !st) return;
+  const total = Number(st.total || 0);
+  const done = Number(st.done || 0);
+  if (!st.running && !total) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  const title = document.getElementById('scanAllTitle');
+  const count = document.getElementById('scanAllCount');
+  const bar = document.getElementById('scanAllBar');
+  const sum = document.getElementById('scanAllSummary');
+  if (title) title.innerText = st.running
+    ? `Đang quét tất cả nick… (${(st.current || []).length ? 'đang kiểm nick #' + (st.current || []).join(', #') : 'chờ Chrome'})`
+    : `Quét xong ${done} nick${st.finished_at ? ' lúc ' + st.finished_at : ''}`;
+  if (count) count.innerText = `${done}/${total}`;
+  if (bar) bar.style.width = total ? `${Math.round(done * 100 / total)}%` : '0%';
+  if (sum) {
+    const s = st.summary || {};
+    sum.innerHTML = Object.keys(SCAN_LABELS).map(k => {
+      const [label, cls] = SCAN_LABELS[k];
+      const n = (s[k] !== null && s[k] !== undefined) ? s[k] : 0;
+      return `<span class="${n ? cls : 'text-gray-600'}">${escapeHtml(label)}: <b>${n}</b></span>`;
+    }).join('');
+  }
+  const btn = document.getElementById('btnScanAll');
+  if (btn) btn.disabled = !!st.running;
+}
+
+async function pollScanStatus() {
+  try {
+    const st = await apiJson('/api/accounts/scan-status');
+    renderScanStatus(st);
+    if (st.running) {
+      clearTimeout(_scanPollTimer);
+      _scanPollTimer = setTimeout(pollScanStatus, 2000);
+    } else {
+      fetchAccounts();
+    }
+  } catch (err) {
+    reportFetchError('Không đọc được tiến độ quét nick', err);
+  }
+}
+
+async function startScanAll() {
+  try {
+    const data = await apiJson('/api/accounts/scan-all', { method: 'POST' });
+    if (data.success === false) {
+      showToast('Không quét được: ' + (data.message || 'máy chủ từ chối'), 'warning', 8000);
+      return;
+    }
+    showToast(`Bắt đầu quét ${data.total} nick (${data.workers} luồng, không quá giới hạn Chrome)`, 'info', 6000);
+    pollScanStatus();
+  } catch (err) {
+    reportFetchError('Không bắt đầu quét được', err);
+  }
 }
 
 async function submitBatchImportCustom(dataText, globalProxy, autoLogin = true) {
@@ -2081,7 +2271,7 @@ async function submitBatchImportCustom(dataText, globalProxy, autoLogin = true) 
     if (data.success) {
       refreshData();
       const errs = Array.isArray(data.errors) ? data.errors.length : 0;
-      showToast(`Đã thêm ${data.imported || 0} nick${errs ? `, ${errs} dòng lỗi` : ''}`, errs ? 'warning' : 'success');
+      showToast(`Đã thêm ${data.imported || 0} nick${errs ? `, ${errs} dòng bỏ qua (xem bảng kết quả)` : ''}`, errs ? 'warning' : 'success');
       showImportResult(data);
       return true;
     }
@@ -2151,6 +2341,7 @@ async function diagnoseAccount(id, name) {
 let currentFilterType = 'all';
 function filterAccountType(type, btn) {
   currentFilterType = type;
+  accPage = 0;
   document.querySelectorAll('.acc-filter-btn').forEach(b => {
     b.className = 'acc-filter-btn px-2.5 py-1 rounded text-[11px] font-medium text-gray-400 hover:text-white';
   });
@@ -2158,17 +2349,12 @@ function filterAccountType(type, btn) {
   fetchAccounts();
 }
 
-let currentFilterStatus = 'all';
+let currentFilterStatus = '';
 
-function filterAccountStatus(status, btn) {
-  if (currentFilterStatus === status) {
-    currentFilterStatus = 'all';
-    document.querySelectorAll('.status-filter-btn').forEach(b => b.classList.remove('ring-2', 'ring-cyan-400'));
-  } else {
-    currentFilterStatus = status;
-    document.querySelectorAll('.status-filter-btn').forEach(b => b.classList.remove('ring-2', 'ring-cyan-400'));
-    if (btn) btn.classList.add('ring-2', 'ring-cyan-400');
-  }
+// Lọc trạng thái phía máy chủ (A7): giá trị là một trong ACCOUNT_STATUS_FILTERS của backend hoặc rỗng = tất cả
+function setAccountStatusFilter(status) {
+  currentFilterStatus = status || '';
+  accPage = 0;
   fetchAccounts();
 }
 
@@ -2283,6 +2469,7 @@ window.addEventListener('DOMContentLoaded', () => {
   refreshData();
   fetchHealth();
   loadSettings();
+  pollScanStatus();
   setInterval(refreshData, 3000);
   setInterval(fetchHealth, 10000);
 });
