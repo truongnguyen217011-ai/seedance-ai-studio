@@ -19,10 +19,10 @@ import browser
 import config
 import director
 from account_pool import AccountPool
-from constants import (DEFAULT_DURATION, DEFAULT_RATIO, JobStatus, Reason, duration_label, normalize_duration,
-                       normalize_ratio)
+from constants import (DEFAULT_DURATION, DEFAULT_RATIO, AccountStatus, JobStatus, NeedsManual, Reason, duration_label,
+                       normalize_duration, normalize_ratio)
 from database import get_connection, init_db, log_event
-from diagnostics import build_bundle, diagnose_account
+from diagnostics import build_bundle, diagnose_account, scan_status, start_scan_all
 from dola_service import (
     account_has_dola_session,
     account_profile_dir,
@@ -30,13 +30,13 @@ from dola_service import (
     check_account_credits,
     has_dola_session,
     launch_login_session,
-    parse_cookie_string,
-    parse_dola_cookies,
+    parse_cookies_by_content,
     save_account_storage_state,
 )
 from logger import get_logger
-from parser import parse_multiple_account_lines, parse_single_account_line
-from worker import MUSE_UNSUPPORTED, run_in_job_executor, running_job_ids, track_task, worker_alive, worker_loop
+from parser import (COOKIE_KIND_DOLA, COOKIE_KIND_FACEBOOK, detect_cookie_kind, parse_multiple_account_lines,
+                    parse_single_account_line)
+from worker import run_in_job_executor, running_job_ids, track_task, worker_alive, worker_loop
 
 log = get_logger("App")
 app = FastAPI(title="Seedance AI Studio", version=config.VERSION)
@@ -74,7 +74,12 @@ class AddAccountRequest(BaseModel):
 class BatchImportRequest(BaseModel):
     data: str
     auto_login: Optional[bool] = False
-    proxy: Optional[str] = None
+    proxy: Optional[str] = ""       # proxy chung gán cho dòng không có proxy riêng (modal thêm nick nhiều dòng)
+
+
+class ParsePreviewRequest(BaseModel):
+    data: str
+    proxy: Optional[str] = ""
 
 
 class PasteCookieRequest(BaseModel):
@@ -119,31 +124,12 @@ class PromptFinalRequest(BaseModel):
     prompt_final: str
 
 
-class CreateImageRequest(BaseModel):
-    prompt: str
-    model: Optional[str] = "Seedance Image 2.5"
-    aspect_ratio: Optional[str] = "16:9"
-    style: Optional[str] = "Cinematic"
-    account_id: Optional[int] = None
-
-
 class CreateAssetRequest(BaseModel):
     name: str
     character_code: Optional[str] = ""
     image_url: Optional[str] = ""
     description: Optional[str] = ""
     tags: Optional[str] = ""
-
-
-class AudioTTSRequest(BaseModel):
-    text: str
-    voice: Optional[str] = "vi-VN-Nu-NheNhang"
-    speed: Optional[float] = 1.0
-
-
-class ImportBatchRequest(BaseModel):
-    file_path: str
-    title: Optional[str] = ""
 
 
 def _count_accounts() -> int:
@@ -245,7 +231,9 @@ def _public_account(row) -> dict:
     d = dict(row)
     today_str = datetime.now().strftime("%Y-%m-%d")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    d["has_dola"] = account_has_dola_session(d)
+    # A7: cột has_dola được ghi mỗi khi phiên được lưu và quét một lần lúc khởi động; chỉ nick chưa quét (NULL)
+    # mới phải đọc file ở đây
+    d["has_dola"] = bool(d["has_dola"]) if d.get("has_dola") is not None else account_has_dola_session(d)
     d["has_pass"] = bool(d.get("fb_pass"))
     d["has_2fa"] = bool(d.get("fb_2fa"))
     d["has_cookies"] = bool(d.get("cookies"))
@@ -261,14 +249,80 @@ def _public_account(row) -> dict:
     return d
 
 
+ACCOUNT_STATUS_FILTERS = ("ready", "needs_manual", "resting", "busy", "no_dola", "no_proxy")
+
+
+def _accounts_where(q: str, status: str, account_type: str):
+    """Mệnh đề WHERE + tham số cho GET /api/accounts (A7): tìm theo tên/UID/email, lọc trạng thái, loại nick."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    clauses, params = [], []
+    q = (q or "").strip()
+    if q:
+        like = f"%{q}%"
+        clauses.append("(name LIKE ? OR fb_uid LIKE ? OR email LIKE ?)")
+        params.extend([like, like, like])
+    account_type = (account_type or "").strip()
+    if account_type and account_type != "all":
+        clauses.append("account_type = ?")
+        params.append(account_type)
+    status = (status or "").strip()
+    # COALESCE: cột NULL (chưa check credit) phải cho FALSE rõ ràng, nếu không `NOT (... OR NULL)` = NULL và nick bị lọc mất
+    resting = "((rest_until IS NOT NULL AND rest_until > ?) OR (COALESCE(credits_date, '') = ? AND COALESCE(credits, -1) = 0))"
+    if status == "ready":
+        clauses.append(f"has_dola = 1 AND status = ? AND needs_manual IS NULL AND NOT {resting}")
+        params.extend([AccountStatus.READY, now_str, today_str])
+    elif status == "needs_manual":
+        clauses.append("needs_manual IS NOT NULL")
+    elif status == "resting":
+        clauses.append(resting)
+        params.extend([now_str, today_str])
+    elif status == "busy":
+        clauses.append("busy_job_id IS NOT NULL")
+    elif status == "no_dola":
+        clauses.append("(has_dola IS NULL OR has_dola = 0)")
+    elif status == "no_proxy":
+        clauses.append("(proxy IS NULL OR TRIM(proxy) = '')")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
 @app.get("/api/accounts")
-async def get_accounts():
+async def get_accounts(limit: int = 0, offset: int = 0, q: str = "", status: str = "", account_type: str = ""):
+    """A7: phân trang (limit=0 = tất cả), tìm q theo tên/UID/email, lọc status ∈ ACCOUNT_STATUS_FILTERS, account_type.
+    Trả {accounts, total, limit, offset}; không đọc storage_state.json của từng nick (cột has_dola)."""
+    if status and status not in ACCOUNT_STATUS_FILTERS:
+        return JSONResponse({"success": False, "message": f"Bộ lọc trạng thái '{status}' không hợp lệ; chọn một trong "
+                                                          f"{', '.join(ACCOUNT_STATUS_FILTERS)}"}, status_code=400)
+    limit = max(0, min(int(limit), 5000))
+    offset = max(0, int(offset))
+    where, params = _accounts_where(q, status, account_type)
     conn = get_connection()
     try:
-        rows = conn.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall()
+        total = conn.execute(f"SELECT COUNT(*) AS c FROM accounts{where}", params).fetchone()["c"]
+        sql = f"SELECT * FROM accounts{where} ORDER BY id DESC"
+        if limit:
+            sql += " LIMIT ? OFFSET ?"
+            rows = conn.execute(sql, (*params, limit, offset)).fetchall()
+        else:
+            rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
-    return {"accounts": [_public_account(r) for r in rows]}
+    return {"accounts": [_public_account(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/accounts/names")
+async def get_account_names():
+    """N-3 (BH-58): danh sách NHẸ mọi nick (id, name, account_type) cho các dropdown chọn nick trên giao diện
+    (lọc ảnh/video theo nick, chọn nick tạo ảnh). Không phân trang, không đọc file; dropdown không được đổ từ
+    trang 50 nick của GET /api/accounts."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, name, account_type FROM accounts ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+    accounts = [{"id": r["id"], "name": r["name"], "account_type": r["account_type"]} for r in rows]
+    return {"accounts": accounts, "total": len(accounts)}
 
 
 @app.post("/api/accounts")
@@ -305,21 +359,20 @@ async def add_account(req: AddAccountRequest, background_tasks: BackgroundTasks)
         else:
             name = f"Nick_{int(time.time()) % 10000}"
 
-    parsed_cookies = []
-    if raw_cookies:
-        domain = ".google.com" if acc_type == "google" else ".facebook.com"
-        parsed_cookies = parse_cookie_string(raw_cookies, domain=domain)
+    # K3 (BH-11): domain cookie nhận diện theo NỘI DUNG (sessionid → Dola, c_user → Facebook), không theo loại nick
+    parsed_cookies = parse_cookies_by_content(raw_cookies, _fallback_cookie_domain(acc_type)) if raw_cookies else []
 
     cookies_json = json.dumps(parsed_cookies) if parsed_cookies else ""
     login_method = 'facebook' if acc_type == 'facebook' else 'google'
+    has_dola = 1 if has_dola_session(parsed_cookies) else 0
 
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
-        """, (name, acc_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies_json, login_method))
+            INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method, has_dola)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (name, acc_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies_json, AccountStatus.READY, login_method, has_dola))
         new_id = cursor.lastrowid
         conn.commit()
     finally:
@@ -328,7 +381,8 @@ async def add_account(req: AddAccountRequest, background_tasks: BackgroundTasks)
     if parsed_cookies:
         save_account_storage_state(new_id, parsed_cookies)
 
-    log_event(f"Thêm nick #{new_id} ({name} - {acc_type.upper()}) | UID: {fb_uid} | 2FA: {bool(fb_2fa)} | Cookie: {bool(parsed_cookies)}",
+    log_event(f"Thêm nick #{new_id} ({name} - {acc_type.upper()}) | UID: {fb_uid} | 2FA: {bool(fb_2fa)} | "
+              f"Cookie: {detect_cookie_kind(raw_cookies) or 'không'} | phiên Dola: {'có' if has_dola else 'chưa'}",
               "SUCCESS", "Account", account_id=new_id)
 
     if req.auto_login:
@@ -340,60 +394,113 @@ async def add_account(req: AddAccountRequest, background_tasks: BackgroundTasks)
     return {"success": True, "id": new_id, "launched_browser": False}
 
 
+def _fallback_cookie_domain(acc_type: str) -> str:
+    return ".google.com" if acc_type == "google" else ".facebook.com"
+
+
+def _existing_account_index(cursor) -> dict:
+    """{uid_hoặc_email: (id, name)} của mọi nick đang có, để nhận ra dòng 'đã có' (A2: so UID hoặc email)."""
+    index = {}
+    for r in cursor.execute("SELECT id, name, fb_uid, email FROM accounts").fetchall():
+        if r["fb_uid"]:
+            index.setdefault(r["fb_uid"], (r["id"], r["name"]))
+        if r["email"]:
+            index.setdefault(r["email"], (r["id"], r["name"]))
+    return index
+
+
+def _duplicate_reason(item: dict, index: dict):
+    """Lý do 'đã có' nếu UID/email của dòng trùng nick trong CSDL, kèm id nick cũ; None nếu mới."""
+    for key in (item.get("uid"), item.get("email")):
+        if key and key in index:
+            old_id, old_name = index[key]
+            return f"Nick đã có: trùng {'email' if '@' in str(key) else 'UID'} {key} với nick #{old_id} ({old_name}), bỏ qua", old_id
+    return None, None
+
+
+@app.post("/api/accounts/parse-preview")
+async def parse_preview_accounts(req: ParsePreviewRequest):
+    """A3: tách từng dòng dán vào để người dùng xác nhận TRƯỚC khi lưu. Không ghi CSDL, không trả mật khẩu;
+    `text` của dòng lỗi là bản đã che của parser (chỉ cột đầu, còn lại "***", BH-57)."""
+    ok_list, err_list = parse_multiple_account_lines(req.data, strict_2fa=True)
+    conn = get_connection()
+    try:
+        index = _existing_account_index(conn.cursor())
+    finally:
+        conn.close()
+    items = []
+    global_proxy = (req.proxy or "").strip()
+    for item in ok_list:
+        dup_reason, old_id = _duplicate_reason(item, index)
+        proxy = item.get("proxy") or global_proxy or ""
+        items.append({
+            "line": item.get("line"), "ok": dup_reason is None, "uid": item["uid"], "name": item["name"],
+            "email": item.get("email"), "account_type": item["account_type"],
+            "has_pass": bool(item.get("pass")) and item.get("pass") != "cookie_login",
+            "has_2fa": bool(item.get("twofa")), "has_cookie": bool(item.get("cookie")),
+            "cookie_kind": item.get("cookie_kind"), "proxy": proxy,
+            "exists": dup_reason is not None, "existing_id": old_id, "reason": dup_reason or "",
+            "note": item.get("note") or "",
+        })
+    for err in err_list:
+        items.append({"line": err.get("line"), "ok": False, "uid": "", "name": "", "email": None, "account_type": "",
+                      "has_pass": False, "has_2fa": False, "has_cookie": False, "cookie_kind": None, "proxy": "",
+                      "exists": False, "existing_id": None, "reason": err.get("reason", ""), "note": "",
+                      "text": err.get("text", "")})
+    items.sort(key=lambda it: (it.get("line") or 0))
+    n_ok = sum(1 for it in items if it["ok"])
+    n_dup = sum(1 for it in items if it["exists"])
+    return {"success": True, "items": items,
+            "summary": {"total": len(items), "ok": n_ok, "duplicates": n_dup, "errors": len(items) - n_ok - n_dup}}
+
+
 @app.post("/api/accounts/batch-import")
 async def batch_import_accounts(req: BatchImportRequest, background_tasks: BackgroundTasks):
-    ok_list, err_list = parse_multiple_account_lines(req.data)
+    """A1/A2: thêm từng dòng; trả imported_lines (dòng đã thêm, id mới) + errors (trùng, thiếu pass, 2FA sai định dạng...).
+    `errors[].text` chỉ là cột đầu/bản đã che (BH-57): không trả nguyên dòng có mật khẩu/2FA/cookie về client."""
+    ok_list, err_list = parse_multiple_account_lines(req.data, strict_2fa=True)
     if not ok_list and not err_list:
         return {"success": False, "message": "Dữ liệu trống hoặc không có dòng nào hợp lệ."}
+    global_proxy = (req.proxy or "").strip()
 
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        existing_rows = cursor.execute("SELECT fb_uid, email FROM accounts").fetchall()
-        existing_uids = set(r["fb_uid"] for r in existing_rows if r["fb_uid"])
-        existing_emails = set(r["email"] for r in existing_rows if r["email"])
-
-        count = 0
+        index = _existing_account_index(cursor)
         cookie_count = 0
-        added = []
-        accounts_added = []
-
-        batch_proxy = (req.proxy or "").strip() or None
+        added = []           # (new_id, parsed_cookies)
+        imported_lines = []
 
         for item in ok_list:
-            uid = item["uid"]
-            email = item.get("email")
-            if uid in existing_uids or (email and email in existing_emails):
-                err_list.append({"line": item.get("line", 0), "text": uid,
-                                 "reason": f"UID {uid} đã tồn tại trong danh sách tài khoản (đã bỏ qua)"})
+            dup_reason, old_id = _duplicate_reason(item, index)
+            if dup_reason:
+                err_list.append({"line": item.get("line", 0), "text": item["uid"], "reason": dup_reason, "existing_id": old_id})
                 continue
 
             raw_c = item.get("cookie")
-            parsed_cookies = parse_cookie_string(raw_c, domain=".facebook.com") if raw_c else []
+            parsed_cookies = parse_cookies_by_content(raw_c, _fallback_cookie_domain(item["account_type"])) if raw_c else []
             cookies_json = json.dumps(parsed_cookies) if parsed_cookies else ""
             if parsed_cookies:
                 cookie_count += 1
-
-            proxy = item.get("proxy") or batch_proxy
+            proxy = item.get("proxy") or global_proxy or None
+            has_dola = 1 if has_dola_session(parsed_cookies) else 0
 
             cursor.execute("""
-                INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
+                INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method, has_dola)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (item["name"], item["account_type"], item.get("email"), item["uid"], item["pass"], item.get("twofa"),
-                  proxy, cookies_json, "facebook" if item["account_type"] == "facebook" else "google"))
+                  proxy, cookies_json, AccountStatus.READY, "facebook" if item["account_type"] == "facebook" else "google", has_dola))
             new_id = cursor.lastrowid
             added.append((new_id, parsed_cookies))
-            accounts_added.append({
-                "id": new_id,
-                "name": item["name"],
-                "uid": uid,
-                "line": item.get("line", 0),
-                "text": uid or item["name"]
+            index[item["uid"]] = (new_id, item["name"])
+            if item.get("email"):
+                index[item["email"]] = (new_id, item["name"])
+            imported_lines.append({
+                "line": item.get("line"), "id": new_id, "name": item["name"], "uid": item["uid"],
+                "account_type": item["account_type"], "has_2fa": bool(item.get("twofa")),
+                "has_cookie": bool(parsed_cookies), "cookie_kind": item.get("cookie_kind"), "has_dola": bool(has_dola),
+                "proxy": proxy or "",
             })
-            existing_uids.add(uid)
-            if email:
-                existing_emails.add(email)
-            count += 1
         conn.commit()
     finally:
         conn.close()
@@ -402,14 +509,32 @@ async def batch_import_accounts(req: BatchImportRequest, background_tasks: Backg
         if parsed_cookies:
             save_account_storage_state(new_id, parsed_cookies)
 
-    log_event(f"Import thành công {count} tài khoản ({cookie_count} nick có cookie sẵn, {len(err_list)} dòng bỏ qua/lỗi)", "SUCCESS", "Account")
+    err_list.sort(key=lambda e: e.get("line") or 0)
+    count = len(imported_lines)
+    log_event(f"Nhập {count} nick ({cookie_count} nick có cookie sẵn, {len(err_list)} dòng bỏ qua/lỗi)",
+              "SUCCESS" if count else "WARNING", "Account")
+    for new in imported_lines:
+        log_event(f"Thêm nick #{new['id']} ({new['name']}) từ dòng {new['line']} | UID: {new['uid']} | 2FA: {new['has_2fa']} | "
+                  f"Cookie: {new['cookie_kind'] or 'không'} | Proxy: {'có' if new['proxy'] else 'không'}",
+                  "INFO", "Account", account_id=new["id"])
 
     if req.auto_login:
         for new_id, _ in added:
             background_tasks.add_task(auto_login_facebook_dola, new_id, True)
 
-    return {"success": True, "imported": count, "with_cookies": cookie_count, "accounts": accounts_added,
+    return {"success": True, "imported": count, "with_cookies": cookie_count, "imported_lines": imported_lines,
             "errors": err_list, "auto_login_queued": bool(req.auto_login)}
+
+
+@app.post("/api/accounts/scan-all")
+async def api_scan_all_accounts():
+    """K9: quét tất cả nick nền (chẩn đoán từng nick qua pool, không vượt giới hạn Chrome)."""
+    return await asyncio.to_thread(start_scan_all)
+
+
+@app.get("/api/accounts/scan-status")
+async def api_scan_status():
+    return scan_status()
 
 
 @app.post("/api/accounts/{account_id}/auto-login")
@@ -421,38 +546,53 @@ async def trigger_auto_login(account_id: int, background_tasks: BackgroundTasks)
 
 @app.post("/api/accounts/{account_id}/cookies")
 async def paste_account_cookies(account_id: int, req: PasteCookieRequest):
-    cookies = parse_dola_cookies(req.cookies)
+    """Modal Dán Cookie: domain theo nội dung (K3); không nhận ra thì coi là cookie Dola (modal này dành cho Dola)."""
+    from dola_service import default_dola_cookie_domain
+    cookies = parse_cookies_by_content(req.cookies, default_dola_cookie_domain())
     if not cookies:
         return {"success": False, "message": "Không tìm thấy cookie nào hợp lệ trong dữ liệu bạn vừa dán."}
+    kind = detect_cookie_kind(req.cookies)
+    has_session = has_dola_session(cookies)
 
     conn = get_connection()
     try:
         acc = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
         if not acc:
             return {"success": False, "message": "Tài khoản không tồn tại."}
-        save_account_storage_state(account_id, cookies)
-        conn.execute("UPDATE accounts SET cookies = ?, status = 'ready', last_check = CURRENT_TIMESTAMP, needs_manual = NULL WHERE id = ?",
-                     (json.dumps(cookies), account_id))
+        conn.execute(f"UPDATE accounts SET cookies = ?, status = '{AccountStatus.READY}', last_check = CURRENT_TIMESTAMP, has_dola = ?, "
+                     "needs_manual = CASE WHEN needs_manual = ? AND ? = 1 THEN NULL ELSE needs_manual END WHERE id = ?",
+                     (json.dumps(cookies), 1 if has_session else 0, NeedsManual.LOGIN, 1 if has_session else 0, account_id))
         conn.commit()
     finally:
         conn.close()
-    log_event(f"Đã nạp {len(cookies)} cookie Dola cho nick #{account_id} ({acc['name']})", "SUCCESS", "Auth", account_id=account_id)
-    return {"success": True, "count": len(cookies), "has_session": has_dola_session(cookies)}
+    save_account_storage_state(account_id, cookies)
+    label = {COOKIE_KIND_DOLA: "Dola", COOKIE_KIND_FACEBOOK: "Facebook"}.get(kind, "theo domain trong JSON" if kind else "không rõ dịch vụ")
+    log_event(f"Đã nạp {len(cookies)} cookie ({label}) cho nick #{account_id} ({acc['name']}); phiên Dola: {'có' if has_session else 'chưa'}",
+              "SUCCESS" if has_session else "WARNING", "Auth", account_id=account_id)
+    message = (f"Đã nạp {len(cookies)} cookie {label}. " +
+               ("Phiên Dola hợp lệ, nick sẵn sàng tạo video." if has_session else
+                "Chưa thấy sessionid Dola trong cookie: nick vẫn cần Auto Login hoặc dán cookie Dola (sessionid=...)."))
+    return {"success": True, "count": len(cookies), "has_session": has_session, "cookie_kind": kind, "message": message}
 
 
 @app.post("/api/accounts/batch-assign-proxy")
 async def batch_assign_proxy(req: BatchAssignProxyRequest):
+    from diagnostics import mask_proxy
     conn = get_connection()
     try:
+        # Đổi proxy thì cờ "proxy lỗi" (A5) của nick đó không còn đúng → gỡ để worker/chẩn đoán thử proxy mới
         if req.target == "no-proxy":
-            conn.execute("UPDATE accounts SET proxy = ? WHERE proxy IS NULL OR proxy = ''", (req.proxy,))
+            cur = conn.execute("UPDATE accounts SET proxy = ?, needs_manual = CASE WHEN needs_manual = ? THEN NULL ELSE needs_manual END "
+                               "WHERE proxy IS NULL OR proxy = ''", (req.proxy, NeedsManual.PROXY))
         else:
-            conn.execute("UPDATE accounts SET proxy = ?", (req.proxy,))
+            cur = conn.execute("UPDATE accounts SET proxy = ?, needs_manual = CASE WHEN needs_manual = ? THEN NULL ELSE needs_manual END",
+                               (req.proxy, NeedsManual.PROXY))
+        changed = cur.rowcount
         conn.commit()
     finally:
         conn.close()
-    log_event(f"Đã gán proxy '{req.proxy}' cho các tài khoản ({req.target})", "SUCCESS", "Account")
-    return {"success": True}
+    log_event(f"Đã gán proxy '{mask_proxy(req.proxy)}' cho {changed} nick ({req.target})", "SUCCESS", "Account")
+    return {"success": True, "updated": changed}
 
 
 @app.post("/api/accounts/{account_id}/login")
@@ -482,17 +622,15 @@ async def check_account_dola(account_id: int):
 
 
 @app.post("/api/accounts/{account_id}/check-credits")
-@app.post("/api/accounts/{account_id}/check")
 async def api_check_account_credits(account_id: int):
     return await check_account_credits(account_id)
 
 
 @app.post("/api/accounts/check-all-credits")
-@app.post("/api/accounts/check-all")
 async def api_check_all_credits(background_tasks: BackgroundTasks):
     conn = get_connection()
     try:
-        accounts = conn.execute("SELECT * FROM accounts WHERE status = 'ready'").fetchall()
+        accounts = conn.execute("SELECT * FROM accounts WHERE status = ?", (AccountStatus.READY,)).fetchall()
     finally:
         conn.close()
     checked_ids = [acc["id"] for acc in accounts if account_has_dola_session(acc)]
@@ -516,27 +654,41 @@ async def api_diagnostics_bundle():
 
 @app.delete("/api/accounts/{account_id}")
 async def delete_account(account_id: int):
+    """A6: không xóa khi nick bận; job đang gán nick về Chờ với lý do rõ; gỡ liên kết job/ảnh cũ (khóa ngoại, BH-52);
+    xóa thư mục profiles/acc_{id}."""
     pool = AccountPool.get()
     if pool.is_busy(account_id):
         holder = pool.holder(account_id)
         return {"success": False, "message": f"Nick #{account_id} đang bận" + (f" với job #{holder}" if holder else "") + ", không xóa được"}
     conn = get_connection()
     try:
+        acc = conn.execute("SELECT id, name FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        if not acc:
+            return {"success": False, "message": f"Nick #{account_id} không tồn tại"}
+        name = acc["name"]
+        cur = conn.execute(
+            """UPDATE jobs SET status = ?, status_message = ?, progress = 0, account_id = NULL, updated_at = CURRENT_TIMESTAMP
+               WHERE account_id = ? AND status IN (?, ?, ?)""",
+            (JobStatus.CHO, Reason.ACCOUNT_DELETED.format(name=name), account_id, JobStatus.CHO, JobStatus.DANG_CHAY, JobStatus.TAM_DUNG),
+        )
+        requeued = cur.rowcount
+        # Job đã xong/thất bại và ảnh chỉ còn tham chiếu lịch sử: gỡ khóa ngoại để xóa được nick (BH-52)
+        conn.execute("UPDATE jobs SET account_id = NULL WHERE account_id = ?", (account_id,))
+        conn.execute("UPDATE images SET account_id = NULL WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         conn.commit()
     finally:
         conn.close()
-
-    p_dir = account_profile_dir(account_id)
-    if os.path.isdir(p_dir):
-        try:
-            import shutil
-            shutil.rmtree(p_dir, ignore_errors=True)
-        except Exception as e:
-            log.warning("Không thể xóa thư mục profile %s: %s", p_dir, e)
-
-    log_event(f"Đã xóa tài khoản #{account_id}", "WARNING", "Account", account_id=account_id)
-    return {"success": True}
+    profile_dir = account_profile_dir(account_id)
+    profile_removed = False
+    if os.path.isdir(profile_dir):
+        # N-7: Windows hay báo PermissionError/read-only khi Chrome vừa đóng → thử 3 lần cách 1 s, gỡ read-only;
+        # thư mục còn sót sẽ được browser.cleanup_profiles_on_startup dọn ở lần khởi động sau
+        profile_removed = await asyncio.to_thread(browser.remove_dir_with_retry, profile_dir)
+    log_event(f"Đã xóa nick #{account_id} ({name}); {requeued} job về '{JobStatus.CHO}' chờ nick khác; "
+              f"thư mục profile {'đã xóa' if profile_removed else 'không có hoặc không xóa được'}",
+              "WARNING", "Account", account_id=account_id)
+    return {"success": True, "requeued_jobs": requeued, "profile_removed": profile_removed}
 
 
 # --- API JOBS (VIDEO) ---
@@ -630,6 +782,13 @@ async def director_preview(req: DirectorPreviewRequest):
 @app.get("/api/director/styles")
 async def get_director_styles():
     """Danh sách 14 trường phái điện ảnh chuẩn của Đạo diễn AI."""
+    return {"success": True, "styles": director.style_choices()}
+
+
+@app.get("/api/director/styles")
+async def get_director_styles():
+    """Danh sách trường phái của Đạo diễn AI ({code, name}, thứ tự = ưu tiên nhận diện trong `director.ARCHETYPES`)
+    cho select "Trường phái" và công cụ ngoài; không đọc CSDL."""
     return {"success": True, "styles": director.style_choices()}
 
 
@@ -834,7 +993,8 @@ async def stream_job_video(job_id: int):
     return JSONResponse(status_code=404, content={"error": "Video đang được tạo hoặc chưa sẵn sàng"})
 
 
-# --- API TẠO ẢNH (IMAGES) — giữ nguyên, giai đoạn 5 mới gỡ ---
+# --- API ẢNH (IMAGES): chỉ đọc/xóa ảnh đã có trong CSDL. Giai đoạn 5 đã gỡ POST tạo ảnh (trả ảnh mẫu giả từ CDN ngoài, BH-12);
+#     tính năng tạo ảnh thật chưa có nên không hiện nút trên giao diện ---
 @app.get("/api/images")
 async def get_images():
     conn = get_connection()
@@ -846,24 +1006,6 @@ async def get_images():
     finally:
         conn.close()
     return {"images": [dict(r) for r in rows]}
-
-
-@app.post("/api/images")
-async def create_image(req: CreateImageRequest):
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        image_url = f"https://images.unsplash.com/photo-{1578632767115 if 'cyber' in req.prompt.lower() else 1618005182384}?w=800"
-        cursor.execute("""
-            INSERT INTO images (account_id, prompt, model, aspect_ratio, style, status, image_url)
-            VALUES (?, ?, ?, ?, ?, 'Hoàn thành', ?)
-        """, (req.account_id, req.prompt, req.model, req.aspect_ratio, req.style, image_url))
-        new_id = cursor.lastrowid
-        conn.commit()
-    finally:
-        conn.close()
-    log_event(f"Tạo ảnh AI #{new_id} hoàn tất ({req.style})", "SUCCESS", "ImageEngine")
-    return {"success": True, "id": new_id, "image_url": image_url}
 
 
 @app.delete("/api/images/{image_id}")
@@ -929,18 +1071,6 @@ async def get_nick_media(account_id: Optional[int] = None):
     finally:
         conn.close()
     return {"videos": [dict(j) for j in jobs], "images": [dict(i) for i in images]}
-
-
-# --- API XỬ LÝ ÂM THANH (AUDIO / TTS) — giữ nguyên, giai đoạn 5 mới gỡ ---
-@app.post("/api/audio/tts")
-async def generate_tts(req: AudioTTSRequest):
-    log_event(f"Tạo giọng đọc AI TTS: '{req.text[:30]}...' ({req.voice})", "SUCCESS", "Audio")
-    return {
-        "success": True,
-        "message": "Đã tạo giọng đọc thành công",
-        "audio_url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-        "duration": "12s"
-    }
 
 
 # --- API NHẬT KÝ (LOGS) ---
@@ -1018,27 +1148,6 @@ async def update_settings(req: dict):
         browser.refresh_chrome()
     log_event("Cập nhật cài đặt hệ thống", "INFO", "Settings")
     return {"success": True, "warnings": warnings}
-
-
-# --- API MUSE AI (không còn hỗ trợ: không mở Chrome ngoài slot/pool; muse_service.py gỡ ở giai đoạn 5) & BATCH B3 ---
-@app.post("/api/accounts/login_muse")
-async def login_muse_account(req: dict):
-    return {"success": False, "message": MUSE_UNSUPPORTED}
-
-
-@app.post("/api/accounts/check_muse_token")
-async def check_muse_token_account(req: dict):
-    return {"success": False, "message": MUSE_UNSUPPORTED}
-
-
-@app.post("/api/batch/import_b3")
-async def import_b3_prompts(req: ImportBatchRequest):
-    return {"success": False, "message": "Batch B3 Muse AI không còn được hỗ trợ. Vui lòng dùng tính năng 'Thêm Prompt Hàng Loạt' với Đạo diễn AI."}
-
-
-@app.get("/api/batch/progress/{batch_id}")
-async def get_batch_status(batch_id: str):
-    return {"batch_id": batch_id, "total": 0, "completed": 0, "failed": 0, "processing": 0, "percent": 100, "status": "deprecated", "message": "Batch B3 Muse AI không còn được hỗ trợ"}
 
 
 if __name__ == "__main__":

@@ -63,18 +63,22 @@ def test_bh31_no_broad_logs_mount():
 
 
 # ---------------------------------------------------------------- N-1
-def test_n1_muse_routes_unsupported(client, db):
+def test_n1_muse_routes_removed(client, db):
+    """Giai đoạn 5 (gộp 1.5.0): route Muse AI / batch B3 / tạo ảnh giả / TTS giả bị gỡ hẳn (404), không còn trả
+    "không hỗ trợ"; app.py/worker.py không import module legacy nào."""
     acc_id = db.add_account("nick muse")
-    for path in ("/api/accounts/login_muse", "/api/accounts/check_muse_token"):
+    for path in ("/api/accounts/login_muse", "/api/accounts/check_muse_token", "/api/batch/import_b3", "/api/audio/tts"):
         r = client.post(path, json={"account_id": acc_id})
-        assert r.status_code == 200, r.text
-        data = r.json()
-        assert data["success"] is False
-        assert "Muse AI không còn được hỗ trợ" in data["message"], data
+        # 404 = không có route; 405 = đường dẫn chỉ khớp DELETE /api/accounts/{id} → POST không còn tồn tại
+        assert r.status_code in (404, 405), f"{path} vẫn tồn tại: {r.status_code} {r.text[:120]}"
+        assert "Muse" not in r.text and "không còn được hỗ trợ" not in r.text, r.text
+    assert client.get("/api/batch/progress/abc").status_code == 404
+    assert client.post("/api/images", json={"prompt": "x"}).status_code in (404, 405), "POST /api/images (ảnh giả) phải bị gỡ"
     import re
     for name in ("app.py", "worker.py"):
         src = (ROOT / name).read_text(encoding="utf-8")
-        assert not re.search(r"^\s*(import muse_service|from muse_service)", src, re.MULTILINE), f"{name} vẫn import muse_service"
+        assert not re.search(r"^\s*(import|from)\s+(muse_service|otp_service|batch_dispatcher|seed_sample_data)\b", src, re.MULTILINE), \
+            f"{name} vẫn import module legacy"
 
 
 # ---------------------------------------------------------------- N-2

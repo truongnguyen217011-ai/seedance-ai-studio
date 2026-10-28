@@ -1,13 +1,16 @@
 """
 Kiểm thử Giai đoạn 2: Quản lý tài khoản toàn diện (A1–A6, K1–K3).
 - A1: Thêm nick đơn qua form và qua raw_line (UID|Pass|2FA và Cookie JSON).
-- A2: Batch import trả về danh sách `accounts` chi tiết và phát hiện trùng UID.
+- A2: Batch import trả về danh sách `imported_lines` chi tiết (hợp đồng KIEN_TRUC mục 5) và phát hiện trùng UID.
 - A3: Cookie JSON Dola và Facebook được parse đúng UID/sessionid, lưu storage_state.
 - A4/A5: Batch assign proxy và batch import default proxy.
 - A6: Xóa nick đang bận bị từ chối; xóa nick rảnh dọn dẹp thư mục profile.
 - K1: _mark_account_connected ghi nhận session_expires từ cookie sessionid.
 - K2: Phiên hỏng chuyển needs_manual='login' và lưu artifact.
-- K3: Route alias /api/accounts/{id}/check và /api/accounts/check-all hoạt động.
+- K3: Route /api/accounts/check-all-credits trả danh sách nick được kiểm (hợp đồng KIEN_TRUC mục 5, không có alias).
+
+Gộp 1.5.0 (BH-66): file này viết trên nhánh song song với giả định API khác; các assert được đưa về hợp đồng
+trong docs/KIEN_TRUC.md mục 5 của nhánh giai đoạn 2 (`imported_lines`, lý do trùng "Nick đã có: ...").
 """
 from __future__ import annotations
 
@@ -97,11 +100,12 @@ sai_dinh_dang_khong_co_pass_hay_cookie
 
     assert data["success"] is True
     assert data["imported"] == 2
-    # Phải có mảng accounts chi tiết để frontend hiển thị bảng
-    assert "accounts" in data
-    assert len(data["accounts"]) == 2
-    assert data["accounts"][0]["uid"] == "10008880001"
-    assert data["accounts"][1]["uid"] == "10008880002"
+    # Phải có mảng imported_lines chi tiết (line, id, name, uid, ...) để frontend hiển thị bảng (KIEN_TRUC mục 5)
+    assert "imported_lines" in data
+    assert len(data["imported_lines"]) == 2
+    assert data["imported_lines"][0]["uid"] == "10008880001" and data["imported_lines"][0]["id"]
+    assert data["imported_lines"][1]["uid"] == "10008880002"
+    assert {"line", "id", "name", "uid", "account_type", "has_2fa", "has_cookie", "has_dola", "proxy"} <= set(data["imported_lines"][0])
 
     # Dòng sai phải nằm trong errors
     assert len(data["errors"]) >= 1
@@ -113,7 +117,8 @@ sai_dinh_dang_khong_co_pass_hay_cookie
     data2 = res2.json()
     assert data2["imported"] == 0
     assert len(data2["errors"]) == 1
-    assert "đã tồn tại" in data2["errors"][0]["reason"]
+    assert "Nick đã có" in data2["errors"][0]["reason"] and data2["errors"][0].get("existing_id"), data2["errors"][0]
+    assert "pass1" not in res2.text, "BH-57: không trả mật khẩu trong phản hồi"
 
 
 def test_a3_cookie_json_fb_and_dola_parsing():
@@ -301,15 +306,18 @@ def test_k2_dead_session_marks_needs_manual_login(db, monkeypatch):
 
     conn = get_connection()
     try:
-        row = conn.execute("SELECT needs_manual, last_error FROM accounts WHERE id = ?", (acc_id,)).fetchone()
+        row = conn.execute("SELECT needs_manual, last_error, has_dola FROM accounts WHERE id = ?", (acc_id,)).fetchone()
         assert row["needs_manual"] == NeedsManual.LOGIN
         assert "sessionid mất hiệu lực" in row["last_error"]
+        assert row["has_dola"] == 0, "A7/BH-60: phiên hết hạn phải ghi has_dola=0"
     finally:
         conn.close()
 
 
-def test_k3_check_routes_alias(client, db):
-    # Test endpoint alias /api/accounts/{id}/check và /api/accounts/check-all
-    r_check_all = client.post("/api/accounts/check-all")
+def test_k3_check_all_credits_route(client, db):
+    # Hợp đồng KIEN_TRUC mục 5: /api/accounts/check-all-credits (không có alias /check-all); không nick nào có phiên → 0
+    r_check_all = client.post("/api/accounts/check-all-credits")
     assert r_check_all.status_code == 200
-    assert r_check_all.json()["success"] is True
+    data = r_check_all.json()
+    assert data["success"] is True and data["count"] == 0 and data["account_ids"] == []
+    assert client.post("/api/accounts/check-all").status_code in (404, 405), "không có alias /check-all"

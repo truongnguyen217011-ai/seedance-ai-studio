@@ -121,3 +121,7 @@ class Reason:
     MAX_ATTEMPTS = "Đã thử {n} lần vẫn lỗi, dừng tự chạy lại. Bấm Chạy lại nếu muốn thử tiếp"
     USER_PAUSED = "Người dùng tạm dừng"
     USER_RETRY = "Người dùng yêu cầu chạy lại"
+    # Giai đoạn 2 (A5, A6, K7)
+    PROXY_DEAD = "Proxy của nick '{name}' không phản hồi ({error}); job chờ nick khác, nick cần đổi proxy rồi Chẩn đoán lại"
+    ACCOUNT_DELETED = "Nick '{name}' đã bị xóa, job chờ nick khác"
+    SESSION_LOST = "Nick '{name}' mất phiên Dola, cần đăng nhập lại; job chờ nick khác"

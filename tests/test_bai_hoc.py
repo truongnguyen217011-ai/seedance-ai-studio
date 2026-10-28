@@ -1,6 +1,6 @@
 """
 Tự động hóa cột "Kiểm" của docs/BAI_HOC.md (quét mã nguồn bằng Python, không gọi grep ngoài).
-Mục tiêu: `python -m pytest tests/test_bai_hoc.py -q` xanh hoàn toàn (trừ xfail có lý do).
+Mục tiêu: `python -m pytest tests/test_bai_hoc.py -q` xanh hoàn toàn (không còn xfail từ giai đoạn 5).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def root_py_files() -> List[pathlib.Path]:
 
 
 def phase1_py_files() -> List[pathlib.Path]:
-    """*.py ở gốc dự án sau khi đã gỡ hoàn toàn các file legacy ở giai đoạn 5."""
+    """*.py ở gốc dự án: từ giai đoạn 5 (BH-65) không còn file legacy nào được loại trừ, mọi bài học áp cho tất cả."""
     return root_py_files()
 
 
@@ -154,6 +154,27 @@ def test_bh10_chrome_exe_and_startfile_only_in_browser_py():
     assert not bad, "BH-10: check_env.py chỉ được dò đường dẫn, không được mở Chrome:\n" + "\n".join(bad)
 
 
+# ---------------------------------------------------------------- BH-65 (giai đoạn 5) + BH-12
+LEGACY_REMOVED = ("muse_service.py", "otp_service.py", "batch_dispatcher.py", "seed_sample_data.py")
+LEGACY_ROUTES = ("/api/accounts/login_muse", "/api/accounts/check_muse_token", "/api/batch/import_b3",
+                 "/api/batch/progress", "/api/audio/tts")
+
+
+def test_bh65_legacy_files_and_fake_features_removed():
+    """Giai đoạn 5 đã chốt gỡ: 4 file legacy không được quay lại; app.py không còn route Muse/B3/TTS giả và POST tạo
+    ảnh giả; không còn URL dữ liệu mẫu (unsplash/soundhelix) trong mã Python/JS/HTML (BH-12)."""
+    present = [name for name in LEGACY_REMOVED if (ROOT / name).exists()]
+    assert not present, f"BH-65: file legacy đã gỡ ở giai đoạn 5 lại xuất hiện: {present}"
+    app_src = read(ROOT / "app.py")
+    bad_routes = [r for r in LEGACY_ROUTES if r in app_src]
+    assert not bad_routes, f"BH-65: app.py vẫn còn route legacy: {bad_routes}"
+    assert '@app.post("/api/images")' not in app_src, "BH-65/BH-12: POST /api/images (ảnh Unsplash giả) đã gỡ, không thêm lại"
+    pat = re.compile(r"unsplash|soundhelix", re.IGNORECASE)
+    files = root_py_files() + sorted((ROOT / "static").rglob("*.js")) + sorted((ROOT / "static").rglob("*.html"))
+    hits = [h for p in files for h in _lines_matching(p, pat)]
+    assert not hits, "BH-12: không còn dữ liệu mẫu giả (unsplash/soundhelix) trong mã:\n" + "\n".join(hits)
+
+
 # ---------------------------------------------------------------- BH-23
 RE_BH_HEADING = re.compile(r"^## BH-(\d+)\s*·", re.MULTILINE)
 
@@ -170,3 +191,16 @@ def test_bh23_lesson_numbers_unique_and_consecutive():
     assert nums == sorted(nums), f"BH-23: số bài học không tăng dần theo thứ tự trong file: {nums}"
     expected = list(range(1, max(nums) + 1))
     assert nums == expected, f"BH-23: số bài học phải liên tục 1..{max(nums)}, thiếu {sorted(set(expected) - set(nums))}"
+
+
+# ---------------------------------------------------------------- BH-51
+def test_bh51_no_python_hash_for_persisted_ids():
+    pat = re.compile(r"(?<![\w`])hash\(")
+    hits = [h for name in ("parser.py", "app.py") for h in _lines_matching(ROOT / name, pat)]
+    assert not hits, "BH-51: không dùng hash() của Python cho định danh ghi vào CSDL (dùng hashlib):\n" + "\n".join(hits)
+
+
+# ---------------------------------------------------------------- BH-54
+def test_bh54_no_urllib_download_in_dola_service():
+    hits = _lines_matching(ROOT / "dola_service.py", re.compile(r"^\s*import urllib|^\s*from urllib"))
+    assert not hits, "BH-54: dola_service tải/hỏi IP bằng httpx trust_env=False, không urllib (tự bỏ proxy theo NO_PROXY):\n" + "\n".join(hits)

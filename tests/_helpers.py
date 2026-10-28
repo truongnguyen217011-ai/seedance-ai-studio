@@ -91,6 +91,8 @@ class DbHelper:
             "cookies": self.fake_cookies(sessionid) if with_session else None,
             "credits": None,
         }
+        if "has_dola" in self.columns("accounts"):
+            row["has_dola"] = 1 if with_session else 0   # A7: như đường ghi thật (save_account_storage_state)
         row.update(overrides)
         cols = ", ".join(row.keys())
         marks = ", ".join("?" for _ in row)

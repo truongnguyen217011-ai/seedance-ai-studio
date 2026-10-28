@@ -10,8 +10,10 @@ Hỗ trợ mọi định dạng shop Facebook & Google:
 - Email|Pass|2FA|Proxy (Google/Dola)
 - Định dạng copy từ Excel (tab-separated)
 """
+import hashlib
+import json
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Các biểu thức chính quy nhận diện thành phần
 RE_COOKIE = re.compile(r'(?:^|;|\b)(?:c_user|xs|datr|fr|sb)=', re.IGNORECASE)
@@ -22,6 +24,107 @@ RE_2FA = re.compile(r'^[A-Z2-7]{16,32}$', re.IGNORECASE)
 RE_PROXY = re.compile(r'^(?:https?:\/\/|socks[45]:\/\/)?(?:[a-zA-Z0-9_.-]+(?::[^@]+)?@)?[0-9a-zA-Z.-]+:\d+(?::[a-zA-Z0-9_.-]+:[^|\s]+)?$')
 RE_DATE = re.compile(r'^\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}(\s|$)|^\d{4}-\d{2}-\d{2}')
 RE_TITLE_IGNORE = re.compile(r'^(uid|id|stt|tài khoản|tai khoan|account|user)\b', re.IGNORECASE)
+# Chuỗi trông như người dùng ĐỊNH đưa mã 2FA nhưng không phải Base32 (A-Z, 2-7): chữ+số 10-40 ký tự, không phải
+# toàn số (UID), không có ':' (proxy) hay '.' (email/IP). Dùng để báo "2FA sai định dạng" thay vì lặng lẽ bỏ qua.
+# G-1: chỉ coi là "2FA sai định dạng" khi chuỗi dài ≥ 16 (độ dài mã 2FA thật) HOẶC gần Base32 (≥ 14 ký tự, không
+# lẫn hoa/thường, tối đa 2 ký tự ngoài A-Z2-7 như 0/1/8/9); cột thừa ngắn kiểu "Nguyenvan2024" là ghi chú → `note`.
+RE_2FA_LOOKALIKE = re.compile(r'^[A-Za-z0-9]{10,40}$')
+TWOFA_LOOKALIKE_MIN_LEN = 16
+TWOFA_NEAR_BASE32_MIN_LEN = 14
+TWOFA_NEAR_BASE32_MAX_ODD = 2
+RE_NOT_BASE32_CHAR = re.compile(r'[^A-Z2-7]')
+
+# Tên cookie đặc trưng của từng dịch vụ (K3, BH-11): quyết định domain theo NỘI DUNG, không theo loại nick
+DOLA_COOKIE_NAMES = frozenset({"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt", "uid_tt_ss", "ttwid",
+                               "sid_ucp_v1", "ssid_ucp_v1", "passport_csrf_token", "msToken"})
+FACEBOOK_COOKIE_NAMES = frozenset({"c_user", "xs", "datr", "fr", "sb", "wd", "presence", "dpr", "locale"})
+COOKIE_KIND_DOLA = "dola"
+COOKIE_KIND_FACEBOOK = "facebook"
+COOKIE_KIND_JSON = "json"
+
+
+def detect_cookie_kind(raw) -> Optional[str]:
+    """Nhận diện cookie dán vào thuộc dịch vụ nào, chỉ dựa vào NỘI DUNG (K3, BH-11).
+
+    Trả về "dola" (có sessionid/sessionid_ss), "facebook" (có c_user/xs...), "json" (JSON đã có trường domain
+    riêng từng cookie, giữ nguyên) hoặc None (không nhận ra cookie nào).
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text[:1] in "[{":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            data = data.get("cookies", [])
+        if isinstance(data, list):
+            names = {str(c.get("name", "")) for c in data if isinstance(c, dict)}
+            if names & DOLA_COOKIE_NAMES:
+                return COOKIE_KIND_DOLA
+            if names & FACEBOOK_COOKIE_NAMES:
+                return COOKIE_KIND_FACEBOOK
+            if any(isinstance(c, dict) and c.get("domain") for c in data):
+                return COOKIE_KIND_JSON
+            return None
+    if RE_DOLA_COOKIE.search(text):
+        return COOKIE_KIND_DOLA
+    if RE_COOKIE.search(text):
+        return COOKIE_KIND_FACEBOOK
+    return None
+
+
+def stable_dola_uid(cookie_text: str, session_value: Optional[str] = None) -> str:
+    """UID thay thế cho dòng chỉ có cookie Dola (không c_user): băm ỔN ĐỊNH theo giá trị sessionid để dán lại
+    cùng cookie ở phiên sau vẫn nhận ra là trùng (BH-51: `hash()` của Python đổi mỗi lần chạy).
+    `session_value` truyền sẵn khi cookie là JSON (không có dạng `sessionid=` để tìm bằng regex)."""
+    key = (session_value or "").strip()
+    if not key:
+        m = re.search(r'(?:^|;\s*)sessionid(?:_ss)?=([^;\s]+)', cookie_text)
+        key = m.group(1) if m else cookie_text.strip()
+    return "Dola_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+
+def looks_like_bad_twofa(item: str) -> bool:
+    """G-1: chuỗi thừa có phải là mã 2FA sai định dạng (đáng báo lỗi) hay chỉ là ghi chú ngắn (bỏ qua, ghi `note`).
+
+    Báo lỗi khi: chữ+số 10-40 ký tự, không toàn số, VÀ (dài ≥ 16, hoặc gần Base32: ≥ 14 ký tự, chữ cái không lẫn
+    hoa/thường, ≤ 2 ký tự ngoài A-Z2-7). "ABCD2345EFGH6789" → True; "Nguyenvan2024" → False.
+    """
+    item = str(item or "")
+    if not RE_2FA_LOOKALIKE.match(item) or item.isdigit():
+        return False
+    if len(item) >= TWOFA_LOOKALIKE_MIN_LEN:
+        return True
+    if len(item) < TWOFA_NEAR_BASE32_MIN_LEN:
+        return False
+    letters = [c for c in item if c.isalpha()]
+    mixed_case = any(c.islower() for c in letters) and any(c.isupper() for c in letters)
+    if mixed_case:
+        return False
+    odd = len(RE_NOT_BASE32_CHAR.findall(item.upper()))
+    return odd <= TWOFA_NEAR_BASE32_MAX_ODD
+
+
+def mask_line(line: str) -> str:
+    """Che dòng tài khoản để đưa vào phản hồi API / nhật ký (C-2, BH-57): chỉ giữ cột đầu (UID/email), mọi cột còn
+    lại (mật khẩu, 2FA, cookie, proxy) thành "***". Dòng chỉ có cookie thô → "c_user=<uid>;***" hoặc "***".
+    Không bao giờ trả nguyên dòng người dùng dán cho client hay ghi vào system_logs."""
+    text = clean_line_text(line)
+    if not text:
+        return ""
+    if text[:1] in "[{":
+        # Khối cookie JSON (Cookie-Editor/J2TEAM/storageState) chứa giá trị cookie ở mọi dòng → che toàn bộ
+        return "***"
+    sep = '|' if '|' in text else ('\t' if '\t' in text else None)
+    parts = [p.strip() for p in text.split(sep)] if sep else [text]
+    first = parts[0]
+    if RE_COOKIE.search(first) or RE_DOLA_COOKIE.search(first) or '=' in first and ';' in first:
+        c_match = re.search(r'(?:^|;\s*)c_user=(\d+)', first)
+        first = f"c_user={c_match.group(1)};***" if c_match else "***"
+    rest = ["***" for p in parts[1:] if p]
+    return "|".join([first] + rest)
+
 
 def clean_line_text(line: str) -> str:
     """Loại bỏ ký tự BOM, khoảng trắng, gạch đầu dòng, dấu ngoặc kép"""
@@ -29,6 +132,60 @@ def clean_line_text(line: str) -> str:
     t = re.sub(r'^(?:[-*•]\s*|\d+[.)]\s*)', '', t)
     t = t.strip('\'" \t\r\n')
     return t
+
+def _json_cookie_list(text: str) -> Optional[list]:
+    """Danh sách cookie dict từ JSON (mảng, hoặc dict có khóa `cookies` như storageState); None nếu không phải JSON
+    cookie (không raise: để dòng rơi về các nhánh parser khác)."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        data = data.get("cookies")
+    if not isinstance(data, list):
+        return None
+    cookies = [c for c in data if isinstance(c, dict) and c.get("name")]
+    return cookies or None
+
+
+def _parse_json_cookie_line(text: str) -> Optional[Dict[str, Optional[str]]]:
+    """Dòng/khối là JSON cookie → dict tài khoản `cookie_login`; None nếu không phải JSON cookie.
+    JSON hợp lệ nhưng không có c_user lẫn sessionid → ValueError (người dùng dán nhầm thứ khác)."""
+    cookies = _json_cookie_list(text)
+    if cookies is None:
+        return None
+    c_user_val = None
+    session_val = None
+    for c in cookies:
+        name = str(c.get("name") or "")
+        value = str(c.get("value") or "").strip()
+        if not value:
+            continue
+        if name == "c_user" and not c_user_val:
+            c_user_val = value
+        elif name in ("sessionid", "sessionid_ss") and not session_val:
+            session_val = value
+    if c_user_val:
+        uid = c_user_val
+    elif session_val:
+        uid = stable_dola_uid(text, session_value=session_val)
+    else:
+        raise ValueError("Cookie JSON không chứa c_user (Facebook) hoặc sessionid (Dola)")
+    return {
+        "uid": uid,
+        "pass": "cookie_login",
+        "twofa": None,
+        "proxy": None,
+        "cookie": text,
+        "email": None,
+        "account_type": "facebook",
+        "name": f"FB {uid[-6:]}",
+        "cookie_kind": detect_cookie_kind(text),
+        "twofa_invalid": None,
+        "unassigned": [],
+        "note": "",
+    }
+
 
 def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
     """
@@ -38,51 +195,12 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
     if not text:
         raise ValueError("Dòng trống")
 
-    # 1. Trường hợp là JSON (Cookie-Editor, J2TEAM, Playwright storage_state)
-    if (text.startswith('[') and text.endswith(']')) or (text.startswith('{') and text.endswith('}')):
-        try:
-            import json
-            jdata = json.loads(text)
-            c_list = jdata if isinstance(jdata, list) else (jdata.get("cookies", []) if isinstance(jdata, dict) else [])
-            if c_list and isinstance(c_list, list):
-                # Tìm c_user hoặc sessionid
-                c_user_val = None
-                session_val = None
-                for c in c_list:
-                    if not isinstance(c, dict):
-                        continue
-                    cname = c.get("name", "")
-                    if cname == "c_user" and c.get("value"):
-                        c_user_val = str(c["value"]).strip()
-                    elif cname in ("sessionid", "sessionid_ss") and c.get("value"):
-                        session_val = str(c["value"]).strip()
-
-                if c_user_val:
-                    return {
-                        "uid": c_user_val,
-                        "pass": "cookie_login",
-                        "twofa": None,
-                        "proxy": None,
-                        "cookie": text,
-                        "email": None,
-                        "account_type": "facebook",
-                        "name": f"FB {c_user_val[-6:]}" if len(c_user_val) >= 6 else f"FB {c_user_val}"
-                    }
-                if session_val:
-                    uid = f"Dola_{abs(hash(session_val)) % 1000000}"
-                    return {
-                        "uid": uid,
-                        "pass": "cookie_login",
-                        "twofa": None,
-                        "proxy": None,
-                        "cookie": text,
-                        "email": None,
-                        "account_type": "facebook",
-                        "name": f"Dola {uid[-6:]}"
-                    }
-                raise ValueError("Cookie JSON không chứa c_user (Facebook) hoặc sessionid (Dola)")
-        except json.JSONDecodeError:
-            pass
+    # 1. Cookie dạng JSON (Cookie-Editor, J2TEAM, Playwright storage_state): lấy c_user (Facebook) hoặc sessionid
+    #    (Dola) làm UID; UID Dola băm ổn định theo giá trị sessionid (BH-51), không dùng `hash()`
+    if text[:1] in "[{" and text[-1:] in "]}":
+        parsed_json = _parse_json_cookie_line(text)
+        if parsed_json is not None:
+            return parsed_json
 
     # 2. Trường hợp chỉ có 1 chuỗi Cookie nguyên bản (không có phân cách | hoặc tab)
     if '|' not in text and '\t' not in text and (RE_COOKIE.search(text) or RE_DOLA_COOKIE.search(text)):
@@ -92,7 +210,7 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         
         # Nếu là Dola cookie mà không có c_user
         if not uid and RE_DOLA_COOKIE.search(text):
-            uid = f"Dola_{abs(hash(text)) % 1000000}"
+            uid = stable_dola_uid(text)
             
         if not uid:
             raise ValueError("Cookie Facebook thiếu c_user")
@@ -105,7 +223,11 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
             "cookie": text,
             "email": None,
             "account_type": "facebook",
-            "name": f"FB {uid[-6:]}"
+            "name": f"FB {uid[-6:]}",
+            "cookie_kind": detect_cookie_kind(text),
+            "twofa_invalid": None,
+            "unassigned": [],
+            "note": "",
         }
 
     # 2. Trường hợp chuỗi có phân cách (| hoặc Tab)
@@ -202,7 +324,17 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         raise ValueError("Thiếu mật khẩu hoặc Cookie đăng nhập")
 
     uid = str(uid).replace(" ", "")
-    
+
+    # Chuỗi thừa trông như mã 2FA nhưng không phải Base32 → báo cho người dùng (không lặng lẽ bỏ); cột thừa ngắn
+    # (tên, ghi chú) không bị coi là 2FA (G-1) mà gom vào `note`
+    twofa_invalid = None
+    if not twofa:
+        for item in unassigned:
+            if looks_like_bad_twofa(item):
+                twofa_invalid = item
+                break
+    note = ", ".join(item for item in unassigned if item != twofa_invalid)
+
     # Đặt tên gợi nhớ
     if account_type == "google" and email:
         name = email.split('@')[0]
@@ -217,13 +349,27 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         "cookie": cookie,
         "email": email,
         "account_type": account_type,
-        "name": name
+        "name": name,
+        "cookie_kind": detect_cookie_kind(cookie) if cookie else None,
+        "twofa_invalid": twofa_invalid,
+        "unassigned": unassigned,
+        "note": note,
     }
 
-def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
+
+def twofa_invalid_reason(token: str) -> str:
+    return (f"Mã 2FA '{token}' sai định dạng: phải là Base32 (chữ A-Z và số 2-7, 16-32 ký tự, có thể có khoảng trắng); "
+            f"bỏ qua dòng này để không tạo nick thiếu 2FA")
+
+
+def parse_multiple_account_lines(text: str, strict_2fa: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """
     Phân tích toàn bộ khối văn bản nhiều dòng (từ file hoặc copy-paste).
-    Trả về: (danh_sach_hop_le, danh_sach_loi)
+    Trả về: (danh_sach_hop_le, danh_sach_loi). `errors[].text` là dòng ĐÃ CHE (mask_line: chỉ cột đầu, còn lại "***",
+    BH-57) vì danh sách này đi thẳng ra API và nhật ký.
+
+    strict_2fa=True (A1): dòng có chuỗi trông như mã 2FA nhưng không phải Base32 bị đưa vào danh sách lỗi với lý do
+    rõ, thay vì tạo nick không có 2FA rồi Auto Login thất bại về sau.
     """
     ok_list = []
     errors = []
@@ -231,16 +377,11 @@ def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
 
     clean_text = str(text or '').replace('\ufeff', '')
     stripped = clean_text.strip()
-    if (stripped.startswith('[') and stripped.endswith(']')) or (stripped.startswith('{') and stripped.endswith('}')):
-        try:
-            parsed = parse_single_account_line(stripped)
-            parsed["line"] = 1
-            return [parsed], []
-        except Exception:
-            # Nếu không phải một khối cookie đơn lẻ, fallback về duyệt từng dòng
-            pass
-
-    lines = clean_text.splitlines()
+    if stripped[:1] in "[{" and stripped[-1:] in "]}" and _json_cookie_list(stripped) is not None:
+        # Cả ô dán là MỘT khối cookie JSON (Cookie-Editor xuất nhiều dòng): coi là một dòng, không tách theo xuống dòng
+        lines = [stripped]
+    else:
+        lines = clean_text.splitlines()
 
     for idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
@@ -252,11 +393,14 @@ def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
 
         try:
             parsed = parse_single_account_line(line)
+            if strict_2fa and parsed.get("twofa_invalid"):
+                errors.append({"line": idx, "text": mask_line(line), "reason": twofa_invalid_reason(parsed["twofa_invalid"])})
+                continue
             uid = parsed["uid"]
             if uid in seen_uids:
                 errors.append({
                     "line": idx,
-                    "text": line,
+                    "text": mask_line(line),
                     "reason": f"UID {uid} bị trùng với dòng trước đó (đã bỏ qua)"
                 })
                 continue
@@ -267,7 +411,7 @@ def parse_multiple_account_lines(text: str) -> Tuple[List[Dict], List[Dict]]:
         except Exception as e:
             errors.append({
                 "line": idx,
-                "text": line,
+                "text": mask_line(line),
                 "reason": str(e)
             })
 

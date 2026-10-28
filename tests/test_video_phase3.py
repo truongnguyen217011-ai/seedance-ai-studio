@@ -3,7 +3,7 @@ Kiểm thử Giai đoạn 3: Tạo video & Tương tác Dola chuyên sâu (T1–
 - T1: Đính kèm ảnh tham chiếu (reference_image) khi file tồn tại, bỏ qua an toàn khi file không tồn tại.
 - T2: Xác thực tính hợp lệ của file video tải về (_is_valid_video_file): loại bỏ file nhỏ (<50KB), từ chối phản hồi lỗi HTML/JSON giả dạng mp4.
 - T3: Tự động dọn dẹp file hỏng nếu quá trình tải thất bại (_download_video).
-- T4: Truyền header Cookie của nick khi tải video từ host Dola.
+- T4: Truyền header Cookie của nick khi tải video từ host khớp domain cookie (không gửi phiên sang host lạ).
 - T5: Endpoint /api/download-video và /api/jobs/{id}/stream phục vụ video chính xác.
 """
 from __future__ import annotations
@@ -15,6 +15,48 @@ import pytest
 import config
 from database import get_connection
 import dola_service
+
+# Gộp 1.5.0 (BH-54): dola_service tải video bằng httpx `trust_env=False` (không urllib) nên T3/T4 giả lập httpx.Client.
+
+
+class _FakeStreamResponse:
+    def __init__(self, body: bytes, status: int = 200):
+        self._body = body
+        self.status_code = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_bytes(self):
+        for i in range(0, len(self._body), 8192):
+            yield self._body[i:i + 8192]
+
+
+def _install_fake_httpx(monkeypatch, body: bytes, captured: dict):
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def stream(self, method, url, headers=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            return _FakeStreamResponse(body)
+
+    monkeypatch.setattr(dola_service.httpx, "Client", _FakeClient)
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient", reason="cần fastapi + httpx (requirements-dev.txt)")
 
@@ -93,50 +135,69 @@ def test_t2_video_file_validation(tmp_path):
 
 
 def test_t3_download_video_cleans_corrupt_files(tmp_path, monkeypatch):
-    import io
     dest = tmp_path / "video_test_corrupt.mp4"
-
-    class FakeResponse(io.BytesIO):
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-
     bad_data = b"<!DOCTYPE html><html>403 Access Denied</html>" + b" " * 60000
-    import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=120: FakeResponse(bad_data))
+    captured = {}
+    _install_fake_httpx(monkeypatch, bad_data, captured)
 
     ok = dola_service._download_video("http://example.com/video.mp4", str(dest), job_id=202)
     assert ok is False
     assert not dest.exists(), "File video lỗi phải bị xóa sạch khỏi thư mục đích"
+    assert captured["client_kwargs"]["trust_env"] is False, "BH-54: không đọc proxy môi trường"
+
+
+def test_t3b_download_error_removes_partial_file(tmp_path, monkeypatch):
+    dest = tmp_path / "video_partial.mp4"
+    captured = {}
+
+    class _Boom(_FakeStreamResponse):
+        def iter_bytes(self):
+            yield b"FAKEMP4;" + b"\x00" * 1000
+            raise ConnectionError("đứt giữa chừng")
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def stream(self, method, url, headers=None):
+            return _Boom(b"")
+
+    monkeypatch.setattr(dola_service.httpx, "Client", _FakeClient)
+    with pytest.raises(ConnectionError):
+        dola_service._download_video("http://example.com/video.mp4", str(dest), job_id=204)
+    assert not dest.exists(), "file tải dở phải bị xóa để không bị coi là video"
 
 
 def test_t4_download_video_cookie_header(tmp_path, monkeypatch):
-    import io
     dest = tmp_path / "video_test_cookie.mp4"
-    captured_headers = {}
-
-    class FakeResponse(io.BytesIO):
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-
     valid_data = b"FAKEMP4;conv=999;" + b"\x00" * 60000
-
-    def fake_urlopen(req, timeout=120):
-        captured_headers.update(req.headers)
-        return FakeResponse(valid_data)
-
-    import urllib.request
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    captured = {}
+    _install_fake_httpx(monkeypatch, valid_data, captured)
 
     cookies = [
-        {"name": "sessionid", "value": "my_secret_session_token"},
-        {"name": "sessionid_ss", "value": "my_secret_session_token"}
+        {"name": "sessionid", "value": "my_secret_session_token", "domain": ".dola.example"},
+        {"name": "sessionid_ss", "value": "my_secret_session_token", "domain": "www.dola.example"},
+        {"name": "c_user", "value": "123", "domain": ".facebook.com"},
     ]
 
-    ok = dola_service._download_video("http://example.com/video.mp4", str(dest), job_id=303, cookies_list=cookies)
-    assert ok is True
-    assert "Cookie" in captured_headers or "cookie" in captured_headers
-    cookie_str = captured_headers.get("Cookie") or captured_headers.get("cookie")
-    assert "sessionid=my_secret_session_token" in cookie_str
+    ok = dola_service._download_video("http://www.dola.example/video/tos/1.mp4", str(dest), job_id=303, cookies_list=cookies)
+    assert ok is True and dest.exists()
+    cookie_str = captured["headers"].get("Cookie")
+    assert cookie_str and "sessionid=my_secret_session_token" in cookie_str and "sessionid_ss=" in cookie_str
+    assert "c_user" not in cookie_str, "cookie Facebook không được gửi sang host Dola"
+
+    # Host không khớp domain cookie (CDN lạ) → không gửi phiên Dola
+    captured.clear()
+    dest2 = tmp_path / "video_cdn.mp4"
+    ok2 = dola_service._download_video("http://cdn.other.example/v.mp4", str(dest2), job_id=304, cookies_list=cookies)
+    assert ok2 is True
+    assert "Cookie" not in captured["headers"], captured["headers"]
 
 
 def test_t5_download_and_stream_endpoints(client, db):

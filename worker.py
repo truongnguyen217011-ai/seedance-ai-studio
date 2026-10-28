@@ -8,6 +8,7 @@ Luồng:
 """
 import asyncio
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -21,9 +22,9 @@ if sys.platform == "win32":
 import browser
 import config
 from account_pool import AccountPool, select_account_for_job
-from constants import AccountStatus, JobStatus, Reason
+from constants import AccountStatus, JobStatus, NeedsManual, Reason
 from database import get_connection, get_int_setting, reset_orphans_on_startup
-from dola_service import execute_video_job, update_job_status
+from dola_service import execute_video_job, recheck_dead_proxy, refresh_has_dola_flags, update_job_status
 from logger import get_logger, log_event
 
 log = get_logger("Worker")
@@ -46,6 +47,9 @@ _last_tick = 0.0
 _running_jobs = set()  # job_id đang chạy trong thread (để không nhặt lại trước khi CSDL cập nhật)
 _background_tasks = set()  # giữ tham chiếu task asyncio (G-1): task đang chạy không bị GC thu
 _last_no_chrome_warn = 0.0
+_last_has_dola_refresh = time.monotonic()   # mốc lần quét cột has_dola gần nhất (N-5); _startup quét ngay nên tính từ lúc nạp module
+_background_inflight = set()   # khóa việc nền đang chạy trên JOB_EXECUTOR: "has_dola", "proxy:<id>" (không chạy chồng)
+_background_lock = threading.Lock()
 
 
 def worker_alive(max_age_seconds: float = 10.0) -> bool:
@@ -69,8 +73,65 @@ def _set_message_if_changed(conn, job_row, message: str) -> None:
         conn.commit()
 
 
+def _run_background(key: str, fn, *args):
+    """Chạy một việc nền trên JOB_EXECUTOR, bảo đảm gỡ khóa `key` khi xong (kể cả khi lỗi)."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001 - việc nền lỗi chỉ ghi log, không ảnh hưởng vòng quét
+        log.error("Việc nền '%s' lỗi: %s", key, e)
+        return None
+    finally:
+        with _background_lock:
+            _background_inflight.discard(key)
+
+
+def _submit_background(key: str, fn, *args):
+    """Đưa việc nền (không mở Chrome nhưng có thể chờ mạng/đọc file) lên JOB_EXECUTOR; mỗi `key` chỉ một lần đồng
+    thời. Trả về Future hoặc None nếu đang chạy."""
+    with _background_lock:
+        if key in _background_inflight:
+            return None
+        _background_inflight.add(key)
+    try:
+        return JOB_EXECUTOR.submit(_run_background, key, fn, *args)
+    except Exception:
+        with _background_lock:
+            _background_inflight.discard(key)
+        raise
+
+
+def _recheck_dead_proxies(conn) -> list:
+    """N-4 (BH-59): nick needs_manual='proxy' quá PROXY_RECHECK_INTERVAL_SECONDS (theo last_check) → hỏi IP qua proxy
+    một lần trên JOB_EXECUTOR (dola_service.recheck_dead_proxy, không mở Chrome); sống thì gỡ cờ. Trả về các Future."""
+    rows = conn.execute(
+        """SELECT id FROM accounts WHERE needs_manual = ? AND proxy IS NOT NULL AND TRIM(proxy) != ''
+           AND (last_check IS NULL OR (strftime('%s', 'now', 'localtime') - strftime('%s', last_check)) > ?)""",
+        (NeedsManual.PROXY, int(config.PROXY_RECHECK_INTERVAL_SECONDS)),
+    ).fetchall()
+    futures = []
+    for row in rows:
+        fut = _submit_background(f"proxy:{row['id']}", recheck_dead_proxy, row["id"])
+        if fut is not None:
+            futures.append(fut)
+    return futures
+
+
+def _refresh_has_dola_if_due(force: bool = False):
+    """N-5 (BH-60): quét lại cột has_dola mỗi HAS_DOLA_REFRESH_INTERVAL_SECONDS trên JOB_EXECUTOR (đọc file của mọi
+    nick, không chặn vòng quét). Trả về Future hoặc None nếu chưa tới hạn / đang chạy."""
+    global _last_has_dola_refresh
+    now = time.monotonic()
+    if not force and now - _last_has_dola_refresh < config.HAS_DOLA_REFRESH_INTERVAL_SECONDS:
+        return None
+    fut = _submit_background("has_dola", refresh_has_dola_flags)
+    if fut is not None:
+        _last_has_dola_refresh = now
+    return fut
+
+
 def _recover_accounts(conn) -> None:
-    """Hết hạn rest_until → bỏ nghỉ; rate_limited quá 30 phút → ready."""
+    """Hết hạn rest_until → bỏ nghỉ; rate_limited quá 30 phút → ready; nick cờ proxy quá 30 phút → thử lại proxy
+    (N-4, nền); quét cột has_dola mỗi 10 phút (N-5, nền)."""
     conn.execute("""
         UPDATE accounts SET rest_until = NULL, rest_reason = NULL
         WHERE rest_until IS NOT NULL AND rest_until <= datetime('now', 'localtime')
@@ -80,6 +141,8 @@ def _recover_accounts(conn) -> None:
         WHERE status = ? AND (last_used IS NULL OR (strftime('%s', 'now') - strftime('%s', last_used)) > 1800)
     """, (AccountStatus.READY, AccountStatus.RATE_LIMITED))
     conn.commit()
+    _recheck_dead_proxies(conn)
+    _refresh_has_dola_if_due()
 
 
 async def _run_job(job_id: int, account_id: int) -> None:
@@ -262,13 +325,37 @@ def _tick() -> list:
     return to_start
 
 
+def _known_account_ids() -> list:
+    conn = get_connection()
+    try:
+        return [r["id"] for r in conn.execute("SELECT id FROM accounts").fetchall()]
+    finally:
+        conn.close()
+
+
 def _startup() -> None:
+    global _last_has_dola_refresh
     reset_count = reset_orphans_on_startup()
     AccountPool.get().clear()
-    cleaned = browser.cleanup_profiles_on_startup()
+    # N-7: dọn Chrome mồ côi và xóa thư mục profiles/acc_* của nick không còn trong CSDL (xóa nick thất bại trên Windows)
+    try:
+        known_ids = _known_account_ids()
+    except Exception as e:  # noqa: BLE001
+        log.error("Không đọc được danh sách nick để dọn profile: %s", e)
+        known_ids = None
+    cleaned = browser.cleanup_profiles_on_startup(known_ids)
+    # A7: quét cột has_dola một lần (đọc cookies + storage_state.json của từng nick); sau đó cập nhật khi ghi phiên
+    # và quét lại mỗi HAS_DOLA_REFRESH_INTERVAL_SECONDS (N-5)
+    try:
+        with_session = refresh_has_dola_flags()
+        _last_has_dola_refresh = time.monotonic()
+    except Exception as e:  # noqa: BLE001 - không được chặn worker
+        log.error("Quét cờ has_dola lúc khởi động lỗi: %s", e)
+        with_session = None
     log_event(
         f"Worker khởi động: reset {reset_count} job mồ côi về '{JobStatus.CHO}', dọn {cleaned} Chrome mồ côi, "
-        f"giới hạn {get_int_setting('max_concurrent_jobs', config.DEFAULT_MAX_BROWSERS)} Chrome",
+        f"giới hạn {get_int_setting('max_concurrent_jobs', config.DEFAULT_MAX_BROWSERS)} Chrome"
+        + (f", {with_session} nick có phiên Dola" if with_session is not None else ""),
         "INFO", "Worker",
     )
 

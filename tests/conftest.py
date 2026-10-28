@@ -79,6 +79,10 @@ os.environ["SEEDANCE_DOLA_URL"] = f"http://127.0.0.1:{FAKE_DOLA_PORT}"
 # không có DISPLAY nên launch headless=False thất bại ("Target page, context or browser has been closed").
 # Test chạy headless thật; chế độ cửa sổ ẩn thật được kiểm riêng qua xvfb (tests/test_browser_hidden_xvfb.py).
 os.environ.setdefault("SEEDANCE_HEADLESS", "1")
+# A4: fake Dola nằm trên loopback; Chromium mặc định KHÔNG đi qua proxy cho 127.0.0.1 nên test proxy cần "<-loopback>"
+os.environ.setdefault("SEEDANCE_PROXY_BYPASS", "<-loopback>")
+# Chẩn đoán hỏi "IP ra ngoài" ở fake Dola thay vì api.ipify.org (máy test không có mạng)
+os.environ["SEEDANCE_IP_CHECK_URL"] = f"http://127.0.0.1:{FAKE_DOLA_PORT}/__ip"
 
 
 def _cleanup_session_dir() -> None:
@@ -157,6 +161,15 @@ def db(env_tmp):
     helper = DbHelper(env_tmp)
     helper.init()
     yield helper
+
+
+@pytest.fixture
+def fake_proxy():
+    """Proxy HTTP giả cục bộ (tests/fake_proxy.py): chuyển tiếp request, đếm từng request đi qua (A4)."""
+    from fake_proxy import start_fake_proxy
+    fp = start_fake_proxy()
+    yield fp
+    fp.stop()
 
 
 @pytest.fixture

@@ -24,6 +24,23 @@ DOLA_CHAT_URL = f"{DOLA_BASE_URL}/chat/"
 # Chrome: env thắng setting, setting thắng dò tự động (xem browser.find_chrome)
 CHROME_PATH_ENV = os.environ.get("SEEDANCE_CHROME_PATH", "")
 
+# Proxy theo nick (A4): danh sách bypass truyền cho Chrome khi nick có proxy. Mặc định rỗng = Chrome tự bỏ qua
+# proxy cho localhost/127.0.0.1 (quy tắc ngầm của Chromium). Test đặt SEEDANCE_PROXY_BYPASS="<-loopback>" để
+# cả fake Dola trên 127.0.0.1 cũng đi qua fake proxy; bản chạy thật không cần vì Dola không nằm trên loopback.
+PROXY_BYPASS_LIST = os.environ.get("SEEDANCE_PROXY_BYPASS", "")
+
+# Dịch vụ hỏi "IP ra ngoài" của máy/proxy (chẩn đoán, A4). Test trỏ về fake Dola (/__ip) để không cần mạng.
+IP_CHECK_URL = os.environ.get("SEEDANCE_IP_CHECK_URL", "https://api.ipify.org?format=json")
+
+# K7: nick mất phiên Dola giữa job mà có mật khẩu → tự Auto Login lại đúng MỘT lần; lần kế tiếp cho cùng nick
+# chỉ sau chừng này giây (chống vòng lặp job ↔ auto login khi phiên "có cookie" nhưng trang vẫn không nhận)
+RELOGIN_MIN_INTERVAL_SECONDS = 1800
+# N-4 (BH-59): nick mang cờ needs_manual='proxy' quá chừng này giây thì worker hỏi IP qua proxy một lần (không mở
+# Chrome); proxy trả lời → gỡ cờ. Cũng là khoảng cách giữa hai lần thử.
+PROXY_RECHECK_INTERVAL_SECONDS = 1800
+# N-5 (BH-60): worker quét lại cột has_dola (cookie/storage_state của từng nick) định kỳ chừng này giây
+HAS_DOLA_REFRESH_INTERVAL_SECONDS = 600
+
 # Chế độ mở Chrome cho thao tác tự động (job, auto login ẩn, check credit, chẩn đoán) — BH-39:
 # Dola chặn Chrome headless bằng captcha ByteDance ngay sau khi gửi prompt, nên mặc định (0) là Chrome THẬT
 # với cửa sổ đặt ngoài màn hình (HIDDEN_WINDOW_POSITION). Đặt SEEDANCE_HEADLESS=1 chỉ cho test trên máy

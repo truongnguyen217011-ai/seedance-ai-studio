@@ -29,6 +29,11 @@ Thiết kế:
   (BH-48): tin người dùng (prompt, rồi câu trả lời tỷ lệ của tool) ``role: user`` + tin trợ lý; trong lúc render có
   thêm ``{"role": "assistant", "text": "Generating video..."}`` và ``status: generating``.
 - mode=reply_text: mọi conversation chỉ trả văn bản REPLY_TEXT ("I cannot create that video"), không bao giờ có video.
+- ``{"session_valid": false}`` (K7): Dola không nhận phiên nữa — mọi trang /chat/* trả Set-Cookie xóa ``sessionid``
+  và không cấp cookie mới, nên dola_service thấy "không có sessionid" như khi phiên thật hết hạn.
+- ``{"credits_in_chain": true}`` (K4): khi video đã xong, chain/single kèm thêm một tin trợ lý nói về credit
+  ("This will use 1 video credits, you only have N left today") để kiểm tool đọc credit từ văn bản chain.
+- ``GET /__ip`` trả ``{"ip": <địa chỉ client>}``: thay api.ipify.org trong chẩn đoán (config.IP_CHECK_URL).
 """
 from __future__ import annotations
 
@@ -77,6 +82,8 @@ class FakeDolaState:
         # mode=captcha: None = captcha vĩnh viễn (người dùng không giải); N = tự "giải" N giây sau lần hiện đầu tiên
         self.solve_captcha_after: Optional[float] = None
         self.auto_resend_after_solve: bool = False
+        self.session_valid: bool = True        # False: trang xóa cookie sessionid (K7)
+        self.credits_in_chain: bool = False    # True: chain kèm câu nói về credit sau khi render xong (K4)
         self.captcha_shown_at: Optional[float] = None
         self.captcha_solved_at: Optional[float] = None
         self.sent_prompts: List[str] = []
@@ -95,6 +102,8 @@ class FakeDolaState:
             self.slow_delay = 3.0
             self.solve_captcha_after = None
             self.auto_resend_after_solve = False
+            self.session_valid = True
+            self.credits_in_chain = False
             self.captcha_shown_at = None
             self.captcha_solved_at = None
             self.sent_prompts = []
@@ -202,6 +211,8 @@ class FakeDolaState:
                 "slow_delay": self.slow_delay,
                 "solve_captcha_after": self.solve_captcha_after,
                 "auto_resend_after_solve": self.auto_resend_after_solve,
+                "session_valid": self.session_valid,
+                "credits_in_chain": self.credits_in_chain,
                 "captcha_shown_at": self.captcha_shown_at,
                 "captcha_solved_at": self.captcha_solved_at,
                 "sent_prompts": list(self.sent_prompts),
@@ -243,6 +254,10 @@ def _log(request: Request) -> str:
 
 
 def _ensure_cookie(request: Request, response: Response) -> None:
+    if not STATE.session_valid:
+        # K7: phiên hết hạn phía Dola → xóa cookie sessionid của trình duyệt, không cấp cookie mới
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return
     if not request.cookies.get(SESSION_COOKIE):
         response.set_cookie(SESSION_COOKIE, f"fake-{random.randint(100000, 999999)}", path="/")
 
@@ -461,7 +476,18 @@ async def single_chain(request: Request):
         return {"data": {"status": "generating",
                          "messages": history + [{"content_type": "text", "role": "assistant", "text": "Generating video..."}]}}
     base = str(request.base_url).rstrip("/")  # http://127.0.0.1:PORT (server không có TLS)
-    return {"data": {"messages": history + [{"content_type": "video", "content": f"{base}/video/tos/{conv_id}.mp4"}]}}
+    done = history + [{"content_type": "video", "content": f"{base}/video/tos/{conv_id}.mp4"}]
+    if STATE.credits_in_chain:
+        sess = STATE.sessions.get(sid) or {"credits": STATE.credits}
+        done.append(_text_msg("assistant", f"This will use 1 video credits, you only have {sess['credits']} left today."))
+    return {"data": {"messages": done}}
+
+
+@app.get("/__ip")
+async def ip_echo(request: Request):
+    """Thay api.ipify.org trong chẩn đoán (config.IP_CHECK_URL): trả IP của client (máy hoặc proxy)."""
+    client = request.client.host if request.client else "127.0.0.1"
+    return {"ip": client, "via_proxy": request.headers.get("x-fake-proxy") == "1"}
 
 
 @app.get("/video/tos/{name}")
@@ -496,6 +522,10 @@ async def control(request: Request):
             STATE.captcha_solved_at = None
         if "auto_resend_after_solve" in body:
             STATE.auto_resend_after_solve = bool(body["auto_resend_after_solve"])
+        if "session_valid" in body:
+            STATE.session_valid = bool(body["session_valid"])
+        if "credits_in_chain" in body:
+            STATE.credits_in_chain = bool(body["credits_in_chain"])
         if "credits" in body:
             STATE.credits = int(body["credits"])
             for s in STATE.sessions.values():
