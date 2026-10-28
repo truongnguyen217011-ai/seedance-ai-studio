@@ -31,6 +31,12 @@ IP_CHECK_URL = config.IP_CHECK_URL   # env SEEDANCE_IP_CHECK_URL; test trỏ v�
 IP_TIMEOUT = 15
 SENSITIVE_SETTING_WORDS = ("key", "pass")
 
+# Lỗi CẤU HÌNH/MÔI TRƯỜNG khi hỏi IP qua proxy (BH-56): không nói gì về proxy sống hay chết → bước proxy ok=None,
+# KHÔNG gắn cờ needs_manual='proxy'. Ví dụ: thiếu gói socksio cho socks5:// (ImportError), URL proxy sai cú pháp
+# (ValueError/httpx.InvalidURL), scheme lạ (httpx.UnsupportedProtocol). Lỗi mạng thật (ConnectError, timeout,
+# ProxyError, HTTP lỗi) mới là "proxy không phản hồi" (ok=False).
+IP_CHECK_CONFIG_ERRORS = (ImportError, ValueError, TypeError, httpx.UnsupportedProtocol, httpx.InvalidURL)
+
 
 def _step(key: str, name: str, ok, detail: str) -> dict:
     return {"key": key, "name": name, "ok": ok, "detail": detail}
@@ -70,10 +76,12 @@ def _proxy_url(proxy_cfg: Optional[dict]) -> Optional[str]:
     return server
 
 
-def _fetch_ip(proxy_url: Optional[str]) -> str:
+def _fetch_ip(proxy_url: Optional[str], timeout: float = IP_TIMEOUT) -> str:
     """IP ra ngoài qua proxy của nick (hoặc IP máy khi không có proxy). trust_env=False cả hai nhánh: không bao giờ
-    đi qua proxy của môi trường (HTTP_PROXY) — "IP máy" phải là IP thật, "IP qua proxy" phải là proxy của nick (A4)."""
-    kwargs = {"timeout": IP_TIMEOUT, "trust_env": False}
+    đi qua proxy của môi trường (HTTP_PROXY) — "IP máy" phải là IP thật, "IP qua proxy" phải là proxy của nick (A4).
+    socks5:// cần `httpx[socks]` (requirements.txt); thiếu thì httpx ném ImportError, hàm gọi phải coi đó là lỗi
+    cấu hình (IP_CHECK_CONFIG_ERRORS), không phải proxy chết (BH-56)."""
+    kwargs = {"timeout": timeout, "trust_env": False}
     if proxy_url:
         kwargs["proxy"] = proxy_url
     with httpx.Client(**kwargs) as client:
@@ -98,7 +106,12 @@ def _check_proxy(acc: dict) -> dict:
     try:
         ip = _fetch_ip(_proxy_url(proxy_cfg))
         return _step("proxy", "Proxy", True, f"Proxy phản hồi, IP ra ngoài: {ip}")
-    except Exception as e:  # noqa: BLE001
+    except IP_CHECK_CONFIG_ERRORS as e:
+        # BH-56: lỗi của máy/cấu hình (thiếu httpx[socks], URL sai...) không phải proxy chết → không gắn cờ
+        why = _scrub_proxy_secret(str(e).strip().splitlines()[0] if str(e).strip() else e.__class__.__name__, proxy_cfg)[:120]
+        return _step("proxy", "Proxy", None,
+                     f"Không kiểm được IP qua proxy '{mask_proxy(acc.get('proxy'))}' (lỗi cấu hình, chưa kết luận proxy): {why}")
+    except Exception as e:  # noqa: BLE001 - lỗi mạng thật: ConnectError, timeout, ProxyError, HTTP lỗi
         return _step("proxy", "Proxy", False, f"Proxy '{mask_proxy(acc.get('proxy'))}' không phản hồi: {_scrub_proxy_secret(str(e), proxy_cfg)[:100]}")
 
 
@@ -202,7 +215,8 @@ def diagnose_account(account_id: int) -> dict:
     if not pool.acquire(account_id, None):
         holder = pool.holder(account_id)
         who = f"job #{holder}" if holder else "thao tác khác"
-        return {"success": False, "steps": [], "summary": f"Nick '{acc['name']}' đang bận với {who}, thử lại sau"}
+        return {"success": False, "busy": True, "steps": [],
+                "summary": f"Nick '{acc['name']}' đang bận với {who}, thử lại sau"}
 
     steps = []
     try:
@@ -250,12 +264,16 @@ def diagnose_account(account_id: int) -> dict:
 
 
 # ==================== QUÉT TẤT CẢ NICK (K9) ====================
-SCAN_CATEGORIES = ("ready", "no_credit", "need_login", "proxy_dead", "captcha", "error", "unknown")
+SCAN_CATEGORIES = ("ready", "no_credit", "need_login", "proxy_dead", "captcha", "busy", "error", "unknown")
+SCAN_BUSY_RETRY_DELAY = 5.0   # giây chờ trước khi thử lại nick đang bận đã được xếp xuống cuối hàng (G-2)
 
 
 def classify_diagnosis(result: dict) -> str:
     """Xếp kết quả diagnose_account vào một nhóm của tổng kết quét: ready / no_credit / need_login / proxy_dead /
-    captcha / error / unknown (bước credit bị bỏ qua vì không có Chrome...). Không đoán: thiếu bước → unknown."""
+    captcha / busy (nick đang bận job/thao tác khác, G-2) / error / unknown (bước credit bị bỏ qua vì không có
+    Chrome...). Không đoán: thiếu bước → unknown."""
+    if (result or {}).get("busy"):
+        return "busy"
     steps = {s["key"]: s for s in (result or {}).get("steps") or []}
     if not steps:
         return "error"
@@ -320,11 +338,20 @@ def scan_status() -> dict:
 
 
 def _scan_worker(queue: list, pool_lock: threading.Lock) -> None:
+    """Một luồng quét: lấy nick đầu hàng, chẩn đoán, ghi kết quả. Phần tử hàng: (account_id, name) hoặc
+    (account_id, name, retry_at) khi nick đang bận được xếp lại cuối hàng để thử một lần nữa (G-2)."""
     while True:
         with pool_lock:
             if not queue:
                 return
-            account_id, name = queue.pop(0)
+            item = queue.pop(0)
+        account_id, name = item[0], item[1]
+        retry_at = item[2] if len(item) > 2 else None
+        if retry_at is not None:
+            # Lần thử lại: chờ một chút cho nick kịp rảnh (không chiếm pool_lock trong lúc chờ)
+            delay = retry_at - time.monotonic()
+            if delay > 0:
+                time.sleep(min(delay, SCAN_BUSY_RETRY_DELAY))
         with _SCAN.lock:
             _SCAN.current.append(account_id)
         try:
@@ -334,6 +361,16 @@ def _scan_worker(queue: list, pool_lock: threading.Lock) -> None:
         except Exception as e:  # noqa: BLE001 - một nick lỗi không được dừng cả đợt quét
             category, summary = "error", f"Chẩn đoán lỗi: {str(e)[:120]}"
             log.error("Quét nick #%s (%s) lỗi: %s", account_id, name, e, extra={"account_id": account_id})
+        if category == "busy" and retry_at is None:
+            # G-2: nick đang bận → xếp lại cuối hàng, thử lại đúng một lần nữa khi hết bận; chưa tính là xong
+            with pool_lock:
+                queue.append((account_id, name, time.monotonic() + SCAN_BUSY_RETRY_DELAY))
+            with _SCAN.lock:
+                if account_id in _SCAN.current:
+                    _SCAN.current.remove(account_id)
+            log.info("Quét nick #%s (%s): đang bận, xếp lại cuối hàng để thử lại", account_id, name,
+                     extra={"account_id": account_id})
+            continue
         with _SCAN.lock:
             _SCAN.done += 1
             _SCAN.summary[category] = _SCAN.summary.get(category, 0) + 1
@@ -342,23 +379,37 @@ def _scan_worker(queue: list, pool_lock: threading.Lock) -> None:
                 _SCAN.current.remove(account_id)
 
 
-def _scan_runner(queue: list, workers: int) -> None:
-    from worker import JOB_EXECUTOR  # import muộn: worker import dola_service → diagnostics
-    pool_lock = threading.Lock()
-    futures = [JOB_EXECUTOR.submit(_scan_worker, queue, pool_lock) for _ in range(workers)]
-    for f in futures:
-        try:
-            f.result()
-        except Exception as e:  # noqa: BLE001
-            log.error("Luồng quét nick văng lỗi: %s", e)
+def _finish_scan() -> None:
+    """Đặt running=False (luôn chạy, kể cả khi submit/log lỗi, N-6) rồi ghi tổng kết; lỗi ghi log không nuốt cờ."""
     with _SCAN.lock:
         _SCAN.running = False
         _SCAN.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         summary = dict(_SCAN.summary)
         total = _SCAN.total
-    log_event(f"Quét tất cả nick xong: {total} nick — sẵn sàng {summary['ready']}, hết credit {summary['no_credit']}, "
-              f"cần đăng nhập {summary['need_login']}, proxy chết {summary['proxy_dead']}, captcha {summary['captcha']}, "
-              f"lỗi khác {summary['error']}, chưa rõ {summary['unknown']}", "INFO", "Diagnose")
+        done = _SCAN.done
+    try:
+        log_event(f"Quét tất cả nick xong: {total} nick" + (f" (chẩn đoán được {done})" if done != total else "") + f" — sẵn sàng {summary['ready']}, hết credit {summary['no_credit']}, "
+                  f"cần đăng nhập {summary['need_login']}, proxy chết {summary['proxy_dead']}, captcha {summary['captcha']}, "
+                  f"đang bận {summary.get('busy', 0)}, lỗi khác {summary['error']}, chưa rõ {summary['unknown']}",
+                  "INFO", "Diagnose")
+    except Exception as e:  # noqa: BLE001 - CSDL bận lúc ghi tổng kết không được giữ cờ running
+        log.error("Không ghi được tổng kết quét: %s", e)
+
+
+def _scan_runner(queue: list, workers: int) -> None:
+    from worker import JOB_EXECUTOR  # import muộn: worker import dola_service → diagnostics
+    pool_lock = threading.Lock()
+    try:
+        futures = [JOB_EXECUTOR.submit(_scan_worker, queue, pool_lock) for _ in range(workers)]
+        for f in futures:
+            try:
+                f.result()
+            except Exception as e:  # noqa: BLE001
+                log.error("Luồng quét nick văng lỗi: %s", e)
+    except Exception as e:  # noqa: BLE001 - submit lỗi (executor đã tắt...) không được để running=True mãi (N-6)
+        log.error("Không khởi động được luồng quét nick: %s", e)
+    finally:
+        _finish_scan()
 
 
 def start_scan_all(account_ids: Optional[list] = None) -> dict:
@@ -391,8 +442,15 @@ def start_scan_all(account_ids: Optional[list] = None) -> dict:
         _SCAN.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _SCAN.finished_at = None
     total = len(queue)  # đọc TRƯỚC khi khởi động luồng: các luồng pop khỏi queue ngay, len(queue) đổi tức thì
-    log_event(f"Bắt đầu quét tất cả {total} nick ({workers} luồng, tối đa {browser.capacity()} Chrome)", "INFO", "Diagnose")
-    threading.Thread(target=_scan_runner, args=(queue, workers), name="scan-all", daemon=True).start()
+    try:
+        log_event(f"Bắt đầu quét tất cả {total} nick ({workers} luồng, tối đa {browser.capacity()} Chrome)", "INFO", "Diagnose")
+        threading.Thread(target=_scan_runner, args=(queue, workers), name="scan-all", daemon=True).start()
+    except Exception as e:  # noqa: BLE001 - N-6: không khởi động được thì trả cờ running, không kẹt "Đang quét dở" mãi
+        with _SCAN.lock:
+            _SCAN.running = False
+            _SCAN.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log.error("Không bắt đầu được đợt quét tất cả nick: %s", e)
+        return {"success": False, "message": f"Không bắt đầu được đợt quét: {str(e)[:120]}"}
     return {"success": True, "total": total, "workers": workers}
 
 
@@ -414,10 +472,12 @@ def _persist(account_id: int, steps: list) -> None:
     fields["last_error"] = "; ".join(f"{s['name']}: {s['detail']}" for s in failed) if failed else None
     conn = get_connection()
     try:
-        current = conn.execute("SELECT needs_manual FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        current = conn.execute("SELECT needs_manual, proxy FROM accounts WHERE id = ?", (account_id,)).fetchone()
         if proxy and proxy["ok"] is False:
             fields["needs_manual"] = NeedsManual.PROXY
-        elif current and current["needs_manual"] == NeedsManual.PROXY and proxy and proxy["ok"] is not False:
+        elif current and current["needs_manual"] == NeedsManual.PROXY and proxy and (
+                proxy["ok"] is True or not (current["proxy"] or "").strip()):
+            # Gỡ cờ khi proxy ĐẠT hoặc nick không còn proxy; ok=None vì lỗi cấu hình (BH-56) thì chưa kết luận, giữ cờ
             fields["needs_manual"] = None
         cols = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE accounts SET {cols} WHERE id = ?", (*fields.values(), account_id))

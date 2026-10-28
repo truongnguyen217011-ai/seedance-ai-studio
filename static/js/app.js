@@ -861,12 +861,39 @@ function searchAccounts(value) {
   }, 300);
 }
 
+// N-3 (BH-58): dropdown chọn nick (lọc ảnh/video theo nick, chọn nick tạo ảnh) đổ từ GET /api/accounts/names
+// (mọi nick, nhẹ), KHÔNG từ trang 50 nick của bảng. Làm mới khi thêm/xóa/nhập nick qua refreshData().
+let _accountNamesKey = '';
+async function fetchAccountNames() {
+  const filterSelect = document.getElementById('filterNickMediaSelect');
+  const imageAccSelect = document.getElementById('imageAccountSelect');
+  if (!filterSelect && !imageAccSelect) return;
+  try {
+    const data = await apiJson('/api/accounts/names');
+    const names = Array.isArray(data.accounts) ? data.accounts : [];
+    const key = names.map(a => `${a.id}:${a.name}:${a.account_type}`).join('\n');
+    if (key === _accountNamesKey) return;   // không đổi thì không vẽ lại (giữ lựa chọn người dùng)
+    _accountNamesKey = key;
+    const optionList = names.map(a => `<option value="${a.id}">[${a.account_type === 'google' ? 'Google' : (a.account_type === 'muse' ? 'Muse' : 'FB')}] ${escapeHtml(a.name)}</option>`).join('');
+    if (filterSelect) {
+      const keep = filterSelect.value;
+      filterSelect.innerHTML = `<option value="">Xem tất cả tài khoản</option>` + optionList;
+      if (keep) filterSelect.value = keep;
+    }
+    if (imageAccSelect) {
+      const keep = imageAccSelect.value;
+      imageAccSelect.innerHTML = `<option value="">Tự động chọn tài khoản rảnh</option>` + optionList;
+      if (keep) imageAccSelect.value = keep;
+    }
+  } catch (err) {
+    reportFetchError('Không tải được danh sách tên nick', err);
+  }
+}
+
 async function fetchAccounts() {
   try {
     const data = await apiJson('/api/accounts?' + accountsQueryString());
     const tbody = document.getElementById('accountsTableBody');
-    const filterSelect = document.getElementById('filterNickMediaSelect');
-    const imageAccSelect = document.getElementById('imageAccountSelect');
 
     const allAccounts = Array.isArray(data.accounts) ? data.accounts : [];
     const accounts = allAccounts;
@@ -933,19 +960,7 @@ async function fetchAccounts() {
       }
     }
 
-    // Populate dropdowns
-    const optionList = allAccounts.map(a => `<option value="${a.id}">[${a.account_type === 'google' ? 'Google' : (a.account_type === 'muse' ? 'Muse' : 'FB')}] ${escapeHtml(a.name)}</option>`).join('');
-    if (filterSelect) {
-      const keep = filterSelect.value;
-      filterSelect.innerHTML = `<option value="">Xem tất cả tài khoản</option>` + optionList;
-      if (keep) filterSelect.value = keep;
-    }
-    if (imageAccSelect) {
-      const keep = imageAccSelect.value;
-      imageAccSelect.innerHTML = `<option value="">Tự động chọn tài khoản rảnh</option>` + optionList;
-      if (keep) imageAccSelect.value = keep;
-    }
-
+    // Dropdown nick: xem fetchAccountNames() (không đổ từ trang phân trang này, BH-58)
     lucide.createIcons();
   } catch (err) {
     reportFetchError('Không lấy được danh sách tài khoản', err);
@@ -1296,6 +1311,7 @@ function refreshData() {
   fetchStats();
   fetchJobs();
   fetchAccounts();
+  fetchAccountNames();
 }
 
 // ==================== BRUCTA CINEMATIC BUILDER HELPERS ====================
@@ -2185,7 +2201,7 @@ async function previewAccountLines() {
             <td class="p-1.5 text-center">${it.has_2fa ? '<span class="text-amber-300">✓</span>' : '<span class="text-gray-600">–</span>'}</td>
             <td class="p-1.5 text-center">${cookieKindBadge(it.has_cookie ? (it.cookie_kind || 'json') : null)}</td>
             <td class="p-1.5 font-mono text-cyan-400 truncate max-w-[110px]" title="${escapeHtml(it.proxy || '')}">${it.proxy ? escapeHtml(it.proxy) : '<span class="text-gray-600">không</span>'}</td>
-            <td class="p-1.5 text-amber-200/90">${escapeHtml(it.reason || (it.account_type === 'google' ? 'Nick Google' : ''))}</td></tr>`;
+            <td class="p-1.5 text-amber-200/90">${escapeHtml(it.reason || (it.note ? `Bỏ qua cột thừa: ${it.note}` : (it.account_type === 'google' ? 'Nick Google' : '')))}</td></tr>`;
         }).join('')}</tbody></table>`;
       box.classList.remove('hidden');
     }
@@ -2200,7 +2216,8 @@ async function previewAccountLines() {
 let _scanPollTimer = null;
 const SCAN_LABELS = {
   ready: ['Sẵn sàng', 'text-emerald-400'], no_credit: ['Hết credit', 'text-amber-300'], need_login: ['Cần đăng nhập', 'text-rose-300'],
-  proxy_dead: ['Proxy chết', 'text-rose-400'], captcha: ['Cần kéo captcha', 'text-amber-300'], error: ['Lỗi khác', 'text-red-400'],
+  proxy_dead: ['Proxy chết', 'text-rose-400'], captcha: ['Cần kéo captcha', 'text-amber-300'],
+  busy: ['Đang bận (chưa quét được)', 'text-cyan-300'], error: ['Lỗi khác', 'text-red-400'],
   unknown: ['Chưa rõ', 'text-gray-400']
 };
 

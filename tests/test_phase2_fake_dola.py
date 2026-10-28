@@ -196,3 +196,32 @@ def test_k9_scan_all_respects_chrome_limit_and_finishes(db, fake_dola, worker_ru
         assert acc["credits"] == 4 and acc["last_check"] and acc["busy_job_id"] is None, acc
     assert fake_dola.get_state()["chat_get_count"] == 8
     assert any("Quét tất cả nick xong: 8 nick" in (r["message"] or "") for r in db.system_logs())
+
+
+# ---------------------------------------------------------------- N-4 / BH-59: ERR_TUNNEL với proxy còn sống
+@pytest.mark.timeout(170)
+def test_bh59_err_tunnel_with_live_proxy_does_not_flag_proxy(db, fake_dola, fake_proxy, worker_runner, monkeypatch):
+    """Fake proxy trả 502 cho CONNECT (Chromium báo net::ERR_TUNNEL_CONNECTION_FAILED khi mở Dola qua https) trong khi
+    GET http /__ip qua proxy vẫn OK → proxy SỐNG, lỗi ở Dola/đường ra: nick KHÔNG needs_manual='proxy', job đi đường
+    lỗi kỹ thuật thường ("tự chạy lại lần n/N") rồi Thất bại sau 3 lượt."""
+    import config
+    fake_dola.control(render_seconds=2, credits=4)
+    fake_proxy.set_connect_status(502)
+    # Dola "https" để Chromium phải CONNECT qua proxy (fake Dola chỉ nói http nên CONNECT luôn bị 502 → ERR_TUNNEL_*)
+    monkeypatch.setattr(config, "DOLA_CHAT_URL", f"https://127.0.0.1:{fake_dola.port}/chat/")
+    acc_id = db.add_account("nick proxy sống", proxy=fake_proxy.address)
+    job_id = db.add_job("BH-59 job")
+
+    worker_runner.start()
+    job = wait_until(lambda: (lambda j: j if j["status"] == JobStatus.THAT_BAI else None)(db.job(job_id)), 150,
+                     what="job Thất bại sau 3 lượt tự chạy lại")
+    assert "ERR_TUNNEL_CONNECTION_FAILED" in (job["status_message"] or ""), job["status_message"]
+    assert "Đã thử 3 lần" in job["status_message"] and job["attempts"] == 3, job
+    acc = db.account(acc_id)
+    assert acc["needs_manual"] is None, f"BH-59: proxy còn trả lời IP thì không được gắn cờ proxy: {acc}"
+    assert fake_proxy.count("", "CONNECT") >= 3, fake_proxy.requests
+    assert fake_proxy.count("/__ip") >= 3, "mỗi lần lỗi phải hỏi IP qua proxy trước khi kết luận"
+    logs = [r["message"] or "" for r in db.system_logs()]
+    assert any("vẫn phản hồi" in m and "không gắn cờ proxy" in m for m in logs), logs
+    assert not any("Proxy của nick 'nick proxy sống' không phản hồi" in m for m in logs), logs
+    wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả")

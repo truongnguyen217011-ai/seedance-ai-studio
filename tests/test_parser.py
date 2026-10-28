@@ -50,7 +50,7 @@ def test_uid_pass_2fa_cookie_proxy():
         "uid": UID, "pass": "Pass123456", "twofa": TWOFA, "proxy": PROXY, "cookie": COOKIE,
         "email": None, "account_type": "facebook", "name": f"FB {UID[-6:]}",
         # Giai đoạn 2 (A1/A3/K3): loại cookie nhận diện theo nội dung, mã 2FA sai định dạng, phần thừa
-        "cookie_kind": "facebook", "twofa_invalid": None, "unassigned": [],
+        "cookie_kind": "facebook", "twofa_invalid": None, "unassigned": [], "note": "",
     }
 
 

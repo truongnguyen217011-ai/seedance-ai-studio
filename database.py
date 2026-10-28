@@ -153,6 +153,9 @@ def init_db():
         # được ghi và một lần lúc khởi động (dola_service.refresh_has_dola_flags); NULL = chưa quét.
         # GET /api/accounts đọc cột này thay vì mở storage_state.json của từng nick mỗi 3 giây.
         ("has_dola", "INTEGER"),
+        # N-8 (K7): mốc lần tự đăng nhập lại gần nhất sau khi mất phiên; bền qua khởi động lại để
+        # RELOGIN_MIN_INTERVAL_SECONDS có tác dụng thật (trước đây là dict trong RAM)
+        ("last_relogin_at", "TIMESTAMP"),
     ]
     for col, decl in account_columns:
         _add_column_if_missing(cursor, "accounts", col, decl)

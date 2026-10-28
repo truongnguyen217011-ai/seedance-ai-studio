@@ -24,6 +24,7 @@ if sys.platform == "win32":
 from playwright.sync_api import sync_playwright
 
 import config
+import diagnostics  # mask_proxy, _fetch_ip (hỏi IP qua proxy để phân biệt proxy chết với lỗi upstream, N-4)
 import director  # hàm thuần (HEADER_RE, parse_header, fix_header), không import ngược module này
 from account_pool import AccountPool
 from browser import ChromeNotFoundError, browser_session, hide_window, show_window
@@ -275,6 +276,72 @@ def proxy_error_text(error) -> Optional[str]:
         if marker in text:
             return marker
     return None
+
+
+# Mã lỗi mà proxy CÓ THỂ vẫn sống: Chromium báo ERR_TUNNEL_* khi proxy trả lời CONNECT bằng mã khác 200, tức proxy
+# nhận kết nối nhưng không nối được tới Dola (upstream/Dola lỗi, proxy chặn host). Phải hỏi IP qua proxy trước khi
+# kết luận "proxy chết" (N-4, BH-59).
+PROXY_MAYBE_ALIVE_PREFIXES = ("ERR_TUNNEL_",)
+PROXY_PROBE_TIMEOUT = 10
+
+
+def proxy_confirmed_dead(acc: dict, error_code: Optional[str]) -> bool:
+    """A5/N-4: lỗi proxy `error_code` có thật sự là proxy của nick chết không.
+
+    - nick không có proxy hoặc không có mã lỗi proxy → False (đi đường lỗi kỹ thuật thường);
+    - ERR_TUNNEL_* → hỏi `diagnostics._fetch_ip` qua proxy (10 s): hỏi được IP → proxy sống, lỗi do Dola/upstream
+      → False; không hỏi được → True;
+    - mã khác (ERR_PROXY_CONNECTION_FAILED, ERR_SOCKS_...) → True như cũ.
+    """
+    if not error_code:
+        return False
+    proxy_cfg = parse_proxy(acc.get("proxy"))
+    if not proxy_cfg:
+        return False
+    if not error_code.startswith(PROXY_MAYBE_ALIVE_PREFIXES):
+        return True
+    try:
+        ip = diagnostics._fetch_ip(proxy_url(proxy_cfg), timeout=PROXY_PROBE_TIMEOUT)
+    except diagnostics.IP_CHECK_CONFIG_ERRORS as e:
+        # Không kiểm được (thiếu httpx[socks], URL lạ...): chưa có bằng chứng proxy chết → không gắn cờ (BH-56)
+        log_event(f"Nick #{acc['id']} ({acc['name']}): gặp {error_code} nhưng không kiểm được IP qua proxy "
+                  f"'{mask_proxy(acc.get('proxy'))}' ({str(e)[:80]}); coi là lỗi kỹ thuật thường, không gắn cờ proxy",
+                  "WARNING", "Proxy", account_id=acc["id"])
+        return False
+    except Exception as e:  # noqa: BLE001 - lỗi mạng thật: proxy không trả lời
+        log.debug("Proxy của nick #%s không trả lời khi kiểm IP sau %s: %s", acc["id"], error_code, str(e)[:120],
+                  extra={"account_id": acc["id"]})
+        return True
+    log_event(f"Nick #{acc['id']} ({acc['name']}): Chromium báo {error_code} nhưng proxy '{mask_proxy(acc.get('proxy'))}' "
+              f"vẫn phản hồi (IP {ip}) → lỗi ở Dola/đường ra của proxy, không phải proxy chết; không gắn cờ proxy",
+              "WARNING", "Proxy", account_id=acc["id"])
+    return False
+
+
+def recheck_dead_proxy(account_id: int) -> bool:
+    """N-4: nick đang mang cờ needs_manual='proxy' quá lâu → hỏi IP qua proxy một lần (không mở Chrome, chạy trên
+    JOB_EXECUTOR do worker._recover_accounts gọi). Proxy trả lời → gỡ cờ, nick được chọn lại cho job; không trả lời →
+    ghi last_check để 30 phút sau thử lại. Trả True nếu đã gỡ cờ."""
+    acc = _load_account(account_id)
+    if not acc or acc.get("needs_manual") != NeedsManual.PROXY:
+        return False
+    proxy_cfg = parse_proxy(acc.get("proxy"))
+    if not proxy_cfg:
+        _set_account_fields(account_id, needs_manual=None, last_check=_now_str())
+        log_event(f"Nick #{account_id} ({acc['name']}) không còn proxy, gỡ cờ proxy lỗi", "INFO", "Proxy", account_id=account_id)
+        return True
+    try:
+        ip = diagnostics._fetch_ip(proxy_url(proxy_cfg), timeout=PROXY_PROBE_TIMEOUT)
+    except Exception as e:  # noqa: BLE001 - lỗi cấu hình hay lỗi mạng đều: chưa gỡ cờ, thử lại sau
+        _set_account_fields(account_id, last_check=_now_str())
+        log.info("Nick #%s (%s): proxy '%s' vẫn không phản hồi (%s), giữ cờ, thử lại sau %s phút", account_id, acc["name"],
+                 mask_proxy(acc.get("proxy")), str(e)[:80], config.PROXY_RECHECK_INTERVAL_SECONDS // 60,
+                 extra={"account_id": account_id})
+        return False
+    _set_account_fields(account_id, needs_manual=None, last_error=None, last_ip=ip, last_check=_now_str())
+    log_event(f"Nick #{account_id} ({acc['name']}): proxy '{mask_proxy(acc.get('proxy'))}' phản hồi lại (IP {ip}), "
+              f"đã gỡ cờ proxy lỗi, nick được chọn lại cho job", "INFO", "Proxy", account_id=account_id)
+    return True
 
 
 def parse_cookie_string(cookie_str: str, domain: str = ".facebook.com"):
@@ -758,7 +825,7 @@ def _auto_login_locked(acc: dict, headless: bool):
         return {"success": False, "message": str(e)}
     except Exception as e:  # noqa: BLE001 - Playwright ném Error chung
         code = proxy_error_text(e)
-        if code and parse_proxy(acc.get("proxy")):
+        if proxy_confirmed_dead(acc, code):
             msg = _mark_proxy_dead(acc, code, "tự động đăng nhập")
         else:
             msg = f"Tự động đăng nhập lỗi: {str(e).strip().splitlines()[0][:150] if str(e).strip() else e.__class__.__name__}"
@@ -984,7 +1051,7 @@ def _launch_login_session_sync(account_id: int):
         return {"success": False, "message": str(e)}
     except Exception as e:  # noqa: BLE001
         code = proxy_error_text(e)
-        if code and parse_proxy(acc.get("proxy")):
+        if proxy_confirmed_dead(acc, code):
             return {"success": False, "message": _mark_proxy_dead(acc, code, "mở Chrome đăng nhập")}
         log_event(f"Mở Chrome cho nick #{account_id} thất bại: {str(e)[:120]}", "ERROR", "Auth", account_id=account_id)
         return {"success": False, "message": f"Mở Chrome thất bại: {str(e)[:120]}"}
@@ -1066,7 +1133,7 @@ def _check_account_credits_sync(account_id: int, pool_held: bool = False) -> dic
         return {"success": False, "is_known": False, "message": str(e)}
     except Exception as e:  # noqa: BLE001
         code = proxy_error_text(e)
-        if code and parse_proxy(acc.get("proxy")):
+        if proxy_confirmed_dead(acc, code):
             return {"success": False, "is_known": False, "message": _mark_proxy_dead(acc, code, "kiểm tra credit")}
         err = str(e)[:120]
         _set_account_fields(account_id, last_error=f"Kiểm tra credit lỗi: {err}", last_check=_now_str())
@@ -1148,7 +1215,7 @@ def diagnose_account_dola(account_id: int, pool_held: bool = False) -> dict:
         return result
     except Exception as e:  # noqa: BLE001
         code = proxy_error_text(e)
-        if code and parse_proxy(acc.get("proxy")):
+        if proxy_confirmed_dead(acc, code):
             result["proxy_dead"] = True
             result["detail"] = _mark_proxy_dead(acc, code, "chẩn đoán")
             return result
@@ -2045,8 +2112,19 @@ def execute_video_job(job_id: int, account_id: int) -> None:
         _relogin_after_session_lost(job_id, acc)
 
 
-_RELOGIN_LAST_AT: dict = {}   # account_id -> time.monotonic() của lần tự đăng nhập lại gần nhất (K7, đúng một lần)
-_RELOGIN_LOCK = threading.Lock()
+_RELOGIN_LOCK = threading.Lock()   # đọc-rồi-ghi accounts.last_relogin_at là một bước (K7, N-8)
+
+
+def _seconds_since_last_relogin(acc: dict) -> Optional[float]:
+    """Số giây từ `accounts.last_relogin_at` (N-8: cột CSDL, bền qua khởi động lại) tới giờ; None nếu chưa từng."""
+    raw = acc.get("last_relogin_at")
+    if not raw:
+        return None
+    try:
+        last = datetime.strptime(str(raw)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return (datetime.now() - last).total_seconds()
 
 
 def _relogin_after_session_lost(job_id: int, acc: dict) -> None:
@@ -2059,15 +2137,17 @@ def _relogin_after_session_lost(job_id: int, acc: dict) -> None:
         log_event(f"Nick #{account_id} ({acc['name']}) mất phiên Dola nhưng không có mật khẩu Facebook, không tự đăng nhập lại được; "
                   f"hãy dán cookie Dola mới hoặc bấm Auto Login/Chrome", "WARNING", "Auth", job_id=job_id, account_id=account_id)
         return
-    now = time.monotonic()
     with _RELOGIN_LOCK:
-        last = _RELOGIN_LAST_AT.get(account_id)
-        if last is not None and now - last < config.RELOGIN_MIN_INTERVAL_SECONDS:
+        # N-8: mốc lần tự đăng nhập lại nằm ở cột accounts.last_relogin_at (không phải dict trong RAM) để khởi động
+        # lại app không làm nick được tự đăng nhập lại lần nữa trong vòng RELOGIN_MIN_INTERVAL_SECONDS
+        fresh = _load_account(account_id) or acc
+        since = _seconds_since_last_relogin(fresh)
+        if since is not None and since < config.RELOGIN_MIN_INTERVAL_SECONDS:
             log_event(f"Nick #{account_id} ({acc['name']}) mất phiên Dola lần nữa trong vòng "
                       f"{config.RELOGIN_MIN_INTERVAL_SECONDS // 60} phút; đã tự đăng nhập lại một lần, không lặp — cần đăng nhập tay",
                       "WARNING", "Auth", job_id=job_id, account_id=account_id)
             return
-        _RELOGIN_LAST_AT[account_id] = now
+        _set_account_fields(account_id, last_relogin_at=_now_str())
     log_event(f"Nick #{account_id} ({acc['name']}) mất phiên Dola → tự đăng nhập lại một lần bằng mật khẩu Facebook",
               "WARNING", "Auth", job_id=job_id, account_id=account_id)
     fresh = _load_account(account_id) or acc
@@ -2100,9 +2180,10 @@ def _apply_technical_failure(job_id: int, acc: dict, error: Exception, page, pag
     account_id = acc["id"]
     err_text = str(error).strip().splitlines()[0][:160] if str(error).strip() else error.__class__.__name__
     proxy_code = proxy_error_text(error)
-    if proxy_code and parse_proxy(acc.get("proxy")):
+    if proxy_confirmed_dead(acc, proxy_code):
         # A5: proxy chết là lỗi của NICK, không phải của job: nick needs_manual='proxy', job về Chờ không tính lượt
-        # để worker chọn nick khác. Không bao giờ lặng lẽ chạy lại không proxy (BH-50).
+        # để worker chọn nick khác. Không bao giờ lặng lẽ chạy lại không proxy (BH-50). ERR_TUNNEL_* mà proxy vẫn
+        # trả lời IP (N-4, BH-59) → không vào đây, đi đường lỗi kỹ thuật thường bên dưới.
         _mark_proxy_dead(acc, proxy_code, "chạy job")
         _set_job_fields(job_id, attempts=max(0, int((_load_job(job_id) or {}).get("attempts") or 0) - 1))
         _fail_job(job_id, account_id, JobStatus.CHO, Reason.PROXY_DEAD.format(name=acc["name"], error=proxy_code),

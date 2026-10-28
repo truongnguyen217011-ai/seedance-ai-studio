@@ -100,11 +100,21 @@ def account_has_dola_session(acc: dict) -> bool:
 
 def _has_session_cached(acc: dict, session_cache: Optional[dict]) -> bool:
     if session_cache is None:
-        return account_has_dola_session(acc)
-    acc_id = acc.get("id")
-    if acc_id not in session_cache:
-        session_cache[acc_id] = account_has_dola_session(acc)
-    return session_cache[acc_id]
+        has = account_has_dola_session(acc)
+    else:
+        acc_id = acc.get("id")
+        if acc_id not in session_cache:
+            session_cache[acc_id] = account_has_dola_session(acc)
+        has = session_cache[acc_id]
+    if not has and acc.get("has_dola") != 0:
+        # N-5 (BH-60): cột cache has_dola nói "có phiên" nhưng cookie/storage_state đã hết hạn → sửa cột ngay để
+        # GET /api/accounts và bộ lọc "Sẵn sàng" không hiện nick này là sẵn sàng
+        from dola_service import _set_has_dola  # import muộn: dola_service import account_pool ở đầu file
+        try:
+            _set_has_dola(acc["id"], False)
+        except Exception as e:  # noqa: BLE001 - không được chặn việc chọn nick
+            log.debug("Không cập nhật được has_dola=0 cho nick #%s: %s", acc.get("id"), e)
+    return has
 
 
 def _credits_today(acc: dict, today: str):

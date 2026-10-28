@@ -26,7 +26,13 @@ RE_DATE = re.compile(r'^\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}(\s|$)|^\d{4}-\d{2}-\d{
 RE_TITLE_IGNORE = re.compile(r'^(uid|id|stt|tài khoản|tai khoan|account|user)\b', re.IGNORECASE)
 # Chuỗi trông như người dùng ĐỊNH đưa mã 2FA nhưng không phải Base32 (A-Z, 2-7): chữ+số 10-40 ký tự, không phải
 # toàn số (UID), không có ':' (proxy) hay '.' (email/IP). Dùng để báo "2FA sai định dạng" thay vì lặng lẽ bỏ qua.
+# G-1: chỉ coi là "2FA sai định dạng" khi chuỗi dài ≥ 16 (độ dài mã 2FA thật) HOẶC gần Base32 (≥ 14 ký tự, không
+# lẫn hoa/thường, tối đa 2 ký tự ngoài A-Z2-7 như 0/1/8/9); cột thừa ngắn kiểu "Nguyenvan2024" là ghi chú → `note`.
 RE_2FA_LOOKALIKE = re.compile(r'^[A-Za-z0-9]{10,40}$')
+TWOFA_LOOKALIKE_MIN_LEN = 16
+TWOFA_NEAR_BASE32_MIN_LEN = 14
+TWOFA_NEAR_BASE32_MAX_ODD = 2
+RE_NOT_BASE32_CHAR = re.compile(r'[^A-Z2-7]')
 
 # Tên cookie đặc trưng của từng dịch vụ (K3, BH-11): quyết định domain theo NỘI DUNG, không theo loại nick
 DOLA_COOKIE_NAMES = frozenset({"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt", "uid_tt_ss", "ttwid",
@@ -76,6 +82,44 @@ def stable_dola_uid(cookie_text: str) -> str:
     key = m.group(1) if m else cookie_text.strip()
     return "Dola_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
 
+def looks_like_bad_twofa(item: str) -> bool:
+    """G-1: chuỗi thừa có phải là mã 2FA sai định dạng (đáng báo lỗi) hay chỉ là ghi chú ngắn (bỏ qua, ghi `note`).
+
+    Báo lỗi khi: chữ+số 10-40 ký tự, không toàn số, VÀ (dài ≥ 16, hoặc gần Base32: ≥ 14 ký tự, chữ cái không lẫn
+    hoa/thường, ≤ 2 ký tự ngoài A-Z2-7). "ABCD2345EFGH6789" → True; "Nguyenvan2024" → False.
+    """
+    item = str(item or "")
+    if not RE_2FA_LOOKALIKE.match(item) or item.isdigit():
+        return False
+    if len(item) >= TWOFA_LOOKALIKE_MIN_LEN:
+        return True
+    if len(item) < TWOFA_NEAR_BASE32_MIN_LEN:
+        return False
+    letters = [c for c in item if c.isalpha()]
+    mixed_case = any(c.islower() for c in letters) and any(c.isupper() for c in letters)
+    if mixed_case:
+        return False
+    odd = len(RE_NOT_BASE32_CHAR.findall(item.upper()))
+    return odd <= TWOFA_NEAR_BASE32_MAX_ODD
+
+
+def mask_line(line: str) -> str:
+    """Che dòng tài khoản để đưa vào phản hồi API / nhật ký (C-2, BH-57): chỉ giữ cột đầu (UID/email), mọi cột còn
+    lại (mật khẩu, 2FA, cookie, proxy) thành "***". Dòng chỉ có cookie thô → "c_user=<uid>;***" hoặc "***".
+    Không bao giờ trả nguyên dòng người dùng dán cho client hay ghi vào system_logs."""
+    text = clean_line_text(line)
+    if not text:
+        return ""
+    sep = '|' if '|' in text else ('\t' if '\t' in text else None)
+    parts = [p.strip() for p in text.split(sep)] if sep else [text]
+    first = parts[0]
+    if RE_COOKIE.search(first) or RE_DOLA_COOKIE.search(first) or '=' in first and ';' in first:
+        c_match = re.search(r'(?:^|;\s*)c_user=(\d+)', first)
+        first = f"c_user={c_match.group(1)};***" if c_match else "***"
+    rest = ["***" for p in parts[1:] if p]
+    return "|".join([first] + rest)
+
+
 def clean_line_text(line: str) -> str:
     """Loại bỏ ký tự BOM, khoảng trắng, gạch đầu dòng, dấu ngoặc kép"""
     t = str(line or '').replace('\ufeff', '').strip()
@@ -116,6 +160,7 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
             "cookie_kind": detect_cookie_kind(text),
             "twofa_invalid": None,
             "unassigned": [],
+            "note": "",
         }
 
     # 2. Trường hợp chuỗi có phân cách (| hoặc Tab)
@@ -213,13 +258,15 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
 
     uid = str(uid).replace(" ", "")
 
-    # Chuỗi thừa trông như mã 2FA nhưng không phải Base32 → báo cho người dùng (không lặng lẽ bỏ)
+    # Chuỗi thừa trông như mã 2FA nhưng không phải Base32 → báo cho người dùng (không lặng lẽ bỏ); cột thừa ngắn
+    # (tên, ghi chú) không bị coi là 2FA (G-1) mà gom vào `note`
     twofa_invalid = None
     if not twofa:
         for item in unassigned:
-            if RE_2FA_LOOKALIKE.match(item) and not item.isdigit():
+            if looks_like_bad_twofa(item):
                 twofa_invalid = item
                 break
+    note = ", ".join(item for item in unassigned if item != twofa_invalid)
 
     # Đặt tên gợi nhớ
     if account_type == "google" and email:
@@ -239,6 +286,7 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
         "cookie_kind": detect_cookie_kind(cookie) if cookie else None,
         "twofa_invalid": twofa_invalid,
         "unassigned": unassigned,
+        "note": note,
     }
 
 
@@ -250,7 +298,8 @@ def twofa_invalid_reason(token: str) -> str:
 def parse_multiple_account_lines(text: str, strict_2fa: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """
     Phân tích toàn bộ khối văn bản nhiều dòng (từ file hoặc copy-paste).
-    Trả về: (danh_sach_hop_le, danh_sach_loi)
+    Trả về: (danh_sach_hop_le, danh_sach_loi). `errors[].text` là dòng ĐÃ CHE (mask_line: chỉ cột đầu, còn lại "***",
+    BH-57) vì danh sách này đi thẳng ra API và nhật ký.
 
     strict_2fa=True (A1): dòng có chuỗi trông như mã 2FA nhưng không phải Base32 bị đưa vào danh sách lỗi với lý do
     rõ, thay vì tạo nick không có 2FA rồi Auto Login thất bại về sau.
@@ -273,13 +322,13 @@ def parse_multiple_account_lines(text: str, strict_2fa: bool = False) -> Tuple[L
         try:
             parsed = parse_single_account_line(line)
             if strict_2fa and parsed.get("twofa_invalid"):
-                errors.append({"line": idx, "text": line, "reason": twofa_invalid_reason(parsed["twofa_invalid"])})
+                errors.append({"line": idx, "text": mask_line(line), "reason": twofa_invalid_reason(parsed["twofa_invalid"])})
                 continue
             uid = parsed["uid"]
             if uid in seen_uids:
                 errors.append({
                     "line": idx,
-                    "text": line,
+                    "text": mask_line(line),
                     "reason": f"UID {uid} bị trùng với dòng trước đó (đã bỏ qua)"
                 })
                 continue
@@ -290,7 +339,7 @@ def parse_multiple_account_lines(text: str, strict_2fa: bool = False) -> Tuple[L
         except Exception as e:
             errors.append({
                 "line": idx,
-                "text": line,
+                "text": mask_line(line),
                 "reason": str(e)
             })
 

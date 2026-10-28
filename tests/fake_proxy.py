@@ -5,6 +5,13 @@ request đi qua (method, host, path) để test đếm. Không có xác thực, 
 Dùng: ``fp = start_fake_proxy(); nick.proxy = f"127.0.0.1:{fp.port}"``; ``fp.requests`` là danh sách request đã qua.
 Mỗi request chuyển tiếp được gắn thêm header ``X-Fake-Proxy: 1`` để server đích (fake Dola /__ip) nhận ra.
 Chromium mặc định bỏ qua proxy với 127.0.0.1, nên conftest đặt SEEDANCE_PROXY_BYPASS="<-loopback>".
+
+Điều khiển (N-4, BH-59): ``fp.set_connect_status(502)`` → mọi CONNECT (https qua proxy) bị trả 502 "Bad Gateway"
+(Chromium báo ``net::ERR_TUNNEL_CONNECTION_FAILED``) trong khi GET absolute-URI (``/__ip`` http) vẫn chuyển tiếp
+bình thường: mô phỏng proxy SỐNG nhưng không nối được tới Dola. ``fp.set_connect_status(None)`` trả về bình thường.
+
+Fake SOCKS5 (``start_fake_socks5_proxy``, BH-56): proxy socks5 không xác thực, chỉ lệnh CONNECT (ATYP IPv4/domain),
+ghi ``("CONNECT", host:port, "")`` để test ``diagnostics._check_proxy`` với ``socks5://`` thật qua ``httpx[socks]``.
 """
 from __future__ import annotations
 
@@ -21,6 +28,7 @@ class _ProxyState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.requests: List[Tuple[str, str, str]] = []   # (method, host, path)
+        self.connect_status: Optional[int] = None         # None = CONNECT bình thường; 502... = từ chối CONNECT
 
     def record(self, method: str, host: str, path: str) -> None:
         with self.lock:
@@ -89,6 +97,12 @@ def _make_handler(state: _ProxyState):
         def do_CONNECT(self):
             host, _, port = self.path.partition(":")
             state.record("CONNECT", self.path, "")
+            with state.lock:
+                refuse = state.connect_status
+            if refuse:
+                # Proxy sống nhưng không nối được upstream: Chromium thấy net::ERR_TUNNEL_CONNECTION_FAILED
+                self.send_error(refuse, "fake proxy: CONNECT refused by test control")  # status line phải latin-1
+                return
             try:
                 up = socket.create_connection((host, int(port or 443)), timeout=30)
             except OSError as e:
@@ -148,6 +162,11 @@ class FakeProxy:
     def count(self, path_prefix: str = "", method: Optional[str] = None) -> int:
         return sum(1 for m, _h, p in self.requests if p.startswith(path_prefix) and (method is None or m == method))
 
+    def set_connect_status(self, status: Optional[int]) -> None:
+        """status=502 → mọi CONNECT bị từ chối (ERR_TUNNEL_CONNECTION_FAILED ở Chromium), GET http vẫn qua; None = bình thường."""
+        with self.state.lock:
+            self.state.connect_status = status
+
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
@@ -167,6 +186,122 @@ def start_fake_proxy(host: str = "127.0.0.1", port: int = 0) -> FakeProxy:
         except OSError:
             time.sleep(0.05)
     return FakeProxy(server, thread, state, host, server.server_address[1])
+
+
+# ---------------------------------------------------------------- fake SOCKS5 (BH-56)
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("socks5: client đóng kết nối giữa chừng")
+        buf += chunk
+    return buf
+
+
+def _socks5_serve(client: socket.socket, state: _ProxyState) -> None:
+    """Một phiên SOCKS5 tối giản (RFC 1928): chào hỏi không xác thực, lệnh CONNECT, rồi bơm hai chiều."""
+    try:
+        ver, nmethods = _recv_exact(client, 2)
+        _recv_exact(client, nmethods)
+        if ver != 5:
+            client.close()
+            return
+        client.sendall(b"\x05\x00")                       # không xác thực
+        ver, cmd, _rsv, atyp = _recv_exact(client, 4)
+        if atyp == 1:
+            host = socket.inet_ntoa(_recv_exact(client, 4))
+        elif atyp == 3:
+            ln = _recv_exact(client, 1)[0]
+            host = _recv_exact(client, ln).decode("latin-1")
+        else:
+            client.sendall(b"\x05\x08\x00\x01" + b"\x00" * 6)  # address type không hỗ trợ (IPv6)
+            client.close()
+            return
+        port = int.from_bytes(_recv_exact(client, 2), "big")
+        state.record("CONNECT", f"{host}:{port}", "")
+        if cmd != 1:
+            client.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)  # chỉ hỗ trợ CONNECT
+            client.close()
+            return
+        try:
+            up = socket.create_connection((host, port), timeout=30)
+        except OSError:
+            client.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)  # connection refused
+            client.close()
+            return
+        client.sendall(b"\x05\x00\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=pump, args=(up, client), daemon=True)
+        t.start()
+        pump(client, up)
+        t.join(timeout=5)
+        up.close()
+    except OSError:
+        pass
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+class FakeSocks5Proxy:
+    def __init__(self, host: str, port: int, state: _ProxyState, sock: socket.socket, thread: threading.Thread):
+        self.host, self.port, self.state, self._sock, self._thread = host, port, state, sock, thread
+        self._stopping = False
+
+    @property
+    def address(self) -> str:
+        return f"socks5://{self.host}:{self.port}"
+
+    @property
+    def requests(self) -> List[Tuple[str, str, str]]:
+        with self.state.lock:
+            return list(self.state.requests)
+
+    def stop(self) -> None:
+        self._stopping = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+
+
+def start_fake_socks5_proxy(host: str = "127.0.0.1", port: int = 0) -> FakeSocks5Proxy:
+    state = _ProxyState()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(16)
+
+    def accept_loop():
+        while True:
+            try:
+                client, _addr = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=_socks5_serve, args=(client, state), daemon=True).start()
+
+    thread = threading.Thread(target=accept_loop, name="fake-socks5", daemon=True)
+    thread.start()
+    return FakeSocks5Proxy(host, srv.getsockname()[1], state, srv, thread)
 
 
 def closed_port(host: str = "127.0.0.1") -> int:

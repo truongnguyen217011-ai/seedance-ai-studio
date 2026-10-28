@@ -35,6 +35,11 @@ IP_CHECK_URL = os.environ.get("SEEDANCE_IP_CHECK_URL", "https://api.ipify.org?fo
 # K7: nick mất phiên Dola giữa job mà có mật khẩu → tự Auto Login lại đúng MỘT lần; lần kế tiếp cho cùng nick
 # chỉ sau chừng này giây (chống vòng lặp job ↔ auto login khi phiên "có cookie" nhưng trang vẫn không nhận)
 RELOGIN_MIN_INTERVAL_SECONDS = 1800
+# N-4 (BH-59): nick mang cờ needs_manual='proxy' quá chừng này giây thì worker hỏi IP qua proxy một lần (không mở
+# Chrome); proxy trả lời → gỡ cờ. Cũng là khoảng cách giữa hai lần thử.
+PROXY_RECHECK_INTERVAL_SECONDS = 1800
+# N-5 (BH-60): worker quét lại cột has_dola (cookie/storage_state của từng nick) định kỳ chừng này giây
+HAS_DOLA_REFRESH_INTERVAL_SECONDS = 600
 
 # Chế độ mở Chrome cho thao tác tự động (job, auto login ẩn, check credit, chẩn đoán) — BH-39:
 # Dola chặn Chrome headless bằng captcha ByteDance ngay sau khi gửi prompt, nên mặc định (0) là Chrome THẬT

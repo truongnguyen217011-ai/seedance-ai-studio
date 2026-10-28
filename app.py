@@ -2,7 +2,6 @@
 import asyncio
 import json
 import os
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -21,7 +20,7 @@ import config
 import director
 from account_pool import AccountPool
 from batch_dispatcher import get_batch_progress, import_b3_batch
-from constants import (DEFAULT_DURATION, DEFAULT_RATIO, JobStatus, NeedsManual, Reason, duration_label,
+from constants import (DEFAULT_DURATION, DEFAULT_RATIO, AccountStatus, JobStatus, NeedsManual, Reason, duration_label,
                        normalize_duration, normalize_ratio)
 from database import get_connection, init_db, log_event
 from diagnostics import build_bundle, diagnose_account, scan_status, start_scan_all
@@ -290,8 +289,8 @@ def _accounts_where(q: str, status: str, account_type: str):
     # COALESCE: cột NULL (chưa check credit) phải cho FALSE rõ ràng, nếu không `NOT (... OR NULL)` = NULL và nick bị lọc mất
     resting = "((rest_until IS NOT NULL AND rest_until > ?) OR (COALESCE(credits_date, '') = ? AND COALESCE(credits, -1) = 0))"
     if status == "ready":
-        clauses.append(f"has_dola = 1 AND status = 'ready' AND needs_manual IS NULL AND NOT {resting}")
-        params.extend([now_str, today_str])
+        clauses.append(f"has_dola = 1 AND status = ? AND needs_manual IS NULL AND NOT {resting}")
+        params.extend([AccountStatus.READY, now_str, today_str])
     elif status == "needs_manual":
         clauses.append("needs_manual IS NOT NULL")
     elif status == "resting":
@@ -329,6 +328,20 @@ async def get_accounts(limit: int = 0, offset: int = 0, q: str = "", status: str
     finally:
         conn.close()
     return {"accounts": [_public_account(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/accounts/names")
+async def get_account_names():
+    """N-3 (BH-58): danh sách NHẸ mọi nick (id, name, account_type) cho các dropdown chọn nick trên giao diện
+    (lọc ảnh/video theo nick, chọn nick tạo ảnh). Không phân trang, không đọc file; dropdown không được đổ từ
+    trang 50 nick của GET /api/accounts."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, name, account_type FROM accounts ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+    accounts = [{"id": r["id"], "name": r["name"], "account_type": r["account_type"]} for r in rows]
+    return {"accounts": accounts, "total": len(accounts)}
 
 
 @app.post("/api/accounts")
@@ -377,8 +390,8 @@ async def add_account(req: AddAccountRequest, background_tasks: BackgroundTasks)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method, has_dola)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
-        """, (name, acc_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies_json, login_method, has_dola))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (name, acc_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies_json, AccountStatus.READY, login_method, has_dola))
         new_id = cursor.lastrowid
         conn.commit()
     finally:
@@ -426,7 +439,8 @@ def _duplicate_reason(item: dict, index: dict):
 
 @app.post("/api/accounts/parse-preview")
 async def parse_preview_accounts(req: ParsePreviewRequest):
-    """A3: tách từng dòng dán vào để người dùng xác nhận TRƯỚC khi lưu. Không ghi CSDL, không trả mật khẩu."""
+    """A3: tách từng dòng dán vào để người dùng xác nhận TRƯỚC khi lưu. Không ghi CSDL, không trả mật khẩu;
+    `text` của dòng lỗi là bản đã che của parser (chỉ cột đầu, còn lại "***", BH-57)."""
     ok_list, err_list = parse_multiple_account_lines(req.data, strict_2fa=True)
     conn = get_connection()
     try:
@@ -445,11 +459,13 @@ async def parse_preview_accounts(req: ParsePreviewRequest):
             "has_2fa": bool(item.get("twofa")), "has_cookie": bool(item.get("cookie")),
             "cookie_kind": item.get("cookie_kind"), "proxy": proxy,
             "exists": dup_reason is not None, "existing_id": old_id, "reason": dup_reason or "",
+            "note": item.get("note") or "",
         })
     for err in err_list:
         items.append({"line": err.get("line"), "ok": False, "uid": "", "name": "", "email": None, "account_type": "",
                       "has_pass": False, "has_2fa": False, "has_cookie": False, "cookie_kind": None, "proxy": "",
-                      "exists": False, "existing_id": None, "reason": err.get("reason", ""), "text": err.get("text", "")})
+                      "exists": False, "existing_id": None, "reason": err.get("reason", ""), "note": "",
+                      "text": err.get("text", "")})
     items.sort(key=lambda it: (it.get("line") or 0))
     n_ok = sum(1 for it in items if it["ok"])
     n_dup = sum(1 for it in items if it["exists"])
@@ -459,7 +475,8 @@ async def parse_preview_accounts(req: ParsePreviewRequest):
 
 @app.post("/api/accounts/batch-import")
 async def batch_import_accounts(req: BatchImportRequest, background_tasks: BackgroundTasks):
-    """A1/A2: thêm từng dòng; trả imported_lines (dòng đã thêm, id mới) + errors (trùng, thiếu pass, 2FA sai định dạng...)."""
+    """A1/A2: thêm từng dòng; trả imported_lines (dòng đã thêm, id mới) + errors (trùng, thiếu pass, 2FA sai định dạng...).
+    `errors[].text` chỉ là cột đầu/bản đã che (BH-57): không trả nguyên dòng có mật khẩu/2FA/cookie về client."""
     ok_list, err_list = parse_multiple_account_lines(req.data, strict_2fa=True)
     if not ok_list and not err_list:
         return {"success": False, "message": "Dữ liệu trống hoặc không có dòng nào hợp lệ."}
@@ -489,9 +506,9 @@ async def batch_import_accounts(req: BatchImportRequest, background_tasks: Backg
 
             cursor.execute("""
                 INSERT INTO accounts (name, account_type, email, fb_uid, fb_pass, fb_2fa, proxy, cookies, status, login_method, has_dola)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (item["name"], item["account_type"], item.get("email"), item["uid"], item["pass"], item.get("twofa"),
-                  proxy, cookies_json, "facebook" if item["account_type"] == "facebook" else "google", has_dola))
+                  proxy, cookies_json, AccountStatus.READY, "facebook" if item["account_type"] == "facebook" else "google", has_dola))
             new_id = cursor.lastrowid
             added.append((new_id, parsed_cookies))
             index[item["uid"]] = (new_id, item["name"])
@@ -561,7 +578,7 @@ async def paste_account_cookies(account_id: int, req: PasteCookieRequest):
         acc = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
         if not acc:
             return {"success": False, "message": "Tài khoản không tồn tại."}
-        conn.execute("UPDATE accounts SET cookies = ?, status = 'ready', last_check = CURRENT_TIMESTAMP, has_dola = ?, "
+        conn.execute(f"UPDATE accounts SET cookies = ?, status = '{AccountStatus.READY}', last_check = CURRENT_TIMESTAMP, has_dola = ?, "
                      "needs_manual = CASE WHEN needs_manual = ? AND ? = 1 THEN NULL ELSE needs_manual END WHERE id = ?",
                      (json.dumps(cookies), 1 if has_session else 0, NeedsManual.LOGIN, 1 if has_session else 0, account_id))
         conn.commit()
@@ -632,7 +649,7 @@ async def api_check_account_credits(account_id: int):
 async def api_check_all_credits(background_tasks: BackgroundTasks):
     conn = get_connection()
     try:
-        accounts = conn.execute("SELECT * FROM accounts WHERE status = 'ready'").fetchall()
+        accounts = conn.execute("SELECT * FROM accounts WHERE status = ?", (AccountStatus.READY,)).fetchall()
     finally:
         conn.close()
     checked_ids = [acc["id"] for acc in accounts if account_has_dola_session(acc)]
@@ -684,11 +701,9 @@ async def delete_account(account_id: int):
     profile_dir = account_profile_dir(account_id)
     profile_removed = False
     if os.path.isdir(profile_dir):
-        try:
-            await asyncio.to_thread(shutil.rmtree, profile_dir)
-            profile_removed = True
-        except OSError as e:
-            log.warning("Không xóa được thư mục profile %s: %s", profile_dir, e, extra={"account_id": account_id})
+        # N-7: Windows hay báo PermissionError/read-only khi Chrome vừa đóng → thử 3 lần cách 1 s, gỡ read-only;
+        # thư mục còn sót sẽ được browser.cleanup_profiles_on_startup dọn ở lần khởi động sau
+        profile_removed = await asyncio.to_thread(browser.remove_dir_with_retry, profile_dir)
     log_event(f"Đã xóa nick #{account_id} ({name}); {requeued} job về '{JobStatus.CHO}' chờ nick khác; "
               f"thư mục profile {'đã xóa' if profile_removed else 'không có hoặc không xóa được'}",
               "WARNING", "Account", account_id=account_id)

@@ -14,6 +14,8 @@ Chỉ khi config.HEADLESS (SEEDANCE_HEADLESS=1, máy test không có màn hình)
 """
 import asyncio
 import os
+import shutil
+import stat
 import sys
 import threading
 import time
@@ -337,14 +339,72 @@ def kill_orphan_chrome(profile_dir: str) -> int:
     return killed
 
 
-def cleanup_profiles_on_startup() -> int:
-    """Lúc khởi động (chưa job nào chạy): dọn Chrome mồ côi của mọi profile acc_*."""
+RMTREE_ATTEMPTS = 3
+RMTREE_RETRY_DELAY = 1.0
+
+
+def _rm_make_writable(func, path, exc_info):
+    """Handler cho shutil.rmtree (N-7, Windows): file/thư mục read-only (Chrome để lại) → gỡ read-only rồi xóa lại."""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        func(path)
+    except OSError as e:
+        log.debug("Không xóa được %s sau khi gỡ read-only: %s", path, e)
+
+
+def _rmtree_once(path: str) -> None:
+    """shutil.rmtree với handler gỡ read-only; Python ≥ 3.12 dùng `onexc`, bản cũ dùng `onerror`."""
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=lambda func, p, exc: _rm_make_writable(func, p, exc))
+    else:
+        shutil.rmtree(path, onerror=_rm_make_writable)
+
+
+def remove_dir_with_retry(path: str, attempts: int = RMTREE_ATTEMPTS, delay: float = RMTREE_RETRY_DELAY) -> bool:
+    """Xóa thư mục (profile Chrome) bền trên Windows (N-7): thử tối đa `attempts` lần cách `delay` giây, mỗi lần gỡ
+    read-only cho file bị khóa. Trả True nếu thư mục không còn; False (kèm WARNING) nếu vẫn còn sau các lần thử."""
+    if not os.path.isdir(path):
+        return True
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _rmtree_once(path)
+        except OSError as e:
+            last_error = e
+        if not os.path.isdir(path):
+            return True
+        if attempt < attempts:
+            log.debug("Xóa thư mục %s lần %s chưa xong (%s), thử lại sau %.0f s", path, attempt, last_error, delay)
+            time.sleep(delay)
+    log.warning("Không xóa được thư mục %s sau %s lần (%s); Chrome/antivirus có thể đang giữ file", path, attempts, last_error)
+    return False
+
+
+def cleanup_profiles_on_startup(known_account_ids=None) -> int:
+    """Lúc khởi động (chưa job nào chạy): dọn Chrome mồ côi của mọi profile acc_*; nếu có `known_account_ids`
+    (id nick còn trong CSDL) thì xóa luôn thư mục profiles/acc_<id> của nick đã bị xóa (N-7: xóa nick thất bại
+    rmtree trên Windows để lại thư mục). Trả về số Chrome mồ côi đã dọn; số thư mục đã xóa ghi log."""
     total = 0
     if not os.path.isdir(config.PROFILES_DIR):
         return 0
-    for name in os.listdir(config.PROFILES_DIR):
-        if name.startswith("acc_"):
-            total += kill_orphan_chrome(os.path.join(config.PROFILES_DIR, name))
+    removed, stale = 0, 0
+    known = {int(i) for i in known_account_ids} if known_account_ids is not None else None
+    for name in sorted(os.listdir(config.PROFILES_DIR)):
+        if not name.startswith("acc_"):
+            continue
+        path = os.path.join(config.PROFILES_DIR, name)
+        if not os.path.isdir(path):
+            continue
+        total += kill_orphan_chrome(path)
+        if known is None:
+            continue
+        suffix = name[len("acc_"):]
+        if suffix.isdigit() and int(suffix) not in known:
+            stale += 1
+            if remove_dir_with_retry(path):
+                removed += 1
+    if stale:
+        log.info("Dọn thư mục profile của nick đã xóa: xóa được %s/%s thư mục", removed, stale)
     return total
 
 
