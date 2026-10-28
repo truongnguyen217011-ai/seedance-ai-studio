@@ -303,7 +303,6 @@ Mẫu một mục:
 - Quy tắc: muốn thấy URL/trạng thái mới phải dùng lệnh Playwright có chờ (`page.wait_for_url`, `wait_for_function`, `locator.wait_for`) hoặc gọi một lệnh bất kỳ (`page.evaluate`) trước khi đọc `page.url`; không `time.sleep` rồi đọc thuộc tính cache. Trong `dola_service._wait_new_conversation` mỗi vòng đều gọi `_fetch_recent_conv_ids` (evaluate) nên không mắc lỗi này.
 - Kiểm: `tests/test_fake_dola_selfcheck.py::test_captcha_mode_solved_after_delay` dùng `page.wait_for_url`; `grep -n "time.sleep" tests/test_fake_dola_selfcheck.py` không được đi ngay trước `assert ... page.url` dương tính.
 
-
 ## BH-42 · Bộ mẫu đạo diễn chỉ nằm ở giao diện, backend gửi prompt thô kèm câu cố định
 - Ngày: 2026-10-09 · Giai đoạn: 4 · Mã: P1, P3, P4, P6, P7
 - Triệu chứng: người dùng đã có sẵn bộ đạo diễn trong tool (cỡ cảnh, góc máy, ống kính, ánh sáng, 11 trường phái, kho nhân vật) nhưng video Dola trả về không theo; cảnh đối thoại hai người bị quay kiểu "FPV nhào lộn hành động bom tấn". Xem `jobs.prompt_final` thì thấy prompt thô + một câu tiếng Anh cố định.
@@ -395,7 +394,6 @@ Mẫu một mục:
 - Quy tắc: đường tải/hỏi IP của nick dùng `httpx` với `trust_env=False` và `proxy=` tường minh (không đọc env, không bỏ qua loopback); proxy socks5 (httpx không có socksio) mới dùng `context.request`. Mọi tính năng "qua proxy" phải có test đếm trên fake proxy (`tests/fake_proxy.py`), gồm cả bước tải video, không chỉ bước mở trang.
 - Kiểm: `tests/test_phase2_fake_dola.py::test_a4_job_check_credit_and_diagnose_go_through_account_proxy` (đếm `/video/tos/` và `/__ip` trên fake proxy); `grep -n "import urllib" dola_service.py` phải rỗng.
 
-
 ## BH-55 · Đọc kích thước hàng đợi dùng chung SAU khi đã khởi động luồng làm việc
 - Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: K9 (hạ tầng test)
 - Triệu chứng: `POST /api/accounts/scan-all` trả `total: 6` trong khi nhật ký ghi "Bắt đầu quét tất cả 8 nick"; test K9 đỏ, đợt quét vẫn chạy nền sang test sau và giữ nick trong pool → các test sau báo "1 nick đang bận" dù không liên quan.
@@ -437,3 +435,48 @@ Mẫu một mục:
 - Nguyên nhân gốc: `has_dola` là cột **cache** (A7) chỉ được ghi khi lưu phiên và một lần lúc khởi động; cookie `sessionid` hết hạn theo `expires` là chuyện xảy ra **trong lúc chạy**, không ai ghi lại cột. Hai nguồn sự thật (cột cache và cookie/file) lệch nhau mà bên đọc file (pool) không đồng bộ ngược.
 - Quy tắc: nơi nào đọc nguồn thật (`account_pool._has_session_cached` → `account_has_dola_session`) mà thấy khác cột cache thì **ghi lại cột ngay** (`_set_has_dola(id, False)`); thêm `worker._refresh_has_dola_if_due` quét lại toàn bộ mỗi `config.HAS_DOLA_REFRESH_INTERVAL_SECONDS` (10 phút) trên `JOB_EXECUTOR`. Tổng quát: cột cache phải có (a) đường cập nhật tại chỗ khi phát hiện lệch và (b) đường quét định kỳ, không chỉ "quét lúc khởi động".
 - Kiểm: `tests/test_phase2_review.py::test_bh60_select_account_corrects_has_dola_when_session_gone` (nick `has_dola=1` nhưng không cookie → sau `select_account_for_job` cột về 0), `::test_bh60_worker_refreshes_has_dola_periodically` (`_refresh_has_dola_if_due` không chạy khi chưa tới hạn, `force=True`/tới hạn → cột về 0); `grep -n "_set_has_dola" account_pool.py`.
+
+## BH-61 · Đường dẫn Chrome cứng Linux và socket Keep-Alive trên Windows làm đứt chuỗi test
+- Ngày: 2026-10-09 · Giai đoạn: 1 · Mã: C3, T5
+- Triệu chứng: Chạy test trên Windows thì test tìm Chrome báo thiếu đường dẫn Linux `/opt/pw-browsers/...`; chạy hàng trăm test HTTP liên tiếp với fake Dola cục bộ bị lỗi `WinError 10053 An established connection was aborted by the software in your host machine`.
+- Nguyên nhân gốc: `conftest.py` chỉ định cứng `DEFAULT_CHROME` theo Linux; `no_chrome_hint` chỉ xóa env/setting mà không mock `_windows_candidates` khiến test không đi đến bước dò Playwright trên Windows; client urllib trong test dùng keep-alive dễ bị Windows hủy socket khi uvicorn đóng kết nối trước.
+- Quy tắc: Cấu hình test trình duyệt phải tự thích ứng nền tảng (`sys.platform == "win32"` dò Chrome Windows chuẩn trước); request HTTP trong fake Dola test dùng `Connection: close` và retry backoff ngắn khi gặp lỗi kết nối hệ thống; fixture dọn gợi ý Chrome phải dọn cả ứng viên Windows.
+- Kiểm: `python -m pytest tests/test_browser_unit.py -q`; `tests/test_worker_fake_dola.py`. (Gộp 1.5.0: `tests/conftest.py::_default_chrome`, `fake_dola._request` có `Connection: close` + thử lại 3 lần; `no_chrome_hint` mock `browser._windows_candidates`.)
+
+## BH-62 · Trả thiếu chi tiết dòng import tài khoản và phân giải cookie JSON đa định dạng
+- Ngày: 2026-10-09 · Giai đoạn: 2 · Mã: A1–A6, K1–K3
+- Triệu chứng: Giao diện web sau khi import nhiều nick hiện bảng trống kèm thông báo "Máy chủ không trả chi tiết từng dòng"; người dùng dán JSON từ tiện ích Cookie-Editor/J2Team/storageState bị parser từ chối; xóa nick để lại thư mục rác profile trên ổ cứng; phiên hết hạn không ghi nhận timestamp `session_expires`.
+- Nguyên nhân gốc: Endpoint `/api/accounts/batch-import` chỉ trả số lượng tổng `imported` mà không trả mảng `accounts` chi tiết (`id, name, uid, line, text`) mà UI mong đợi; parser chỉ nhận dạng định dạng pipe `UID|Pass` mà không bóc mảng cookie JSON; hàm xóa tài khoản chỉ xóa bản ghi SQLite mà quên dọn thư mục `profiles/acc_{id}`; kết nối Dola không trích xuất timestamp `expires` từ cookie `sessionid`.
+- Quy tắc: API batch import phải luôn trả mảng `accounts` chi tiết từng dòng cho giao diện; parser tự động nhận diện và trích xuất `c_user` (Facebook) hoặc `sessionid` (Dola) từ JSON; gán proxy mặc định của batch cho các nick không có proxy riêng; xóa tài khoản phải kiểm tra AccountPool không bận, xóa CSDL và dọn sạch thư mục profile trên ổ đĩa; cập nhật `session_expires` chuẩn datetime khi nick kết nối có phiên; tuân thủ nghiêm ngặt BH-03 không gọi `kill_orphan_chrome` ngoài các module được phép.
+- Kiểm: `tests/test_account_phase2.py` (toàn bộ A1–A6, K1–K3), `tests/test_bai_hoc.py`.
+- Gộp 1.5.0 (nhánh giai đoạn 2 đã làm cùng việc theo cách khác, giữ bản đã qua rà soát): batch-import trả `imported_lines` (không phải `accounts`, BH-57 không trả nguyên dòng); cookie JSON đi qua `parser._parse_json_cookie_line` (UID Dola băm `stable_dola_uid`, không `hash()`, BH-51) và `parse_cookies_by_content`; xóa nick qua `browser.remove_dir_with_retry` (N-7); `session_expires` ghi trong `_mark_account_connected` cùng `has_dola`.
+
+## BH-63 · Xác thực file video tải về chống lưu nhầm HTML lỗi và truyền cookie phiên
+- Ngày: 2026-10-09 · Giai đoạn: 3 · Mã: T1–T5
+- Triệu chứng: Job báo "Đã tạo video thành công" nhưng khi người dùng mở video thì màn hình đen/báo lỗi định dạng; hoặc file mp4 tải về chỉ là trang HTML lỗi 403 Forbidden của CDN; khi tải thất bại, các file rác hỏng không được dọn dẹp.
+- Nguyên nhân gốc: `_download_video` dùng `urllib.request` chay không kèm header Cookie của phiên nick nên CDN có thể chặn; hàm kiểm tra video chỉ kiểm tra kích thước `> 50KB` mà không kiểm tra nội dung file dẫn đến file HTML lỗi > 50KB bị lưu thành video .mp4; không có cơ chế dọn dẹp file hỏng khi quá trình tải gặp sự cố.
+- Quy tắc: Luôn xác thực nội dung file video (`_is_valid_video_file` từ chối `<!DOCTYPE html`, `<html`, `{"error"`); truyền Header Cookie từ phiên Playwright khi tải; tự động xóa sạch file tạm nếu tải thất bại hoặc nội dung không hợp lệ; đính kèm ảnh tham chiếu `reference_image` qua `input[type="file"]` trước khi gửi prompt nếu file tồn tại trên đĩa.
+- Kiểm: `tests/test_video_phase3.py` (T1–T5), `tests/test_bai_hoc.py`.
+- Gộp 1.5.0: tải video vẫn bằng httpx `trust_env=False` qua proxy của nick (BH-54, không urllib); header `Cookie` chỉ gồm cookie có domain khớp host URL (`_cookie_header_for_url`), không gửi phiên Dola sang CDN lạ; `_is_valid_video_file` + xóa file hỏng áp dụng cho cả đường httpx lẫn `context.request` (socks5).
+
+## BH-64 · Đạo diễn AI đa trường phái và quản lý đặt tên lô phim (batch_name)
+- Ngày: 2026-10-10 · Giai đoạn: 4 · Mã: P1–P7
+- Triệu chứng: Hàng đợi job không hiển thị rõ lô phim khiến người dùng khó quản lý các đợt tạo video hàng loạt; thiếu endpoint chuẩn để giao diện hoặc công cụ lấy danh sách 14 trường phái điện ảnh động; sửa prompt khi job đang chạy gây xung đột dữ liệu.
+- Nguyên nhân gốc: `BatchJobsRequest` chưa nhận trường `batch_name` để gán vào CSDL; chưa có route `GET /api/director/styles`; `PUT /api/jobs/{id}/prompt_final` cần chặn tuyệt đối khi job `Đang chạy`.
+- Quy tắc: Hỗ trợ `batch_name` khi tạo lô job và hiển thị nhãn lô trực quan trên giao diện; cung cấp endpoint `GET /api/director/styles` chuẩn hóa 14 trường phái; chỉ cho phép sửa `prompt_final` khi job chưa chạy (`Chờ`, `Tạm dừng`, `Thất bại`) và từ chối rõ ràng bằng tiếng Việt khi job đang chạy.
+- Kiểm: `tests/test_director_phase4.py` (4 tests), `tests/test_director.py`, `tests/test_director_docs.py`.
+
+## BH-65 · Gỡ bỏ hoàn toàn mã nguồn cũ Muse AI, OTP mail và làm sạch codebase (Giai đoạn 5)
+- Ngày: 2026-10-10 · Giai đoạn: 5 · Mã: G1, G2
+- Triệu chứng: Dự án tồn tại mã nguồn cũ không còn dùng (Muse AI, OTP dịch vụ mail Dongvanfb, batch B3) gây vi phạm quy tắc kiến trúc (sqlite3.connect tự do, kill_orphan_chrome ngoài module cho phép, chuỗi trạng thái tự tạo, nuốt lỗi); các nút bấm batch cũ trên web không còn ý nghĩa.
+- Nguyên nhân gốc: Mã thử nghiệm cũ từ các phiên bản trước chưa được dọn dẹp triệt để; cần loại bỏ để tập trung 100% vào luồng Dola AI và Đạo diễn AI chuẩn.
+- Quy tắc: Xóa bỏ hoàn toàn 4 file legacy (`muse_service.py`, `otp_service.py`, `batch_dispatcher.py`, `seed_sample_data.py`); loại bỏ danh sách ngoại lệ `LEGACY_PHASE5` trong `tests/test_bai_hoc.py`; chuyển các endpoint legacy (`/api/accounts/login_muse`, `/api/accounts/check_muse_token`, `/api/batch/import_b3`, `/api/batch/progress/{id}`) sang phản hồi thông báo từ chối rõ ràng bằng tiếng Việt có dấu; gỡ bỏ nút bấm nạp clip B3 cũ trên giao diện web để người dùng chỉ dùng tính năng "Thêm Prompt Hàng Loạt" với Đạo diễn AI; đảm bảo toàn bộ test suite đạt 100% PASSED (không còn xfail).
+- Kiểm: `tests/test_bai_hoc.py::test_bh65_legacy_files_and_fake_features_removed` (4 file không tồn tại; app.py không còn route Muse/B3/tạo ảnh giả/TTS giả; không còn `unsplash`/`soundhelix` trong mã); `tests/test_app_api.py::test_n1_muse_routes_removed` (route Muse → 404).
+- Gộp 1.5.0: các route legacy (`login_muse`, `check_muse_token`, `import_b3`, `batch/progress`) được **gỡ hẳn** (404) thay vì trả "không hỗ trợ"; gỡ luôn `POST /api/images` (ảnh Unsplash giả), `/api/audio/tts` (nhạc SoundHelix giả), nút "Đổi IP" chỉ alert, tab Âm thanh và nút "Tạo Ảnh Ngay" trên giao diện (BH-12: chưa làm thì không hiện); `GET/DELETE /api/images` giữ vì đọc dữ liệu thật trong CSDL.
+
+## BH-66 · Hai phiên làm việc song song trên hai nhánh không biết nhau
+- Ngày: 2026-10-28 · Giai đoạn: 2 (quy trình) · Mã: (quy trình), BH-23
+- Triệu chứng: nhánh `claude/giai-doan-1-hang-doi` (7 commit, 9-10/10) và nhánh `claude/giai-doan-2-nick` cùng xuất phát từ 2a12526; mỗi bên tự thêm BH-50.. nên trùng số 5 mục; cùng một chức năng được làm hai cách (nhập nick trả `accounts` vs `imported_lines`, cookie JSON trong `parser` với `hash()` vs `stable_dola_uid`, dọn profile bằng `shutil.rmtree` vs `remove_dir_with_retry`, tải video urllib vs httpx); một bên gỡ 4 file legacy trong khi bên kia còn test xfail chờ gỡ. Gộp mất một phiên làm việc riêng, 3 file xung đột, phải viết lại test của bên kia theo hợp đồng API.
+- Nguyên nhân gốc: mỗi phiên chỉ nhìn nhánh của mình: không `git fetch`, không đọc log các nhánh `claude/*` khác trước khi bắt đầu; số BH lấy từ bản cục bộ (BH-23 chỉ nói "đọc lại file ngay trước khi ghi" trong cùng một nhánh). Giả định sai: "repo chỉ có mình đang sửa".
+- Quy tắc: (1) **một repo, một phiên đang sửa tại một thời điểm**; cần việc song song thì chia theo file/module và nói rõ trong tên nhánh. (2) Trước khi sửa bất kỳ gì: `git fetch --all` rồi `git log --oneline --all --since=<ngày merge-base>` / đọc log mọi nhánh `claude/*`; có nhánh khác đi trước thì gộp (merge) vào trước khi viết. (3) **Số BH mới = số lớn nhất trên MỌI nhánh ở origin + 1** (`git show origin/<nhánh>:docs/BAI_HOC.md | grep -o "^## BH-[0-9]*"`), không chỉ bản cục bộ. (4) Khi gộp: giữ hành vi của cả hai; chức năng trùng lấy bản đã qua rà soát/có test, rà bản kia bổ sung ca thiếu; đánh lại số BH của bên đến sau, giữ nội dung.
+- Kiểm: `tests/test_bai_hoc.py::test_bh23_lesson_numbers_unique_and_consecutive`; tay trước khi bắt đầu phiên: `git fetch --all && for b in $(git branch -r | grep claude/); do echo $b; git show $b:docs/BAI_HOC.md | grep -o "^## BH-[0-9]*" | tail -1; done`.

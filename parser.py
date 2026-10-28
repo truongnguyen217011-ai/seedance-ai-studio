@@ -75,11 +75,14 @@ def detect_cookie_kind(raw) -> Optional[str]:
     return None
 
 
-def stable_dola_uid(cookie_text: str) -> str:
+def stable_dola_uid(cookie_text: str, session_value: Optional[str] = None) -> str:
     """UID thay thế cho dòng chỉ có cookie Dola (không c_user): băm ỔN ĐỊNH theo giá trị sessionid để dán lại
-    cùng cookie ở phiên sau vẫn nhận ra là trùng (BH-51: `hash()` của Python đổi mỗi lần chạy)."""
-    m = re.search(r'(?:^|;\s*)sessionid(?:_ss)?=([^;\s]+)', cookie_text)
-    key = m.group(1) if m else cookie_text.strip()
+    cùng cookie ở phiên sau vẫn nhận ra là trùng (BH-51: `hash()` của Python đổi mỗi lần chạy).
+    `session_value` truyền sẵn khi cookie là JSON (không có dạng `sessionid=` để tìm bằng regex)."""
+    key = (session_value or "").strip()
+    if not key:
+        m = re.search(r'(?:^|;\s*)sessionid(?:_ss)?=([^;\s]+)', cookie_text)
+        key = m.group(1) if m else cookie_text.strip()
     return "Dola_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
 
 def looks_like_bad_twofa(item: str) -> bool:
@@ -110,6 +113,9 @@ def mask_line(line: str) -> str:
     text = clean_line_text(line)
     if not text:
         return ""
+    if text[:1] in "[{":
+        # Khối cookie JSON (Cookie-Editor/J2TEAM/storageState) chứa giá trị cookie ở mọi dòng → che toàn bộ
+        return "***"
     sep = '|' if '|' in text else ('\t' if '\t' in text else None)
     parts = [p.strip() for p in text.split(sep)] if sep else [text]
     first = parts[0]
@@ -127,6 +133,60 @@ def clean_line_text(line: str) -> str:
     t = t.strip('\'" \t\r\n')
     return t
 
+def _json_cookie_list(text: str) -> Optional[list]:
+    """Danh sách cookie dict từ JSON (mảng, hoặc dict có khóa `cookies` như storageState); None nếu không phải JSON
+    cookie (không raise: để dòng rơi về các nhánh parser khác)."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        data = data.get("cookies")
+    if not isinstance(data, list):
+        return None
+    cookies = [c for c in data if isinstance(c, dict) and c.get("name")]
+    return cookies or None
+
+
+def _parse_json_cookie_line(text: str) -> Optional[Dict[str, Optional[str]]]:
+    """Dòng/khối là JSON cookie → dict tài khoản `cookie_login`; None nếu không phải JSON cookie.
+    JSON hợp lệ nhưng không có c_user lẫn sessionid → ValueError (người dùng dán nhầm thứ khác)."""
+    cookies = _json_cookie_list(text)
+    if cookies is None:
+        return None
+    c_user_val = None
+    session_val = None
+    for c in cookies:
+        name = str(c.get("name") or "")
+        value = str(c.get("value") or "").strip()
+        if not value:
+            continue
+        if name == "c_user" and not c_user_val:
+            c_user_val = value
+        elif name in ("sessionid", "sessionid_ss") and not session_val:
+            session_val = value
+    if c_user_val:
+        uid = c_user_val
+    elif session_val:
+        uid = stable_dola_uid(text, session_value=session_val)
+    else:
+        raise ValueError("Cookie JSON không chứa c_user (Facebook) hoặc sessionid (Dola)")
+    return {
+        "uid": uid,
+        "pass": "cookie_login",
+        "twofa": None,
+        "proxy": None,
+        "cookie": text,
+        "email": None,
+        "account_type": "facebook",
+        "name": f"FB {uid[-6:]}",
+        "cookie_kind": detect_cookie_kind(text),
+        "twofa_invalid": None,
+        "unassigned": [],
+        "note": "",
+    }
+
+
 def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
     """
     Bóc tách 1 dòng tài khoản đơn lẻ theo cơ chế nguyên tử của HaLi AI.
@@ -135,7 +195,14 @@ def parse_single_account_line(raw_line: str) -> Dict[str, Optional[str]]:
     if not text:
         raise ValueError("Dòng trống")
 
-    # 1. Trường hợp chỉ có 1 chuỗi Cookie nguyên bản (không có phân cách | hoặc tab)
+    # 1. Cookie dạng JSON (Cookie-Editor, J2TEAM, Playwright storage_state): lấy c_user (Facebook) hoặc sessionid
+    #    (Dola) làm UID; UID Dola băm ổn định theo giá trị sessionid (BH-51), không dùng `hash()`
+    if text[:1] in "[{" and text[-1:] in "]}":
+        parsed_json = _parse_json_cookie_line(text)
+        if parsed_json is not None:
+            return parsed_json
+
+    # 2. Trường hợp chỉ có 1 chuỗi Cookie nguyên bản (không có phân cách | hoặc tab)
     if '|' not in text and '\t' not in text and (RE_COOKIE.search(text) or RE_DOLA_COOKIE.search(text)):
         # Thử trích xuất c_user làm UID
         c_match = re.search(r'(?:^|;\s*)c_user=(\d+)', text)
@@ -309,7 +376,12 @@ def parse_multiple_account_lines(text: str, strict_2fa: bool = False) -> Tuple[L
     seen_uids = set()
 
     clean_text = str(text or '').replace('\ufeff', '')
-    lines = clean_text.splitlines()
+    stripped = clean_text.strip()
+    if stripped[:1] in "[{" and stripped[-1:] in "]}" and _json_cookie_list(stripped) is not None:
+        # Cả ô dán là MỘT khối cookie JSON (Cookie-Editor xuất nhiều dòng): coi là một dòng, không tách theo xuống dòng
+        lines = [stripped]
+    else:
+        lines = clean_text.splitlines()
 
     for idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()

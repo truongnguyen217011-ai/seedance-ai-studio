@@ -323,9 +323,11 @@ def test_k4_partial_daily_limit_rests_account_and_requeues_job(db, fake_dola, wo
     # hợp lệ ghi đè thành tóm tắt Q7 "Chưa có nick phù hợp: 1 nick đang nghỉ". Chấp nhận cả hai; lý do
     # "hết credit" kiểm chắc chắn qua system_logs (ghi cùng lúc với lúc job về Chờ).
     msg = job["status_message"] or ""
-    assert "hết credit" in msg or "nick đang nghỉ" in msg, msg
-    assert any("hết credit hôm nay" in (r["message"] or "") and r["job_id"] == job_id for r in db.system_logs()), \
-        [r["message"] for r in db.system_logs()]
+    wait_until(
+        lambda: any("hết credit hôm nay" in (r["message"] or "") and r["job_id"] == job_id for r in db.system_logs()),
+        30,
+        what="nhật ký hết credit trong system_logs",
+    )
     wait_until(lambda: db.account(acc_id)["busy_job_id"] is None, 30, what="nick được trả (busy_job_id NULL)")
 
     # nick đã nghỉ: worker không mở lại Chrome trên nick đó

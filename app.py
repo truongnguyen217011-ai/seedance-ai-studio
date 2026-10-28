@@ -19,7 +19,6 @@ import browser
 import config
 import director
 from account_pool import AccountPool
-from batch_dispatcher import get_batch_progress, import_b3_batch
 from constants import (DEFAULT_DURATION, DEFAULT_RATIO, AccountStatus, JobStatus, NeedsManual, Reason, duration_label,
                        normalize_duration, normalize_ratio)
 from database import get_connection, init_db, log_event
@@ -37,7 +36,7 @@ from dola_service import (
 from logger import get_logger
 from parser import (COOKIE_KIND_DOLA, COOKIE_KIND_FACEBOOK, detect_cookie_kind, parse_multiple_account_lines,
                     parse_single_account_line)
-from worker import MUSE_UNSUPPORTED, run_in_job_executor, running_job_ids, track_task, worker_alive, worker_loop
+from worker import run_in_job_executor, running_job_ids, track_task, worker_alive, worker_loop
 
 log = get_logger("App")
 app = FastAPI(title="Seedance AI Studio", version=config.VERSION)
@@ -109,6 +108,7 @@ class BatchJobsRequest(BaseModel):
     ratio: Optional[str] = None
     style_code: Optional[str] = ""      # "" = tự nhận diện; mã trong director.ARCHETYPE_BY_CODE để ép trường phái
     director: Optional[bool] = None     # None = theo setting director_enabled
+    batch_name: Optional[str] = None
 
 
 class DirectorPreviewRequest(BaseModel):
@@ -124,31 +124,12 @@ class PromptFinalRequest(BaseModel):
     prompt_final: str
 
 
-class CreateImageRequest(BaseModel):
-    prompt: str
-    model: Optional[str] = "Seedance Image 2.5"
-    aspect_ratio: Optional[str] = "16:9"
-    style: Optional[str] = "Cinematic"
-    account_id: Optional[int] = None
-
-
 class CreateAssetRequest(BaseModel):
     name: str
     character_code: Optional[str] = ""
     image_url: Optional[str] = ""
     description: Optional[str] = ""
     tags: Optional[str] = ""
-
-
-class AudioTTSRequest(BaseModel):
-    text: str
-    voice: Optional[str] = "vi-VN-Nu-NheNhang"
-    speed: Optional[float] = 1.0
-
-
-class ImportBatchRequest(BaseModel):
-    file_path: str
-    title: Optional[str] = ""
 
 
 def _count_accounts() -> int:
@@ -798,6 +779,19 @@ async def director_preview(req: DirectorPreviewRequest):
             "duration": ctx["duration"], "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
 
 
+@app.get("/api/director/styles")
+async def get_director_styles():
+    """Danh sách 14 trường phái điện ảnh chuẩn của Đạo diễn AI."""
+    return {"success": True, "styles": director.style_choices()}
+
+
+@app.get("/api/director/styles")
+async def get_director_styles():
+    """Danh sách trường phái của Đạo diễn AI ({code, name}, thứ tự = ưu tiên nhận diện trong `director.ARCHETYPES`)
+    cho select "Trường phái" và công cụ ngoài; không đọc CSDL."""
+    return {"success": True, "styles": director.style_choices()}
+
+
 @app.post("/api/jobs")
 async def create_job(req: CreateJobRequest):
     title = req.title if req.title else req.prompt[:40] + "..."
@@ -840,6 +834,7 @@ async def create_batch_jobs(req: BatchJobsRequest):
     except ValueError as e:
         return {"success": False, "message": str(e), "created": 0, "jobs": []}
 
+    batch_name = (req.batch_name or "").strip() or None
     created = []
     conn = get_connection()
     try:
@@ -847,12 +842,13 @@ async def create_batch_jobs(req: BatchJobsRequest):
         for seq, p, composed in prepared:
             cursor.execute("""
                 INSERT INTO jobs (title, prompt, prompt_final, archetype_code, model, duration, ratio, status,
-                                  status_message, progress, seq, reference_image, attempts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)
+                                  status_message, progress, seq, batch_name, reference_image, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0)
             """, (p[:40] + "...", p, composed["prompt_final"], composed["archetype_code"], ctx["model"], ctx["duration"],
-                  ctx["ratio"], JobStatus.CHO, "Chờ worker nhặt", seq, composed["reference_image"] or ""))
+                  ctx["ratio"], JobStatus.CHO, "Chờ worker nhặt", seq, batch_name, composed["reference_image"] or ""))
             created.append({"id": cursor.lastrowid, "prompt": p, "prompt_final": composed["prompt_final"],
-                            "archetype": composed["archetype_code"], "characters": composed["characters"]})
+                            "archetype": composed["archetype_code"], "characters": composed["characters"],
+                            "batch_name": batch_name})
         conn.commit()
     finally:
         conn.close()
@@ -861,8 +857,8 @@ async def create_batch_jobs(req: BatchJobsRequest):
               + (", ".join(codes) if codes else "tắt"), "SUCCESS", "Queue")
     for w in ctx["warnings"]:
         log_event(f"Nạp lô prompt: {w}", "WARNING", "Queue")
-    return {"success": True, "created": len(created), "jobs": created, "duration": ctx["duration"],
-            "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
+    return {"success": True, "created": len(created), "jobs": created, "batch_name": batch_name,
+            "duration": ctx["duration"], "ratio": ctx["ratio"], "warnings": ctx["warnings"]}
 
 
 @app.put("/api/jobs/{job_id}/prompt_final")
@@ -997,7 +993,8 @@ async def stream_job_video(job_id: int):
     return JSONResponse(status_code=404, content={"error": "Video đang được tạo hoặc chưa sẵn sàng"})
 
 
-# --- API TẠO ẢNH (IMAGES) — giữ nguyên, giai đoạn 5 mới gỡ ---
+# --- API ẢNH (IMAGES): chỉ đọc/xóa ảnh đã có trong CSDL. Giai đoạn 5 đã gỡ POST tạo ảnh (trả ảnh mẫu giả từ CDN ngoài, BH-12);
+#     tính năng tạo ảnh thật chưa có nên không hiện nút trên giao diện ---
 @app.get("/api/images")
 async def get_images():
     conn = get_connection()
@@ -1009,24 +1006,6 @@ async def get_images():
     finally:
         conn.close()
     return {"images": [dict(r) for r in rows]}
-
-
-@app.post("/api/images")
-async def create_image(req: CreateImageRequest):
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        image_url = f"https://images.unsplash.com/photo-{1578632767115 if 'cyber' in req.prompt.lower() else 1618005182384}?w=800"
-        cursor.execute("""
-            INSERT INTO images (account_id, prompt, model, aspect_ratio, style, status, image_url)
-            VALUES (?, ?, ?, ?, ?, 'Hoàn thành', ?)
-        """, (req.account_id, req.prompt, req.model, req.aspect_ratio, req.style, image_url))
-        new_id = cursor.lastrowid
-        conn.commit()
-    finally:
-        conn.close()
-    log_event(f"Tạo ảnh AI #{new_id} hoàn tất ({req.style})", "SUCCESS", "ImageEngine")
-    return {"success": True, "id": new_id, "image_url": image_url}
 
 
 @app.delete("/api/images/{image_id}")
@@ -1092,18 +1071,6 @@ async def get_nick_media(account_id: Optional[int] = None):
     finally:
         conn.close()
     return {"videos": [dict(j) for j in jobs], "images": [dict(i) for i in images]}
-
-
-# --- API XỬ LÝ ÂM THANH (AUDIO / TTS) — giữ nguyên, giai đoạn 5 mới gỡ ---
-@app.post("/api/audio/tts")
-async def generate_tts(req: AudioTTSRequest):
-    log_event(f"Tạo giọng đọc AI TTS: '{req.text[:30]}...' ({req.voice})", "SUCCESS", "Audio")
-    return {
-        "success": True,
-        "message": "Đã tạo giọng đọc thành công",
-        "audio_url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-        "duration": "12s"
-    }
 
 
 # --- API NHẬT KÝ (LOGS) ---
@@ -1181,31 +1148,6 @@ async def update_settings(req: dict):
         browser.refresh_chrome()
     log_event("Cập nhật cài đặt hệ thống", "INFO", "Settings")
     return {"success": True, "warnings": warnings}
-
-
-# --- API MUSE AI (không còn hỗ trợ: không mở Chrome ngoài slot/pool; muse_service.py gỡ ở giai đoạn 5) & BATCH B3 ---
-@app.post("/api/accounts/login_muse")
-async def login_muse_account(req: dict):
-    return {"success": False, "message": MUSE_UNSUPPORTED}
-
-
-@app.post("/api/accounts/check_muse_token")
-async def check_muse_token_account(req: dict):
-    return {"success": False, "message": MUSE_UNSUPPORTED}
-
-
-@app.post("/api/batch/import_b3")
-async def import_b3_prompts(req: ImportBatchRequest):
-    try:
-        return import_b3_batch(req.file_path, req.title)
-    except Exception as e:  # noqa: BLE001 - trả lỗi về giao diện
-        log.warning("Import B3 lỗi: %s", e)
-        return {"success": False, "message": str(e)}
-
-
-@app.get("/api/batch/progress/{batch_id}")
-async def get_batch_status(batch_id: str):
-    return get_batch_progress(batch_id)
 
 
 if __name__ == "__main__":

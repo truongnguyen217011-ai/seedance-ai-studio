@@ -49,8 +49,27 @@ def _free_port(host: str = "127.0.0.1") -> int:
 
 
 FAKE_DOLA_PORT = int(os.environ.get("SEEDANCE_TEST_DOLA_PORT") or _free_port())
+def _default_chrome() -> str:
+    if sys.platform == "win32":
+        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.environ.get(var)
+            if base:
+                cand = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+                if os.path.exists(cand):
+                    return cand
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                pw_path = p.chromium.executable_path
+                if pw_path and os.path.exists(pw_path):
+                    return pw_path
+        except Exception:
+            pass
+    return "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
+
+
 SESSION_DATA_DIR = tempfile.mkdtemp(prefix="seedance-tests-")
-DEFAULT_CHROME = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
+DEFAULT_CHROME = _default_chrome()
 
 os.environ["SEEDANCE_DATA_DIR"] = SESSION_DATA_DIR
 os.environ["SEEDANCE_DB_PATH"] = os.path.join(SESSION_DATA_DIR, "studio.db")

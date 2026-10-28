@@ -254,7 +254,7 @@ def test_control_and_state_roundtrip(fake_dola):
     assert st["mode"] == "slow" and st["render_seconds"] == 7 and st["credits"] == 9
     t0 = time.time()
     urllib.request.urlopen(fake_dola.base_url + "/chat/", timeout=10).read()
-    assert time.time() - t0 >= 0.5
+    assert time.time() - t0 >= 0.45, "Độ trễ slow_delay phải >= 0.45s (cho phép sai số clock tick ~15ms trên Windows)"
     with pytest.raises(urllib.error.HTTPError):
         fake_dola.control(mode="khong-co")
     st = fake_dola.reset()

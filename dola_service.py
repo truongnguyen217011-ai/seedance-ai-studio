@@ -348,6 +348,8 @@ def parse_cookie_string(cookie_str: str, domain: str = ".facebook.com"):
     """Chuyển chuỗi cookie / JSON thành danh sách cookie Playwright theo domain yêu cầu."""
     if "dola" in (domain or "") or _cookie_domain_matches(domain, config.DOLA_DOMAIN):
         return parse_dola_cookies(cookie_str)
+    if cookie_str and ("sessionid=" in cookie_str or "sessionid_ss=" in cookie_str) and "c_user=" not in cookie_str:
+        return parse_dola_cookies(cookie_str)
     return _parse_raw_cookie_for_domain(cookie_str, domain)
 
 
@@ -408,9 +410,22 @@ def _parse_raw_cookie_for_domain(cookie_str: str, domain: str):
     if not cookie_str or not cookie_str.strip():
         return []
     cookie_str = cookie_str.strip()
-    if cookie_str.startswith("[") and cookie_str.endswith("]"):
+    if (cookie_str.startswith("[") and cookie_str.endswith("]")) or (cookie_str.startswith("{") and cookie_str.endswith("}")):
         try:
-            return json.loads(cookie_str)
+            data = json.loads(cookie_str)
+            raw_list = data if isinstance(data, list) else (data.get("cookies", []) if isinstance(data, dict) else [])
+            if raw_list and isinstance(raw_list, list):
+                result = []
+                for c in raw_list:
+                    if isinstance(c, dict) and c.get("name") and c.get("value"):
+                        c_dict = dict(c)
+                        if not c_dict.get("domain"):
+                            c_dict["domain"] = domain
+                        if not c_dict.get("path"):
+                            c_dict["path"] = "/"
+                        result.append(c_dict)
+                if result:
+                    return result
         except json.JSONDecodeError as e:
             log.debug("Cookie dạng JSON không hợp lệ, thử dạng chuỗi: %s", e)
 
@@ -649,16 +664,45 @@ def _inject_cookies(context, acc: dict, only_facebook: bool = False) -> int:
         return 0
 
 
+def _session_expires_from_cookies(cookies) -> Optional[str]:
+    """Hạn của cookie phiên Dola (sessionid/sessionid_ss) dạng 'YYYY-mm-dd HH:MM:SS', None nếu cookie không có
+    `expires`/`expirationDate` hợp lệ (cookie phiên, -1, hoặc giá trị lạ). Không bịa hạn (BH-09)."""
+    if not isinstance(cookies, list):
+        return None
+    for c in cookies:
+        if not (isinstance(c, dict) and c.get("name") in ("sessionid", "sessionid_ss") and c.get("value")):
+            continue
+        exp = c.get("expires", c.get("expirationDate"))
+        if exp is None:
+            continue
+        try:
+            exp_f = float(exp)
+        except (TypeError, ValueError):
+            log.debug("Cookie %s có expires lạ: %r", c.get("name"), exp)
+            continue
+        if exp_f <= 0:
+            continue
+        try:
+            return datetime.fromtimestamp(exp_f).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError) as e:
+            log.debug("Cookie %s có expires ngoài khoảng: %r (%s)", c.get("name"), exp, e)
+    return None
+
+
 def _mark_account_connected(account_id: int, cookies):
-    """Nick vào được trang Dola có phiên: cookie mới nhất, ready, has_dola, và đếm lại lỗi kết nối liên tiếp từ 0."""
-    _set_account_fields(
-        account_id,
+    """Nick vào được trang Dola có phiên: cookie mới nhất, ready, has_dola, đếm lại lỗi kết nối liên tiếp từ 0 và lưu
+    hạn phiên (`session_expires`, từ `expires` của cookie sessionid; không có thì giữ nguyên cột)."""
+    fields = dict(
         cookies=json.dumps(cookies),
         status=AccountStatus.READY,
         last_check=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         consecutive_errors=0,
         has_dola=1 if has_dola_session(cookies) else 0,
     )
+    expires = _session_expires_from_cookies(cookies)
+    if expires:
+        fields["session_expires"] = expires
+    _set_account_fields(account_id, **fields)
 
 
 def _now_str() -> str:
@@ -1103,6 +1147,13 @@ def _check_account_credits_sync(account_id: int, pool_held: bool = False) -> dic
                 if has_dola_session(curr_c):
                     save_account_storage_state(account_id, curr_c)
                     _mark_account_connected(account_id, curr_c)
+                else:
+                    arts = save_failure_artifacts(page, "no_session", account_id=account_id)
+                    # Phiên hết hạn phía Dola: nick cần đăng nhập lại, cột cache has_dola về 0 (A7/BH-60), không đọc credit
+                    msg = f"Trang Dola không nhận phiên đăng nhập của nick '{acc['name']}' (sessionid mất hiệu lực), cần đăng nhập lại" + artifact_suffix(arts)
+                    _set_account_fields(account_id, needs_manual=NeedsManual.LOGIN, last_error=msg, has_dola=0, last_check=_now_str())
+                    log_event(msg, "WARNING", "Auth", account_id=account_id)
+                    return {"success": False, "is_known": False, "message": msg}
 
                 if _detect_captcha(page):
                     arts = save_failure_artifacts(page, "captcha", account_id=account_id)
@@ -1592,8 +1643,8 @@ def _handle_no_credit(job_id: int, acc: dict) -> None:
     # Không tính là một lần thử của job vì lỗi thuộc về nick, không phải job
     _set_job_fields(job_id, attempts=max(0, int(_load_job(job_id).get("attempts") or 0) - 1))
     msg = Reason.NO_CREDIT_WAIT.format(name=acc["name"])
-    update_job_status(job_id, JobStatus.CHO, msg, 0)
     log_event(f"Job #{job_id}: {msg}", "WARNING", "Credit", job_id=job_id, account_id=acc["id"])
+    update_job_status(job_id, JobStatus.CHO, msg, 0)
 
 
 def _handle_captcha(job_id: int, acc: dict, page) -> None:
@@ -1783,40 +1834,118 @@ def _conv_after_captcha_solved(job: dict, acc: dict, page, initial_conv_ids: set
     return _wait_new_conversation(page, initial_conv_ids, CONV_WAIT_SECONDS, job_id), False
 
 
-def _download_video(url: str, dest_file: str, job_id: int, proxy_cfg: Optional[dict] = None, context=None) -> bool:
+VIDEO_MIN_BYTES = 50000
+# Đầu file của phản hồi KHÔNG phải video (trang lỗi CDN/Cloudflare 403, JSON lỗi) bị lưu nhầm thành .mp4 (giai đoạn 3)
+NON_VIDEO_HEAD_MARKERS = (b"<!doctype", b"<html", b'{"error"')
+
+
+def _is_valid_video_file(file_path: str) -> bool:
+    """File video tải về có dùng được không: tồn tại, > VIDEO_MIN_BYTES và 64 byte đầu không phải HTML/JSON lỗi
+    (`NON_VIDEO_HEAD_MARKERS`). Không kiểm sâu định dạng mp4 (fake Dola dùng FAKEMP4)."""
+    if not os.path.exists(file_path):
+        return False
+    try:
+        if os.path.getsize(file_path) <= VIDEO_MIN_BYTES:
+            return False
+        with open(file_path, "rb") as f:
+            head = f.read(64).lower()
+    except OSError as e:
+        log.warning("Không đọc được file video %s để kiểm: %s", file_path, e)
+        return False
+    return not any(marker in head for marker in NON_VIDEO_HEAD_MARKERS)
+
+
+def _remove_file_quietly(path: str, why: str, job_id: Optional[int] = None) -> None:
+    if not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except OSError as e:
+        log.warning("Không xóa được file %s (%s): %s", path, why, e, extra={"job_id": job_id})
+
+
+def _attach_reference_image(page, image_path: str, job_id: int) -> bool:
+    """Giai đoạn 3: đính kèm ảnh tham chiếu (`jobs.reference_image`, file trên đĩa) vào ô `input[type=file]` của
+    Dola trước khi gửi prompt. Không có file / không có ô → False, không raise; lỗi Playwright chỉ WARNING."""
+    if not image_path or not os.path.isfile(image_path):
+        return False
+    try:
+        file_input = page.locator('input[type="file"]')
+        if file_input.count() > 0:
+            file_input.first.set_input_files(image_path)
+            time.sleep(2)
+            log_event(f"Job #{job_id}: đã đính kèm ảnh tham chiếu '{os.path.basename(image_path)}'", "INFO", "Prompt", job_id=job_id)
+            return True
+        log.debug("Không tìm thấy ô input file trên trang Dola để đính kèm ảnh", extra={"job_id": job_id})
+    except Exception as e:  # noqa: BLE001 - thiếu ảnh tham chiếu không được làm hỏng job
+        log.warning("Đính kèm ảnh tham chiếu thất bại: %s", str(e)[:120], extra={"job_id": job_id})
+    return False
+
+
+def _cookie_header_for_url(url: str, cookies_list) -> Optional[str]:
+    """Header `Cookie` cho một URL tải: chỉ các cookie có domain khớp host của URL (như trình duyệt), để không gửi
+    phiên Dola sang CDN lạ. Không có cookie khớp → None."""
+    if not cookies_list or not isinstance(cookies_list, list):
+        return None
+    try:
+        host = httpx.URL(url).host
+    except Exception as e:  # noqa: BLE001 - URL lạ thì không gắn cookie
+        log.debug("Không đọc được host của URL video để gắn cookie: %s", e)
+        return None
+    parts = [f"{c['name']}={c['value']}" for c in cookies_list
+             if isinstance(c, dict) and c.get("name") and c.get("value") and _cookie_domain_matches(c.get("domain"), host)]
+    return "; ".join(parts) if parts else None
+
+
+def _download_video(url: str, dest_file: str, job_id: int, proxy_cfg: Optional[dict] = None, context=None,
+                    cookies_list: Optional[list] = None) -> bool:
     """Tải video về máy qua ĐÚNG proxy của nick (A4), không bao giờ qua proxy môi trường (HTTP_PROXY/NO_PROXY):
 
     - proxy http(s) (`ip:port`, `ip:port:user:pass`, `http://...`) hoặc không proxy: httpx với `trust_env=False`
       (urllib tự bỏ qua proxy theo biến NO_PROXY, Playwright `context.request` tự bỏ qua proxy với host loopback —
-      cả hai đều không kiểm được bằng fake proxy, BH-54);
-    - proxy socks5: httpx không có socksio → tải qua `context.request` (phiên Chrome của nick, Playwright tự nối socks).
+      cả hai đều không kiểm được bằng fake proxy, BH-54); kèm header `Cookie` của phiên nick cho host khớp domain
+      cookie (`cookies_list` = `context.cookies()`, giai đoạn 3: CDN có thể chặn tải không cookie);
+    - proxy socks5: httpx không có socksio → tải qua `context.request` (phiên Chrome của nick, Playwright tự nối socks
+      và tự gửi cookie của context).
+
+    Kết quả phải qua `_is_valid_video_file` (trang HTML/JSON lỗi > 50 KB không được lưu thành .mp4); file tải dở
+    hoặc không hợp lệ bị xóa, trả False (tải lỗi mạng → raise để nơi gọi ghi DOWNLOAD_FAILED).
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': config.DOLA_BASE_URL + '/',
     }
     purl = proxy_url(proxy_cfg)
-    if purl and purl.startswith("socks") and context is not None:
-        resp = context.request.get(url, headers=headers, timeout=120000)
-        try:
-            if not resp.ok:
-                raise RuntimeError(f"HTTP {resp.status} khi tải video")
-            with open(dest_file, 'wb') as out_v:
-                out_v.write(resp.body())
-        finally:
-            resp.dispose()
-    else:
-        kwargs = {"timeout": 120, "trust_env": False, "follow_redirects": True}
-        if purl:
-            kwargs["proxy"] = purl
-        with httpx.Client(**kwargs) as client, client.stream("GET", url, headers=headers) as resp_v:
-            resp_v.raise_for_status()
-            with open(dest_file, 'wb') as out_v:
-                for chunk in resp_v.iter_bytes():
-                    out_v.write(chunk)
-    if os.path.exists(dest_file) and os.path.getsize(dest_file) > 50000:
+    try:
+        if purl and purl.startswith("socks") and context is not None:
+            resp = context.request.get(url, headers=headers, timeout=120000)
+            try:
+                if not resp.ok:
+                    raise RuntimeError(f"HTTP {resp.status} khi tải video")
+                with open(dest_file, 'wb') as out_v:
+                    out_v.write(resp.body())
+            finally:
+                resp.dispose()
+        else:
+            cookie_header = _cookie_header_for_url(url, cookies_list)
+            if cookie_header:
+                headers['Cookie'] = cookie_header
+            kwargs = {"timeout": 120, "trust_env": False, "follow_redirects": True}
+            if purl:
+                kwargs["proxy"] = purl
+            with httpx.Client(**kwargs) as client, client.stream("GET", url, headers=headers) as resp_v:
+                resp_v.raise_for_status()
+                with open(dest_file, 'wb') as out_v:
+                    for chunk in resp_v.iter_bytes():
+                        out_v.write(chunk)
+    except Exception:
+        _remove_file_quietly(dest_file, "tải dở", job_id)
+        raise
+    if _is_valid_video_file(dest_file):
         return True
-    log.warning("File video tải về quá nhỏ (%s byte), bỏ qua", os.path.getsize(dest_file) if os.path.exists(dest_file) else 0,
+    actual_sz = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
+    _remove_file_quietly(dest_file, "không phải video hợp lệ", job_id)
+    log.warning("File video tải về không hợp lệ hoặc quá nhỏ (%s byte), đã xóa, không lưu thành video", actual_sz,
                 extra={"job_id": job_id})
     return False
 
@@ -1873,7 +2002,11 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
         initial_conv_ids.add(m_curr.group(1))
     initial_conv_ids.update(_fetch_recent_conv_ids(page, 10, 1, job_id))
 
-    # 2. Gửi prompt
+    # 2. Gửi prompt (kèm ảnh tham chiếu nếu có)
+    ref_img = (job.get("reference_image") or "").strip()
+    if ref_img and os.path.isfile(ref_img):
+        _attach_reference_image(page, ref_img, job_id)
+
     full_prompt = build_full_prompt(job)
     if (job.get("prompt_final") or "").strip() != full_prompt:
         _set_job_fields(job_id, prompt_final=full_prompt)
@@ -1989,11 +2122,14 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
             log_event(f"Job #{job_id}: tìm thấy video thành phẩm, đang tải về máy", "SUCCESS", "Download", job_id=job_id, account_id=account_id)
             update_job_status(job_id, JobStatus.DANG_CHAY, "Đang tải video từ Dola về máy", 92)
             try:
-                downloaded = _download_video(target_video_url, dest_file, job_id, parse_proxy(acc.get("proxy")), context)
+                downloaded = _download_video(target_video_url, dest_file, job_id, parse_proxy(acc.get("proxy")), context,
+                                             cookies_list=context.cookies())
                 if downloaded:
                     sz_mb = round(os.path.getsize(dest_file) / (1024 * 1024), 2)
                     log_event(f"Job #{job_id}: đã lưu video ({sz_mb} MB) vào {dest_file}", "SUCCESS", "Download", job_id=job_id, account_id=account_id)
                     break
+                else:
+                    download_error = "File tải về không phải video hợp lệ hoặc quá nhỏ (< 50KB)"
             except Exception as dl_err:  # noqa: BLE001
                 download_error = str(dl_err)[:100]
                 log_event(f"Job #{job_id}: tải video lỗi: {download_error}", "WARNING", "Download", job_id=job_id, account_id=account_id)
@@ -2031,8 +2167,8 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
                                     "generating" in chain_lower or "đang tạo" in chain_lower):
                 # N-1: từ chối/giải thích → dừng sau 60 s; văn bản khác → 120 s; đang generating → chờ tiếp
                 _fail_job(job_id, account_id, JobStatus.THAT_BAI,
-                          Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)), page, "dola_replied_text",
-                          module="Render")
+                              Reason.DOLA_REPLIED_TEXT.format(text=_short(pending_reply, 200)), page, "dola_replied_text",
+                              module="Render")
                 return
 
         time.sleep(5)
@@ -2046,7 +2182,7 @@ def _run_job_in_browser(job: dict, acc: dict, context, page, state: Optional[dic
             log.info("Đọc credit còn lại từ văn bản chain: %s", credits_post, extra={"job_id": job_id, "account_id": account_id})
     _record_credits(account_id, credits_post, touch_last_used=True)
 
-    if downloaded and os.path.exists(dest_file) and os.path.getsize(dest_file) > 50000:
+    if downloaded and _is_valid_video_file(dest_file):
         update_job_status(job_id, JobStatus.HOAN_THANH, "Đã tạo video thành công, sẵn sàng xem hoặc tải về", 100,
                           local_video_path=f"/outputs/video_{job_id}.mp4",
                           finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

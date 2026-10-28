@@ -80,7 +80,7 @@ function reportFetchError(context, err) {
 
 // Tab switching
 function switchTab(tabId) {
-  const tabs = ['overview', 'image', 'video', 'tut', 'assets', 'accounts', 'check-media', 'audio', 'logs', 'settings'];
+  const tabs = ['overview', 'image', 'video', 'tut', 'assets', 'accounts', 'check-media', 'logs', 'settings'];
   tabs.forEach(t => {
     const el = document.getElementById(`tab-${t}`);
     const nav = document.getElementById(`nav-${t}`);
@@ -394,34 +394,6 @@ async function fetchImages() {
   }
 }
 
-async function submitCreateImage() {
-  const prompt = document.getElementById('imagePromptInput').value.trim();
-  const model = document.getElementById('imageModelSelect').value;
-  const aspect_ratio = document.getElementById('imageRatioSelect').value;
-  const style = document.getElementById('imageStyleSelect').value;
-
-  if (!prompt) {
-    alert('Vui lòng nhập mô tả ảnh!');
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/images', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, model, aspect_ratio, style })
-    });
-    const data = await res.json();
-    if (data.success) {
-      document.getElementById('imagePromptInput').value = '';
-      fetchImages();
-      fetchStats();
-    }
-  } catch (err) {
-    showToast('Lỗi tạo ảnh: ' + err.message, 'error');
-  }
-}
-
 async function deleteImage(id) {
   if (!confirm('Xóa ảnh này?')) return;
   try {
@@ -456,7 +428,7 @@ async function fetchAssets() {
       <div class="bg-[#0b1017] border border-[#172333] rounded-xl overflow-hidden flex flex-col justify-between">
         <div class="p-4 space-y-3">
           <div class="flex items-center space-x-3">
-            <img src="${a.image_url || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=200'}" class="w-14 h-14 rounded-full object-cover border-2 border-emerald-500/40">
+            ${a.image_url ? `<img src="${escapeHtml(a.image_url)}" class="w-14 h-14 rounded-full object-cover border-2 border-emerald-500/40">` : `<div class="w-14 h-14 rounded-full border-2 border-dashed border-[#233145] flex items-center justify-center text-[9px] text-gray-500" title="Chưa có ảnh nhân vật">Chưa có ảnh</div>`}
             <div>
               <div class="font-bold text-gray-200 text-xs">${a.name}</div>
               <div class="text-[10px] text-cyan-400 font-mono mt-0.5">${a.character_code}</div>
@@ -576,36 +548,6 @@ async function loadNickMedia() {
     }
   } catch (err) {
     reportFetchError('Lỗi nạp nick media', err);
-  }
-}
-
-// 6. Xử lý Âm thanh (Audio TTS)
-async function submitGenerateAudio() {
-  const text = document.getElementById('audioTextInput').value.trim();
-  const voice = document.getElementById('audioVoiceSelect').value;
-  const speed = parseFloat(document.getElementById('audioSpeedSelect').value);
-
-  if (!text) {
-    alert('Vui lòng nhập kịch bản cần đọc!');
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/audio/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice, speed })
-    });
-    const data = await res.json();
-    if (data.success) {
-      const card = document.getElementById('audioResultCard');
-      const player = document.getElementById('audioPlayer');
-      card.classList.remove('hidden');
-      player.src = data.audio_url;
-      player.play();
-    }
-  } catch (err) {
-    showToast('Lỗi tạo âm thanh: ' + err.message, 'error');
   }
 }
 
@@ -976,13 +918,15 @@ function _batchPromptLines() {
 function _directorRequestBody(prompts) {
   const styleEl = document.getElementById('batchStyleSelect');
   const dirEl = document.getElementById('batchDirectorEnabled');
+  const nameEl = document.getElementById('batchNameInput');
   return {
     prompts,
     model: document.getElementById('batchModelSelect').value,
     duration: document.getElementById('batchDurationSelect').value,
     ratio: document.getElementById('batchRatioSelect').value,
     style_code: styleEl ? styleEl.value : '',
-    director: dirEl ? !!dirEl.checked : null
+    director: dirEl ? !!dirEl.checked : null,
+    batch_name: nameEl && nameEl.value.trim() ? nameEl.value.trim() : null
   };
 }
 
@@ -1062,6 +1006,8 @@ async function submitBatchPrompts() {
     }
     closeModal('modalBatchPrompts');
     document.getElementById('batchPromptsInput').value = '';
+    const nameEl = document.getElementById('batchNameInput');
+    if (nameEl) nameEl.value = '';
     const box = document.getElementById('directorPreviewBox');
     if (box) { box.innerHTML = ''; box.classList.add('hidden'); }
     const codes = Array.from(new Set((data.jobs || []).map(j => j.archetype).filter(Boolean)));
@@ -2410,72 +2356,6 @@ async function batchAssignProxy() {
     }
   } catch (err) {
     showToast('Lỗi gán proxy: ' + err.message, 'error');
-  }
-}
-
-function rotateIPNotice() {
-  alert('Đang gửi lệnh đổi IP tới dịch vụ Proxy xoay... Đổi IP mới thành công!');
-}
-
-// ==================== TÍNH NĂNG TỰ ĐỘNG MUSE AI & BATCH 180 CLIP B3 ====================
-
-async function autoLoginMuse(accountId) {
-  if (!confirm(`Bắt đầu tự động đăng nhập Muse AI qua OTP Dongvanfb cho tài khoản #${accountId}?`)) return;
-  alert('🚀 Đang mở Chromium ngầm: Điền email Muse AI -> Yêu cầu OTP -> Tự động cào hòm thư dongvanfb.net -> Điền mã xác thực.\nVui lòng chờ khoảng 40-50s...');
-  try {
-    const res = await fetch('/api/accounts/login_muse', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ account_id: accountId })
-    });
-    const data = await res.json();
-    alert(data.message || (data.success ? '🎉 Đăng nhập Muse AI thành công!' : '❌ Đăng nhập thất bại'));
-    fetchAccounts();
-    fetchStats();
-  } catch (err) {
-    showToast('Lỗi: ' + err.message, 'error');
-  }
-}
-
-async function checkMuseToken(accountId) {
-  try {
-    const res = await fetch('/api/accounts/check_muse_token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ account_id: accountId })
-    });
-    const data = await res.json();
-    alert(data.message || (data.success ? 'Đã kiểm tra token!' : 'Lỗi kiểm tra token'));
-    fetchAccounts();
-  } catch (err) {
-    showToast('Lỗi: ' + err.message, 'error');
-  }
-}
-
-async function openImportB3Modal() {
-  const filePath = prompt(
-    "Nhập đường dẫn đầy đủ đến file '_ALL_CLIP_PROMPTS.txt' hoặc thư mục bài sản xuất của TOOL AI:\n(Ví dụ: D:\\TOOL_AI\\Ten_Bai\\_ALL_CLIP_PROMPTS.txt)",
-    "D:\\TOOL_AI\\"
-  );
-  if (!filePath || !filePath.trim()) return;
-
-  try {
-    const res = await fetch('/api/batch/import_b3', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath.trim() })
-    });
-    const data = await res.json();
-    if (data.success) {
-      alert(`🎉 ${data.message}\n\n• Tổng số clip: ${data.total_clips}\n• Đã chia đều cho: ${data.accounts_assigned} tài khoản Muse AI sẵn có\n\nHệ thống sẽ bắt đầu tự động render song song!`);
-      switchTab('video');
-      fetchJobs();
-      fetchStats();
-    } else {
-      alert('Lỗi nạp batch: ' + data.message);
-    }
-  } catch (err) {
-    showToast('Lỗi kết nối: ' + err.message, 'error');
   }
 }
 

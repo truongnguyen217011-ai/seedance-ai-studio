@@ -1,6 +1,6 @@
 """
 Tự động hóa cột "Kiểm" của docs/BAI_HOC.md (quét mã nguồn bằng Python, không gọi grep ngoài).
-Mục tiêu: `python -m pytest tests/test_bai_hoc.py -q` xanh hoàn toàn (trừ xfail có lý do).
+Mục tiêu: `python -m pytest tests/test_bai_hoc.py -q` xanh hoàn toàn (không còn xfail từ giai đoạn 5).
 """
 from __future__ import annotations
 
@@ -17,21 +17,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
 BAI_HOC = ROOT / "docs" / "BAI_HOC.md"
 
-# File mã cũ (Muse AI, OTP mail, batch B3, seed mẫu) sẽ GỠ ở giai đoạn 5 (BH-12). Chúng vi phạm nhiều
-# bài học (chuỗi trạng thái tay, kill_orphan_chrome, sqlite3.connect, except/pass, giá trị giả) nhưng
-# không được sửa ở giai đoạn 1 để tránh đụng mã sắp xóa. Danh sách này là nơi DUY NHẤT liệt kê chúng;
-# test_legacy_files_still_present_until_phase5 sẽ XPASS (và đỏ vì strict) khi gỡ xong → xóa danh sách này.
-LEGACY_PHASE5 = {"muse_service.py", "otp_service.py", "batch_dispatcher.py", "seed_sample_data.py"}
-
-
 def root_py_files() -> List[pathlib.Path]:
     """*.py ở thư mục gốc dự án (không gồm tests/)."""
     return sorted(p for p in ROOT.glob("*.py") if p.is_file())
 
 
 def phase1_py_files() -> List[pathlib.Path]:
-    """*.py ở gốc trừ các file sẽ gỡ ở giai đoạn 5."""
-    return [p for p in root_py_files() if p.name not in LEGACY_PHASE5]
+    """*.py ở gốc dự án: từ giai đoạn 5 (BH-65) không còn file legacy nào được loại trừ, mọi bài học áp cho tất cả."""
+    return root_py_files()
 
 
 def read(p: pathlib.Path) -> str:
@@ -161,13 +154,25 @@ def test_bh10_chrome_exe_and_startfile_only_in_browser_py():
     assert not bad, "BH-10: check_env.py chỉ được dò đường dẫn, không được mở Chrome:\n" + "\n".join(bad)
 
 
-# ---------------------------------------------------------------- giai đoạn 5: nhắc gỡ danh sách LEGACY_PHASE5
-@pytest.mark.xfail(strict=True, reason="gỡ ở giai đoạn 5: muse_service/otp_service/batch_dispatcher/seed_sample_data còn tồn tại")
-def test_legacy_files_still_present_until_phase5():
-    """Đỏ (xfail) chừng nào còn file cũ. Khi gỡ xong test XPASS → strict làm nó đỏ để nhắc xóa LEGACY_PHASE5
-    và các chỗ loại trừ trong file này."""
-    present = sorted(name for name in LEGACY_PHASE5 if (ROOT / name).exists())
-    assert not present, f"file giai đoạn 5 vẫn còn: {present}"
+# ---------------------------------------------------------------- BH-65 (giai đoạn 5) + BH-12
+LEGACY_REMOVED = ("muse_service.py", "otp_service.py", "batch_dispatcher.py", "seed_sample_data.py")
+LEGACY_ROUTES = ("/api/accounts/login_muse", "/api/accounts/check_muse_token", "/api/batch/import_b3",
+                 "/api/batch/progress", "/api/audio/tts")
+
+
+def test_bh65_legacy_files_and_fake_features_removed():
+    """Giai đoạn 5 đã chốt gỡ: 4 file legacy không được quay lại; app.py không còn route Muse/B3/TTS giả và POST tạo
+    ảnh giả; không còn URL dữ liệu mẫu (unsplash/soundhelix) trong mã Python/JS/HTML (BH-12)."""
+    present = [name for name in LEGACY_REMOVED if (ROOT / name).exists()]
+    assert not present, f"BH-65: file legacy đã gỡ ở giai đoạn 5 lại xuất hiện: {present}"
+    app_src = read(ROOT / "app.py")
+    bad_routes = [r for r in LEGACY_ROUTES if r in app_src]
+    assert not bad_routes, f"BH-65: app.py vẫn còn route legacy: {bad_routes}"
+    assert '@app.post("/api/images")' not in app_src, "BH-65/BH-12: POST /api/images (ảnh Unsplash giả) đã gỡ, không thêm lại"
+    pat = re.compile(r"unsplash|soundhelix", re.IGNORECASE)
+    files = root_py_files() + sorted((ROOT / "static").rglob("*.js")) + sorted((ROOT / "static").rglob("*.html"))
+    hits = [h for p in files for h in _lines_matching(p, pat)]
+    assert not hits, "BH-12: không còn dữ liệu mẫu giả (unsplash/soundhelix) trong mã:\n" + "\n".join(hits)
 
 
 # ---------------------------------------------------------------- BH-23

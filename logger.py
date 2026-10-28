@@ -6,6 +6,7 @@
 
 Không hàm nào ở đây được phép raise: nhật ký hỏng không được làm hỏng job.
 """
+import io
 import logging
 import logging.handlers
 import os
@@ -94,7 +95,13 @@ def _configure():
         except OSError as e:
             sys.stderr.write(f"[logger] Không mở được file log trong {config.LOGS_DIR}: {e}\n")
 
-        ch = logging.StreamHandler(sys.stdout)
+        stream = sys.stdout
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, io.UnsupportedOperation) as exc:
+                sys.stderr.write(f"[logger] Không thể reconfigure stdout sang UTF-8: {exc}\n")
+        ch = logging.StreamHandler(stream)
         ch.setLevel(logging.INFO)
         ch.setFormatter(fmt)
         ch.addFilter(ctx)

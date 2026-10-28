@@ -61,6 +61,7 @@ def no_chrome_hint(db, monkeypatch):
     import config
     original = config.CHROME_PATH_ENV
     monkeypatch.setattr(config, "CHROME_PATH_ENV", "")
+    monkeypatch.setattr(browser, "_windows_candidates", lambda: [])
     db.exec("DELETE FROM settings WHERE key = 'chrome_path'")
     cap = _Capture()
     logging.getLogger("studio").addHandler(cap)
